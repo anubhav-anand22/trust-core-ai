@@ -103,8 +103,43 @@ pub async fn run_turn(
         tracing::warn!(error = %e, "failed to append session turn");
     }
 
+    // Fold the session digest into encrypted long-term memory every turn, so a
+    // crash between turns never loses history. `end_session` does the same on an
+    // orderly shutdown.
+    persist_long_term(config, &session);
+
     sink.emit(StepEvent::Done {
         report_json: serde_json::to_string(&report)?,
     });
     Ok(TurnOutcome::Completed(report))
+}
+
+/// Update `persistent_memory.json` (AES-256-GCM) from the current session's
+/// rolling context.
+///
+/// **Inputs:** pipeline config (for the file path) and the session to summarise.
+/// Best-effort: a write failure is logged, never propagated — losing long-term
+/// memory must not fail a turn or a shutdown.
+pub fn persist_long_term(config: &PipelineConfig, session: &SessionContext) {
+    let path = config.persistent_path();
+    let mut memory = PersistentMemory::load(&path);
+
+    let digest = if !session.rolling_summary.is_empty() {
+        session.rolling_summary.clone()
+    } else {
+        session
+            .turns
+            .iter()
+            .map(|t| t.report_summary.as_str())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    if !digest.is_empty() {
+        memory.history_digest = digest;
+    }
+
+    if let Err(e) = memory.persist(&path) {
+        tracing::warn!(error = %e, "failed to persist long-term memory");
+    }
 }

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 pub use engine::schemas;
 pub use events::{ProgressSink, StepEvent};
-pub use pipeline::{run_turn, TurnOutcome};
+pub use pipeline::{persist_long_term, run_turn, TurnOutcome};
 
 /// Everything the pipeline needs to resolve models and on-disk locations.
 ///

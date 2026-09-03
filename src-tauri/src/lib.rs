@@ -27,9 +27,10 @@ use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed};
 use base64::Engine as _;
 use events::ChannelSink;
 use workbench_core::engine::OllamaEngine;
+use workbench_core::memory::SessionContext;
 use workbench_core::schemas::{FileKind, InputFile};
 use workbench_core::tools::default_registry;
-use workbench_core::{PipelineConfig, ProgressSink, StepEvent};
+use workbench_core::{persist_long_term, PipelineConfig, ProgressSink, StepEvent};
 
 /// Where the local Ollama server listens. Fixed — this is an offline desktop app.
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -70,6 +71,16 @@ async fn generate_response(prompt: String, state: State<'_, AppState>) -> Result
 #[tauri::command]
 fn set_model_plan(plan: ModelPlan, state: State<'_, AppState>) {
     *state.model_plan.lock().expect("model_plan mutex poisoned") = Some(plan);
+}
+
+/// Finalise a session: fold its rolling context into encrypted long-term memory.
+/// Safe to call at any time (e.g. window close, "new session" button).
+#[tauri::command]
+fn end_session(app: tauri::AppHandle, state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let config = pipeline_config(&app, &state.plan())?;
+    let session = SessionContext::load_or_new(&config.session_path(), &session_id);
+    persist_long_term(&config, &session);
+    Ok(())
 }
 
 /// Warm the resident model so the first real turn is not cold. Idempotent.
@@ -229,6 +240,7 @@ pub fn run() {
             warm_model,
             audit_paths,
             submit_turn,
+            end_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
