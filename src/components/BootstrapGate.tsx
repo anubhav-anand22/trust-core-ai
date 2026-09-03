@@ -25,12 +25,16 @@ type Phase =
   | "warming"
   | "error";
 
-// Resident-LLM options offered in the override dropdown.
+// Resident-LLM options offered in the override dropdown. The recommended tier is
+// pre-selected; the others cover both fresh pulls and models a machine may
+// already have locally.
 const LLM_CHOICES = [
   "qwen2.5:7b-instruct",
   "phi4-mini",
   "qwen2.5:3b-instruct",
   "qwen2.5:1.5b-instruct",
+  "llama3.2:3b",
+  "qwen3:4b",
 ];
 
 export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void }) {
