@@ -1,13 +1,22 @@
 //! Tool modules. Each is a small, independently testable unit that turns one
 //! step's arguments into a [`ToolResult`].
 //!
-//! Phase 2 adds `audio`, `document`, `ocr`, `vision` and `rag` here. The trait and
-//! context below are the contract they all implement, defined now so the executor
-//! and the registry can be built against it.
+//! The trait and context below are the contract every tool implements.
+//! [`default_registry`] wires the concrete set the executor runs.
+
+pub mod analysis;
+pub mod audio;
+pub mod document;
+pub mod ocr;
+pub mod rag;
+pub mod vision;
 
 use std::collections::HashMap;
 
+use crate::executor::ToolRegistry;
+
 use crate::engine::schemas::{InputFile, TaskStep, ToolResult};
+use crate::engine::OllamaEngine;
 use crate::{PipelineConfig, Result};
 
 /// Everything a tool may read while running.
@@ -22,6 +31,10 @@ pub struct ToolContext<'a> {
     /// The original user prompt, for tools that need the ask verbatim
     /// (e.g. the vision tool's question, the RAG query fallback).
     pub prompt: &'a str,
+    /// Shared Ollama engine — the vision tool and the RAG embedder call the
+    /// specialist models (`moondream`, `nomic-embed-text`) through it with
+    /// `keep_alive = 0`, so no second model ever co-resides with the resident one.
+    pub engine: &'a OllamaEngine,
 }
 
 impl<'a> ToolContext<'a> {
@@ -59,4 +72,20 @@ pub trait Tool: Send + Sync {
     /// failures (bad file, empty result) should come back as a
     /// [`ToolResult`] with `ok: false` so the run can continue degraded.
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult>;
+}
+
+/// The concrete tool set the pipeline runs. One entry per non-analysis task in
+/// [`TASK_REGISTRY`](crate::planner::registry::TASK_REGISTRY), plus the two
+/// analysis tasks served by [`analysis::AnalysisTool`].
+pub fn default_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Box::new(audio::AudioTool))
+        .register(Box::new(document::DocumentTool))
+        .register(Box::new(ocr::OcrTool))
+        .register(Box::new(vision::VisionTool))
+        .register(Box::new(rag::RagTool))
+        .register(Box::new(analysis::AnalysisTool::summarize()))
+        .register(Box::new(analysis::AnalysisTool::compare_to_sop()));
+    registry
 }

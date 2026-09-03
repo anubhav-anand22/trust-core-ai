@@ -6,13 +6,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-# NOTE ON DEPENDENCY STAGING
-# Only the crates needed by Phase 0/1 (orchestration core) and Phase 3 (memory)
-# are declared now. The heavy tool crates — pdfplumber, whisper-rs, symphonia,
-# rubato, ocrs/rten, image, lancedb/arrow — are added in Phase 2 alongside the
-# `tools/*` modules they back, so early `cargo check` stays fast and each crate
-# arrives with the code that uses it.
-
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -29,6 +22,19 @@ pbkdf2 = { version = "0.12", features = ["hmac"] }
 sha2 = "0.10"
 machine-uid = "0.5"
 base64 = "0.22"
+
+# --- Phase 2: sequential tools -------------------------------------------
+# PDF (digital only): text + tables, pure Rust.
+pdfplumber = "0.4"
+# OCR: pure-Rust engine on the rten runtime.
+ocrs = "0.13"
+rten = "0.26"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "webp"] }
+# Audio: whisper.cpp bindings + container decode (linear resample is hand-rolled).
+whisper-rs = "0.16"
+symphonia = { version = "0.5", default-features = false, features = [
+    "mp3", "isomp4", "aac", "flac", "vorbis", "ogg", "wav", "pcm", "adpcm",
+] }
 
 [dev-dependencies]
 tempfile = "3"

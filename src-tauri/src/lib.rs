@@ -24,9 +24,11 @@ use tauri::{Manager, State};
 use bootstrap::hardware::detect_hardware;
 use bootstrap::models::{ensure_models, probe_system, ModelPlan};
 use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed};
+use base64::Engine as _;
 use events::ChannelSink;
 use workbench_core::engine::OllamaEngine;
-use workbench_core::executor::ToolRegistry;
+use workbench_core::schemas::{FileKind, InputFile};
+use workbench_core::tools::default_registry;
 use workbench_core::{PipelineConfig, ProgressSink, StepEvent};
 
 /// Where the local Ollama server listens. Fixed — this is an offline desktop app.
@@ -125,23 +127,64 @@ fn pipeline_config(app: &tauri::AppHandle, plan: &ModelPlan) -> Result<PipelineC
     })
 }
 
+/// One attachment as sent from the front-end: original name + base64 bytes.
+///
+/// base64 (rather than a `Vec<u8>` that JSON would balloon) keeps the IPC payload
+/// compact and needs no extra Tauri plugin.
+#[derive(serde::Deserialize)]
+struct UploadedFile {
+    name: String,
+    content_base64: String,
+}
+
+/// Decode the uploads, write them under `uploads/<session>/`, and classify each by
+/// extension into a [`InputFile`] the pipeline can consume.
+fn persist_uploads(
+    config: &PipelineConfig,
+    session_id: &str,
+    files: &[UploadedFile],
+) -> Result<Vec<InputFile>, String> {
+    let dir = config.uploads_dir().join(session_id);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(file.content_base64.trim())
+            .map_err(|e| format!("invalid base64 for `{}`: {e}", file.name))?;
+        let safe_name: String = file
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+            .collect();
+        let path = dir.join(if safe_name.is_empty() { "upload" } else { &safe_name });
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+        out.push(InputFile {
+            kind: FileKind::from_path(&path),
+            path: path.to_string_lossy().into_owned(),
+            original_name: file.name.clone(),
+        });
+    }
+    Ok(out)
+}
+
 /// Run one turn of the pipeline, streaming [`StepEvent`]s to the front-end.
 ///
-/// **Inputs:** the user prompt, a session id, and a `Channel` the UI listens on.
-/// **Phase 1:** no tools are registered, so a text-only prompt flows
-/// `idle → parsing_context → validating_plan → …`. Phase 2 registers real tools
-/// and adds file attachments.
+/// **Inputs:** the user prompt, any attached files (base64), a session id, and a
+/// `Channel` the UI listens on. Files are written to `uploads/<session>/` and
+/// classified by extension before the pipeline runs.
 #[tauri::command]
 async fn submit_turn(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     prompt: String,
     session_id: String,
+    files: Vec<UploadedFile>,
     on_event: Channel<StepEvent>,
 ) -> Result<(), String> {
     let plan = state.plan();
     let config = pipeline_config(&app, &plan)?;
-    std::fs::create_dir_all(config.uploads_dir()).ok();
+    let uploads = persist_uploads(&config, &session_id, &files)?;
 
     let engine = OllamaEngine::new(
         &config.ollama_url,
@@ -149,11 +192,11 @@ async fn submit_turn(
         plan.vision.clone(),
         plan.embed.clone(),
     );
-    let registry = ToolRegistry::new(); // Phase 2 populates this
+    let registry = default_registry();
     let sink = ChannelSink(on_event);
 
     match workbench_core::run_turn(
-        &engine, &registry, &config, &session_id, &prompt, &[], &sink,
+        &engine, &registry, &config, &session_id, &prompt, &uploads, &sink,
     )
     .await
     {

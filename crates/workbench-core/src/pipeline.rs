@@ -57,7 +57,7 @@ pub async fn run_turn(
     };
 
     // --- strictly sequential tool execution --------------------------------
-    let results = execute_plan(&plan, registry, uploads, config, prompt, sink).await?;
+    let results = execute_plan(&plan, registry, uploads, config, engine, prompt, sink).await?;
 
     // --- rule-based quality gate (before synthesis, per the blueprint) -----
     let quality = assert_sane(&plan, &results, None);

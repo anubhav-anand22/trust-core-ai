@@ -193,6 +193,47 @@ Return JSON only. No prose, no markdown, no code fences.",
         self.generate_json(ROLE_C_SYSTEM, user, "output_compiler").await
     }
 
+    /// Vision call against the compact VLM (e.g. `moondream`).
+    ///
+    /// `keep_alive = UnloadOnCompletion` so Ollama frees the vision model the
+    /// instant it answers — it must never co-reside with the resident LLM.
+    pub async fn analyze_image(&self, image_base64: &str, question: &str) -> Result<String> {
+        use ollama_rs::generation::images::Image;
+        let request = GenerationRequest::new(self.vision_model.clone(), question.to_string())
+            .add_image(Image::from_base64(image_base64.to_string()))
+            .keep_alive(KeepAlive::UnloadOnCompletion);
+        let response = self
+            .client
+            .generate(request)
+            .await
+            .map_err(|e| CoreError::Ollama(e.to_string()))?;
+        Ok(response.response.trim().to_string())
+    }
+
+    /// Analysis step (`summarize` / `compare_to_sop`) on the resident model:
+    /// `instruction` + accumulated `evidence` + the user's ask → prose.
+    pub async fn analyze(
+        &self,
+        instruction: &str,
+        evidence: &str,
+        user_prompt: &str,
+    ) -> Result<String> {
+        let request = GenerationRequest::new(
+            self.llm_model.clone(),
+            format!(
+                "USER REQUEST:\n{user_prompt}\n\nTASK:\n{instruction}\n\nEVIDENCE:\n{evidence}\n\n\
+                 Answer concisely and only from the evidence."
+            ),
+        )
+        .keep_alive(KeepAlive::Indefinitely);
+        let response = self
+            .client
+            .generate(request)
+            .await
+            .map_err(|e| CoreError::Ollama(e.to_string()))?;
+        Ok(response.response.trim().to_string())
+    }
+
     /// Plain-text summarisation used by the rolling session-memory compressor.
     ///
     /// Deliberately not JSON-constrained: we want prose here, and a schema error

@@ -26,4 +26,5 @@ tokio = { workspace = true }
 ollama-rs = { workspace = true }
 tokio-stream = "0.1.19"
 sysinfo = "0.33"
+base64 = "0.22"
 workbench-core = { path = "../crates/workbench-core" }

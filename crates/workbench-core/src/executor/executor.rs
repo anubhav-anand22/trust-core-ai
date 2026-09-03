@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use crate::engine::schemas::{InputFile, Plan, ToolResult};
+use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::tools::{Tool, ToolContext};
 use crate::{PipelineConfig, Result};
@@ -52,6 +53,7 @@ pub async fn execute_plan(
     registry: &ToolRegistry,
     uploads: &[InputFile],
     config: &PipelineConfig,
+    engine: &OllamaEngine,
     prompt: &str,
     sink: &dyn ProgressSink,
 ) -> Result<Vec<ToolResult>> {
@@ -76,6 +78,7 @@ pub async fn execute_plan(
                     uploads,
                     outputs: &outputs,
                     prompt,
+                    engine,
                 };
                 match tool.run(step, &ctx).await {
                     Ok(r) => r,
