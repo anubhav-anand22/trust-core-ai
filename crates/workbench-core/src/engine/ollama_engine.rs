@@ -13,8 +13,9 @@
 //! Because the executor is strictly sequential, no two of these calls overlap.
 
 use ollama_rs::generation::completion::request::GenerationRequest;
-use ollama_rs::generation::parameters::{FormatType, KeepAlive};
+use ollama_rs::generation::parameters::{FormatType, JsonStructure, KeepAlive};
 use ollama_rs::Ollama;
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::engine::schemas::{FinalReport, InputFile, IntentResult, Plan, ToolResult};
@@ -88,12 +89,15 @@ impl OllamaEngine {
         &self.client
     }
 
-    /// Issue one JSON-constrained generation against the resident model and
+    /// Issue one schema-constrained generation against the resident model and
     /// deserialise it into `T`.
     ///
-    /// A malformed body is surfaced as [`CoreError::Schema`] — the signal the
-    /// planner's retry loop watches for.
-    async fn generate_json<T: DeserializeOwned>(
+    /// Ollama is given `T`'s JSON Schema (structured outputs), so even a small
+    /// model is forced to emit the right shape — arrays stay arrays, `depends_on`
+    /// entries stay strings, etc. A body that still fails to deserialise is
+    /// surfaced as [`CoreError::Schema`], the signal the planner's retry loop
+    /// watches for.
+    async fn generate_json<T: DeserializeOwned + JsonSchema>(
         &self,
         system: &str,
         user: String,
@@ -101,7 +105,7 @@ impl OllamaEngine {
     ) -> Result<T> {
         let request = GenerationRequest::new(self.llm_model.clone(), user)
             .system(system.to_string())
-            .format(FormatType::Json)
+            .format(FormatType::StructuredJson(Box::new(JsonStructure::new::<T>())))
             .keep_alive(KeepAlive::Indefinitely);
 
         let response = self

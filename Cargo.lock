@@ -6213,6 +6213,7 @@ dependencies = [
  "pbkdf2",
  "pdfplumber",
  "rten",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.10.9",

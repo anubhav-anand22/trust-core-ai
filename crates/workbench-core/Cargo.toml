@@ -15,6 +15,9 @@ thiserror.workspace = true
 tracing.workspace = true
 ollama-rs.workspace = true
 async-trait = "0.1"
+# JSON-Schema derive, used to constrain Ollama structured outputs. Kept on the
+# same major as ollama-rs's own schemars dep so the Schema type matches.
+schemars = "1"
 
 # --- Phase 3: persistent-memory encryption --------------------------------
 aes-gcm = { version = "0.10", features = ["getrandom"] }

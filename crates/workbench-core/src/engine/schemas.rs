@@ -6,6 +6,7 @@
 //! A malformed response is a [`CoreError::Schema`](crate::CoreError::Schema),
 //! which is exactly what triggers a planner retry.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// File kinds the pipeline understands.
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Detected from the upload's extension by the host and echoed by role A; matched
 /// against [`TaskSpec::requires_file`](crate::planner::registry::TaskSpec) during
 /// validation so a plan can never schedule `ocr_image` with no image attached.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FileKind {
     Audio,
@@ -53,7 +54,7 @@ pub struct InputFile {
 }
 
 /// Output of **role A — Intent Parser**.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct IntentResult {
     /// Distinct user goals, one per ask.
     pub intents: Vec<String>,
@@ -67,7 +68,7 @@ pub struct IntentResult {
 
 /// One node of the plan. `depends_on` names other [`TaskStep::id`]s, forming a DAG
 /// that [`validate_plan`](crate::planner::registry::validate_plan) checks.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TaskStep {
     pub id: String,
     /// Must be a name present in
@@ -81,7 +82,7 @@ pub struct TaskStep {
 }
 
 /// Output of **role B — Task Planner**: an ordered, executable sequence.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Plan {
     pub steps: Vec<TaskStep>,
 }
@@ -134,7 +135,7 @@ pub struct QualityReport {
 }
 
 /// Output of **role C — Output Compiler**: what the user actually reads.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FinalReport {
     pub summary: String,
     #[serde(default)]
