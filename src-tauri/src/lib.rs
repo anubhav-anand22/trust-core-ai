@@ -1,170 +1,170 @@
+//! Tauri host for the Sovereign On-Premise AI Workbench.
+//!
+//! What stays on the Rust side of the app:
+//!   * Ollama bootstrap — install + tier-aware model pulls ([`bootstrap`])
+//!   * Host capability probe + model-tier pick ([`bootstrap::hardware`], [`bootstrap::models`])
+//!   * Driving [`workbench_core`] once per turn and streaming
+//!     [`StepEvent`](workbench_core::StepEvent)s to the React stepper ([`submit_turn`])
+//!
+//! The pipeline (planning, validation, tools, memory) lives in the
+//! `workbench-core` crate and knows nothing about Tauri.
+
+mod bootstrap;
+mod events;
+
+use std::sync::Mutex;
+
 use ollama_rs::generation::completion::request::GenerationRequest;
+use ollama_rs::generation::parameters::KeepAlive;
 use ollama_rs::Ollama;
-use std::process::Command;
+use serde::Serialize;
 use tauri::ipc::Channel;
-use tauri::State;
-use tokio::process::Command as TokioCommand;
+use tauri::{Manager, State};
 
-// Managed state for Tauri
+use bootstrap::hardware::detect_hardware;
+use bootstrap::models::{ensure_models, probe_system, ModelPlan};
+use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed};
+use events::ChannelSink;
+use workbench_core::engine::OllamaEngine;
+use workbench_core::executor::ToolRegistry;
+use workbench_core::{PipelineConfig, ProgressSink, StepEvent};
+
+/// Where the local Ollama server listens. Fixed — this is an offline desktop app.
+const OLLAMA_URL: &str = "http://127.0.0.1:11434";
+
+/// Tauri-managed shared state.
 pub struct AppState {
+    /// Client used by the bootstrap commands (list / pull models).
     pub ollama: Ollama,
+    /// The tier the user confirmed in the bootstrap screen. `None` until then.
+    pub model_plan: Mutex<Option<ModelPlan>>,
 }
 
-#[tauri::command]
-fn is_ollama_installed() -> bool {
-    let (shell, shell_arg, check_cmd) = if cfg!(target_os = "windows") {
-        ("cmd", "/C", "where ollama")
-    } else {
-        ("sh", "-c", "command -v ollama")
-    };
-
-    match Command::new(shell).args([shell_arg, check_cmd]).output() {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
+impl AppState {
+    /// The active plan, or the conservative fallback if nothing is set yet.
+    fn plan(&self) -> ModelPlan {
+        self.model_plan
+            .lock()
+            .expect("model_plan mutex poisoned")
+            .clone()
+            .unwrap_or_else(ModelPlan::fallback)
     }
 }
 
-#[tauri::command]
-async fn ensure_ollama_installed(on_progress: Channel<String>) -> Result<bool, String> {
-    if is_ollama_installed() {
-        let _ = on_progress.send("✔ Ollama is already installed.".to_string());
-        return Ok(true);
-    }
-
-    let _ = on_progress.send("Ollama not found. Starting installation...".to_string());
-
-    let (shell, arg, script) = if cfg!(target_os = "macos") {
-        (
-            "sh",
-            "-c",
-            "brew install --cask ollama || (curl -fsSL https://ollama.com/download/Ollama-darwin.zip -o /tmp/Ollama-darwin.zip && unzip -qo /tmp/Ollama-darwin.zip -d /Applications && rm /tmp/Ollama-darwin.zip)"
-        )
-    } else if cfg!(target_os = "linux") {
-        (
-            "sh",
-            "-c",
-            "curl -fsSL https://ollama.com/install.sh | sh"
-        )
-    } else if cfg!(target_os = "windows") {
-        let ps_script = "try { winget install -e --id Ollama.Ollama --accept-source-agreements --accept-package-agreements } catch { $installerPath = \"$env:TEMP\\OllamaSetup.exe\"; Invoke-WebRequest -Uri \"https://ollama.com/download/OllamaSetup.exe\" -OutFile $installerPath; Start-Process -FilePath $installerPath -Args \"/silent\" -Wait; Remove-Item $installerPath; }";
-        (
-            "powershell",
-            "-Command",
-            ps_script
-        )
-    } else {
-        return Err("Unsupported OS".into());
-    };
-
-    let _ = on_progress.send(format!("Running installation script for {}...", std::env::consts::OS));
-
-    let status = TokioCommand::new(shell)
-        .args([arg, script])
-        .status()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if status.success() {
-        let _ = on_progress.send("✔ Ollama successfully installed!".to_string());
-        Ok(true)
-    } else {
-        let _ = on_progress.send("⚠️ Installation finished with errors. Restart your terminal/process to refresh PATH.".to_string());
-        Err("Installation failed".into())
-    }
-}
-
+/// Debug helper kept from the scaffold: one-shot generation. Not on the pipeline
+/// path — handy for smoke-testing that Ollama answers at all.
 #[tauri::command]
 async fn generate_response(prompt: String, state: State<'_, AppState>) -> Result<String, String> {
-    // Keep model in memory indefinitely (-1) or for a long duration (e.g. "60m")
-    let request = GenerationRequest::new("llama3.2:3b".to_string(), prompt)
-        .keep_alive(ollama_rs::generation::parameters::KeepAlive::Indefinitely);
-
-    let res = state.ollama.generate(request).await;
-    match res {
-        Ok(res) => Ok(res.response),
-        Err(e) => Err(e.to_string()),
-    }
+    let request = GenerationRequest::new(state.plan().llm, prompt).keep_alive(KeepAlive::Indefinitely);
+    state
+        .ollama
+        .generate(request)
+        .await
+        .map(|r| r.response)
+        .map_err(|e| e.to_string())
 }
 
-const REQUIRED_OLLAMA_MODELS: &[&str] = &["qwen3:4b", "llama3.2:3b"];
+/// Persist the model plan the user confirmed in the bootstrap screen.
+#[tauri::command]
+fn set_model_plan(plan: ModelPlan, state: State<'_, AppState>) {
+    *state.model_plan.lock().expect("model_plan mutex poisoned") = Some(plan);
+}
 
-#[derive(Clone, serde::Serialize)]
-struct ModelProgress {
-    model: String,
-    message: String,
-    percentage: Option<u8>,
+/// Warm the resident model so the first real turn is not cold. Idempotent.
+#[tauri::command]
+async fn warm_model(state: State<'_, AppState>) -> Result<(), String> {
+    let model = state
+        .model_plan
+        .lock()
+        .expect("model_plan mutex poisoned")
+        .as_ref()
+        .map(|p| p.llm.clone())
+        .ok_or("no model plan selected yet")?;
+    let request = GenerationRequest::new(model, String::new()).keep_alive(KeepAlive::Indefinitely);
+    let _ = state.ollama.generate(request).await;
+    Ok(())
+}
+
+/// Absolute paths the audit sidebar displays.
+#[derive(Serialize)]
+struct AuditPaths {
+    data_dir: String,
+    uploads: String,
+    lancedb: String,
+    session_context: String,
+    persistent_memory: String,
 }
 
 #[tauri::command]
-async fn ensure_required_models(
-    on_progress: Channel<ModelProgress>,
+fn audit_paths(app: tauri::AppHandle) -> Result<AuditPaths, String> {
+    let cfg = pipeline_config(&app, &ModelPlan::fallback())?;
+    Ok(AuditPaths {
+        data_dir: cfg.data_dir.display().to_string(),
+        uploads: cfg.uploads_dir().display().to_string(),
+        lancedb: cfg.lancedb_dir().display().to_string(),
+        session_context: cfg.session_path().display().to_string(),
+        persistent_memory: cfg.persistent_path().display().to_string(),
+    })
+}
+
+/// Assemble a [`PipelineConfig`] rooted at the OS app-data directory.
+fn pipeline_config(app: &tauri::AppHandle, plan: &ModelPlan) -> Result<PipelineConfig, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let models_dir = data_dir.join("models");
+    Ok(PipelineConfig {
+        kb_dir: data_dir.join("kb"),
+        data_dir,
+        ollama_url: OLLAMA_URL.to_string(),
+        llm_model: plan.llm.clone(),
+        vision_model: plan.vision.clone(),
+        embed_model: plan.embed.clone(),
+        // Phase 2 wires downloads for these; the paths are fixed now.
+        whisper_model_path: models_dir.join("ggml-base.en.bin"),
+        ocr_detection_model: models_dir.join("text-detection.rten"),
+        ocr_recognition_model: models_dir.join("text-recognition.rten"),
+    })
+}
+
+/// Run one turn of the pipeline, streaming [`StepEvent`]s to the front-end.
+///
+/// **Inputs:** the user prompt, a session id, and a `Channel` the UI listens on.
+/// **Phase 1:** no tools are registered, so a text-only prompt flows
+/// `idle → parsing_context → validating_plan → …`. Phase 2 registers real tools
+/// and adds file attachments.
+#[tauri::command]
+async fn submit_turn(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
+    prompt: String,
+    session_id: String,
+    on_event: Channel<StepEvent>,
 ) -> Result<(), String> {
-    for model_name in REQUIRED_OLLAMA_MODELS {
-        let target = if model_name.contains(':') {
-            model_name.to_string()
-        } else {
-            format!("{}:latest", model_name)
-        };
+    let plan = state.plan();
+    let config = pipeline_config(&app, &plan)?;
+    std::fs::create_dir_all(config.uploads_dir()).ok();
 
-        let models = state.ollama.list_local_models().await.map_err(|e| e.to_string())?;
-        let is_installed = models.iter().any(|m| m.name == target || m.name == *model_name);
+    let engine = OllamaEngine::new(
+        &config.ollama_url,
+        plan.llm.clone(),
+        plan.vision.clone(),
+        plan.embed.clone(),
+    );
+    let registry = ToolRegistry::new(); // Phase 2 populates this
+    let sink = ChannelSink(on_event);
 
-        if is_installed {
-            let _ = on_progress.send(ModelProgress {
-                model: model_name.to_string(),
-                message: format!("✔ Model \"{}\" is already installed.", model_name),
-                percentage: Some(100),
+    match workbench_core::run_turn(
+        &engine, &registry, &config, &session_id, &prompt, &[], &sink,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            sink.emit(StepEvent::Error {
+                message: e.to_string(),
             });
-            continue;
+            Err(e.to_string())
         }
-
-        let _ = on_progress.send(ModelProgress {
-            model: model_name.to_string(),
-            message: format!("Model \"{}\" not found. Starting download...", model_name),
-            percentage: Some(0),
-        });
-
-        use tokio_stream::StreamExt;
-        let mut stream = state
-            .ollama
-            .pull_model_stream(model_name.to_string(), false)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        while let Some(res) = stream.next().await {
-            match res {
-                Ok(progress) => {
-                    let percentage = if let (Some(total), Some(completed)) = (progress.total, progress.completed) {
-                        if total > 0 {
-                            Some(((completed as f64 / total as f64) * 100.0).round() as u8)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let _ = on_progress.send(ModelProgress {
-                        model: model_name.to_string(),
-                        message: progress.message,
-                        percentage,
-                    });
-                }
-                Err(e) => {
-                    return Err(format!("Error downloading {}: {}", model_name, e));
-                }
-            }
-        }
-
-        let _ = on_progress.send(ModelProgress {
-            model: model_name.to_string(),
-            message: format!("✔ Successfully downloaded \"{}\".", model_name),
-            percentage: Some(100),
-        });
     }
-
-    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -173,22 +173,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             ollama: Ollama::default(),
-        })
-        .setup(|app| {
-            // Warm up model in the background on startup so the first user prompt is instant
-            tauri::async_runtime::spawn(async {
-                let client = Ollama::default();
-                let warmup_req = GenerationRequest::new("llama3.2:3b".to_string(), "".to_string())
-                    .keep_alive(ollama_rs::generation::parameters::KeepAlive::Indefinitely);
-                let _ = client.generate(warmup_req).await;
-            });
-            Ok(())
+            model_plan: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             generate_response,
             is_ollama_installed,
             ensure_ollama_installed,
-            ensure_required_models
+            detect_hardware,
+            probe_system,
+            ensure_models,
+            set_model_plan,
+            warm_model,
+            audit_paths,
+            submit_turn,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

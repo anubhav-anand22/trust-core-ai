@@ -22,3 +22,18 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Rust / Cargo
+/target
+# workspace lock lives at the root now; the stale member lock is not used
+/src-tauri/Cargo.lock
+
+# Runtime data written by the app (uploads, vector store, memory, model files)
+/src-tauri/**/data/
+**/workbench-core/data/
+*.rten
+*.gguf
+ggml-*.bin
+
+# Local model cache / scratch
+/models/

@@ -1,9 +1,9 @@
 [package]
 name = "tauri-app"
-version = "0.1.0"
-description = "A Tauri App"
+version.workspace = true
+description = "Sovereign On-Premise AI Workbench"
 authors = ["you"]
-edition = "2021"
+edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -20,9 +20,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1.53.1", features = ["full"] }
-ollama-rs = { version = "0.3.6", features = ["stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+ollama-rs = { workspace = true }
 tokio-stream = "0.1.19"
-
+sysinfo = "0.33"
+workbench-core = { path = "../crates/workbench-core" }

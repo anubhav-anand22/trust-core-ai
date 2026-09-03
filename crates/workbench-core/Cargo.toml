@@ -1,0 +1,34 @@
+[package]
+name = "workbench-core"
+description = "Pure-Rust agentic pipeline for the Sovereign On-Premise AI Workbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# NOTE ON DEPENDENCY STAGING
+# Only the crates needed by Phase 0/1 (orchestration core) and Phase 3 (memory)
+# are declared now. The heavy tool crates — pdfplumber, whisper-rs, symphonia,
+# rubato, ocrs/rten, image, lancedb/arrow — are added in Phase 2 alongside the
+# `tools/*` modules they back, so early `cargo check` stays fast and each crate
+# arrives with the code that uses it.
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ollama-rs.workspace = true
+async-trait = "0.1"
+
+# --- Phase 3: persistent-memory encryption --------------------------------
+aes-gcm = { version = "0.10", features = ["getrandom"] }
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+sha2 = "0.10"
+machine-uid = "0.5"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

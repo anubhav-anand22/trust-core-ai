@@ -1,0 +1,37 @@
+# Workspace root for the Sovereign On-Premise AI Workbench.
+#
+# Two members:
+#   * `crates/workbench-core` — the pure-Rust pipeline (engine, planner, executor,
+#     tools, memory). No Tauri, no UI: it can be unit-tested with plain `cargo test`.
+#   * `src-tauri` — the Tauri desktop host. Owns the window, the Ollama bootstrap,
+#     hardware detection, and the command layer that drives `workbench-core` and
+#     streams progress to the React front-end.
+#
+# Shared third-party versions live in `[workspace.dependencies]` so both members
+# stay on exactly the same release.
+
+[workspace]
+members = ["src-tauri", "crates/workbench-core"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.77"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+# Ollama HTTP client — pinned to the version the original scaffold already used.
+ollama-rs = { version = "0.3.6", features = ["stream"] }
+
+# Fast iterative dev builds by default. The few compute-heavy crates that are
+# painful at opt-level 0 (whisper.cpp, rten, arrow kernels) get bumped
+# individually in Phase 2, e.g.:
+#   [profile.dev.package.whisper-rs-sys]
+#   opt-level = 3
