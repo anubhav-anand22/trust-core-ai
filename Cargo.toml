@@ -35,3 +35,13 @@ ollama-rs = { version = "0.3.6", features = ["stream"] }
 # individually in Phase 2, e.g.:
 #   [profile.dev.package.whisper-rs-sys]
 #   opt-level = 3
+
+# Disk hygiene: the LanceDB + Arrow + DataFusion + Tauri graph is ~400 crates.
+# At the default `debug = 2` the dev `target/` runs to ~20 GB, most of it
+# debuginfo for dependencies nobody steps through. Keep line tables for our own
+# crates (backtraces stay useful); drop debuginfo entirely for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
