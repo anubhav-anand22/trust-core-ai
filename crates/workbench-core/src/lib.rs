@@ -11,6 +11,10 @@
 //! The Tauri host in `src-tauri` wires a [`ProgressSink`] over a `tauri::ipc::Channel`
 //! and calls [`run_turn`] (added in Phase 2).
 
+// `planner/planner.rs`, `executor/executor.rs` etc. — the leaf file carries the
+// implementation, the `mod.rs` only re-exports. Intentional.
+#![allow(clippy::module_inception)]
+
 pub mod engine;
 pub mod events;
 pub mod executor;

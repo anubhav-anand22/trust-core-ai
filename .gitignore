@@ -37,3 +37,6 @@ ggml-*.bin
 
 # Local model cache / scratch
 /models/
+
+# demo fixtures are generated, not committed
+demo/fixtures/
