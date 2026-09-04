@@ -29,6 +29,33 @@ pub use engine::schemas;
 pub use events::{ProgressSink, StepEvent};
 pub use pipeline::{persist_long_term, resume_turn, run_turn, TurnOutcome};
 
+/// Threads a compute-heavy step may use: every core but one.
+///
+/// This is a desktop app, and a turn must not make the machine unusable while it
+/// runs. whisper.cpp and the `rten` OCR runtime both default to grabbing every
+/// core, which on a small CPU-only host starves the window manager — frozen
+/// tray flyouts, stuttering video calls — for the whole step.
+pub fn worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .max(1)
+}
+
+/// Bound the global `rayon` pool (used by `rten` under `ocrs`) to
+/// [`worker_threads`].
+///
+/// Call once, before any tool runs. Safe to call repeatedly: after the first
+/// call the pool already exists and the builder returns an error we ignore.
+pub fn init_thread_pools() {
+    // `rayon` reads this when it lazily builds its global pool. Setting it is
+    // enough and avoids taking a direct dependency on rayon here.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        std::env::set_var("RAYON_NUM_THREADS", worker_threads().to_string());
+    }
+}
+
 /// Everything the pipeline needs to resolve models and on-disk locations.
 ///
 /// Built by the Tauri host from the app-data dir + the hardware-selected

@@ -14,6 +14,7 @@
 
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::generation::parameters::{FormatType, JsonStructure, KeepAlive};
+use ollama_rs::models::ModelOptions;
 use ollama_rs::Ollama;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -46,12 +47,43 @@ earlier turns, and long-term facility memory. Synthesise them into STRICT JSON:
 Never invent measurements, tag numbers or SOP clauses that are not in the tool outputs.
 Return JSON only. No prose, no markdown, no code fences.";
 
+/// How much context, generation and CPU one session may use.
+///
+/// Ollama's per-model defaults are not safe here: a 4096-token window silently
+/// truncates a long attachment (the model then reports "no relevant information"
+/// about text that was simply cut off), and an uncapped thread count pins every
+/// core, starving the desktop while a turn runs.
+#[derive(Clone, Copy, Debug)]
+pub struct ResourceLimits {
+    /// Context window. Must fit the evidence blob plus the answer.
+    pub num_ctx: u64,
+    /// Threads Ollama may use. Leave at least one core for the OS.
+    pub num_thread: u32,
+    /// Ceiling on generated tokens, so a rambling small model cannot burn
+    /// minutes of CPU on one step.
+    pub num_predict: i32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            num_ctx: 8192,
+            num_thread: cores.saturating_sub(1).max(1) as u32,
+            num_predict: 640,
+        }
+    }
+}
+
 /// Wraps the Ollama client and the three model names for one session.
 pub struct OllamaEngine {
     client: Ollama,
     llm_model: String,
     vision_model: String,
     embed_model: String,
+    limits: ResourceLimits,
 }
 
 impl OllamaEngine {
@@ -72,7 +104,27 @@ impl OllamaEngine {
             llm_model: llm_model.into(),
             vision_model: vision_model.into(),
             embed_model: embed_model.into(),
+            limits: ResourceLimits::default(),
         }
+    }
+
+    /// Override the default context / thread / output ceilings.
+    pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> ResourceLimits {
+        self.limits
+    }
+
+    /// The options every request carries: bounded context, bounded threads,
+    /// bounded output.
+    fn opts(&self) -> ModelOptions {
+        ModelOptions::default()
+            .num_ctx(self.limits.num_ctx)
+            .num_thread(self.limits.num_thread)
+            .num_predict(self.limits.num_predict)
     }
 
     pub fn llm_model(&self) -> &str {
@@ -106,6 +158,7 @@ impl OllamaEngine {
         let request = GenerationRequest::new(self.llm_model.clone(), user)
             .system(system.to_string())
             .format(FormatType::StructuredJson(Box::new(JsonStructure::new::<T>())))
+            .options(self.opts())
             .keep_alive(KeepAlive::Indefinitely);
 
         let response = self
@@ -225,6 +278,7 @@ Return JSON only. No prose, no markdown, no code fences.",
         use ollama_rs::generation::images::Image;
         let request = GenerationRequest::new(self.vision_model.clone(), question.to_string())
             .add_image(Image::from_base64(image_base64.to_string()))
+            .options(self.opts())
             .keep_alive(KeepAlive::UnloadOnCompletion);
         let response = self
             .client
@@ -246,9 +300,12 @@ Return JSON only. No prose, no markdown, no code fences.",
             self.llm_model.clone(),
             format!(
                 "USER REQUEST:\n{user_prompt}\n\nTASK:\n{instruction}\n\nEVIDENCE:\n{evidence}\n\n\
-                 Answer concisely and only from the evidence."
+                 Answer concisely and only from the evidence. When the evidence gives a \
+                 rate, fee or percentage the request asks about, quote it exactly and show \
+                 the arithmetic for the user's figures."
             ),
         )
+        .options(self.opts())
         .keep_alive(KeepAlive::Indefinitely);
         let response = self
             .client
@@ -270,6 +327,7 @@ Return JSON only. No prose, no markdown, no code fences.",
                  Preserve equipment tags, measurements and dates verbatim.\n\n{text}"
             ),
         )
+        .options(self.opts())
         .keep_alive(KeepAlive::Indefinitely);
 
         let response = self

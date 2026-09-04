@@ -3,4 +3,4 @@
 pub mod ollama_engine;
 pub mod schemas;
 
-pub use ollama_engine::OllamaEngine;
+pub use ollama_engine::{OllamaEngine, ResourceLimits};

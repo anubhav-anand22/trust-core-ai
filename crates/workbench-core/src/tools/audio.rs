@@ -99,6 +99,9 @@ fn transcribe(model_path: &Path, audio_path: &str) -> Result<String> {
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_special(false);
+    // Leave a core for the OS. whisper.cpp otherwise takes every core it can see,
+    // which on a 4-core CPU-only host freezes the desktop for the whole step.
+    params.set_n_threads(crate::worker_threads() as i32);
 
     state
         .full(params, &samples)

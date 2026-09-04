@@ -192,12 +192,23 @@ fn turn_setup(
     let plan = state.plan();
     let config = pipeline_config(app, &plan)?;
     let uploads = persist_uploads(&config, session_id, files)?;
+
+    // Bound context, threads and output against the real host. Ollama's own
+    // defaults would take every core (freezing the desktop for the whole turn)
+    // and silently truncate long attachments to the model's default window.
+    let hw = detect_hardware();
+    let limits = workbench_core::engine::ResourceLimits {
+        num_thread: hw.worker_threads() as u32,
+        ..Default::default()
+    };
+
     let engine = OllamaEngine::new(
         &config.ollama_url,
         plan.llm.clone(),
         plan.vision.clone(),
         plan.embed.clone(),
-    );
+    )
+    .with_limits(limits);
     Ok((config, uploads, engine))
 }
 
@@ -273,6 +284,10 @@ async fn resume_turn(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Cap the OCR runtime's thread pool before anything can build it, so a turn
+    // never pins every core and locks up the desktop.
+    workbench_core::init_thread_pools();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
