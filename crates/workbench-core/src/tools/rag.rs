@@ -70,14 +70,24 @@ fn chunk_text(text: &str) -> Vec<String> {
     chunks
 }
 
-/// Embed one string via the configured embedding model, unloading it immediately.
-async fn embed(engine: &OllamaEngine, text: &str) -> Result<Vec<f32>> {
+/// Embed a batch of strings in **one** request.
+///
+/// Batching matters more than it looks: the embedding model is called with
+/// `keep_alive = 0` so it never co-resides with the resident LLM, which means one
+/// request per chunk would load and unload the weights once per chunk. A KB of a
+/// few hundred chunks turned that into minutes of pure model-loading churn.
+pub(crate) async fn embed_many(engine: &OllamaEngine, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     use ollama_rs::generation::embeddings::request::{EmbeddingsInput, GenerateEmbeddingsRequest};
     use ollama_rs::generation::parameters::KeepAlive;
 
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expected = texts.len();
+
     let request = GenerateEmbeddingsRequest::new(
         engine.embed_model().to_string(),
-        EmbeddingsInput::Single(text.to_string()),
+        EmbeddingsInput::Multiple(texts),
     )
     .keep_alive(KeepAlive::UnloadOnCompletion);
 
@@ -87,11 +97,106 @@ async fn embed(engine: &OllamaEngine, text: &str) -> Result<Vec<f32>> {
         .await
         .map_err(|e| CoreError::VectorStore(format!("embedding request failed: {e}")))?;
 
-    response
-        .embeddings
+    if response.embeddings.len() != expected {
+        return Err(CoreError::VectorStore(format!(
+            "embedding count mismatch: asked for {expected}, got {}",
+            response.embeddings.len()
+        )));
+    }
+    Ok(response.embeddings)
+}
+
+/// Embed a single string.
+pub(crate) async fn embed(engine: &OllamaEngine, text: &str) -> Result<Vec<f32>> {
+    embed_many(engine, vec![text.to_string()])
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| CoreError::VectorStore("embedding response was empty".into()))
+}
+
+/// Cosine similarity, for ranking without a round trip to the vector store.
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
+    }
+}
+
+/// Reduce a long evidence blob to the passages that actually bear on `query`.
+///
+/// Attachments are frequently far larger than the context window. Passing the
+/// whole thing means the tail is silently truncated — which is how a fee table on
+/// page 20 becomes "no relevant information found" — and makes prefill crawl on a
+/// CPU-only host. Chunk, embed once, keep the best `top_k`, restore reading order.
+///
+/// Falls back to a plain head-truncation if embedding is unavailable, so this can
+/// never fail a turn outright.
+pub(crate) async fn select_relevant(
+    engine: &OllamaEngine,
+    query: &str,
+    text: &str,
+    top_k: usize,
+    budget_chars: usize,
+) -> String {
+    if text.chars().count() <= budget_chars {
+        return text.to_string();
+    }
+
+    let chunks = chunk_text(text);
+    if chunks.len() <= 1 {
+        return text.chars().take(budget_chars).collect();
+    }
+
+    let mut inputs = Vec::with_capacity(chunks.len() + 1);
+    inputs.push(query.to_string());
+    inputs.extend(chunks.iter().cloned());
+
+    let vectors = match embed_many(engine, inputs).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "evidence ranking unavailable; truncating instead");
+            return text.chars().take(budget_chars).collect();
+        }
+    };
+
+    let (query_vec, chunk_vecs) = vectors.split_at(1);
+    let mut ranked: Vec<(usize, f32)> = chunk_vecs
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, cosine(&query_vec[0], v)))
+        .collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    // Take the best chunks up to the budget, then put them back in document order
+    // so the excerpt still reads coherently.
+    let mut picked: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for (idx, _) in ranked.into_iter().take(top_k) {
+        let len = chunks[idx].chars().count();
+        if used + len > budget_chars && !picked.is_empty() {
+            continue;
+        }
+        used += len;
+        picked.push(idx);
+    }
+    picked.sort_unstable();
+
+    picked
+        .into_iter()
+        .map(|i| chunks[i].as_str())
+        .collect::<Vec<_>>()
+        .join("\n…\n")
 }
 
 /// One KB chunk ready to insert.
@@ -103,10 +208,12 @@ struct Row {
 }
 
 /// Read + chunk + embed every supported file in `kb_dir`.
+///
+/// All chunks are embedded in a single batched request — see [`embed_many`].
 async fn build_rows(engine: &OllamaEngine, kb_dir: &Path) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
+    let mut pending: Vec<(String, String, usize)> = Vec::new(); // (source, text, index)
     let Ok(entries) = std::fs::read_dir(kb_dir) else {
-        return Ok(rows);
+        return Ok(Vec::new());
     };
 
     for entry in entries.flatten() {
@@ -129,16 +236,26 @@ async fn build_rows(engine: &OllamaEngine, kb_dir: &Path) -> Result<Vec<Row>> {
         };
 
         for (i, chunk) in chunk_text(&raw).into_iter().enumerate() {
-            let vector = embed(engine, &chunk).await?;
-            rows.push(Row {
-                id: format!("{source}#{i}"),
-                text: chunk,
-                source: source.clone(),
-                vector,
-            });
+            pending.push((source.clone(), chunk, i));
         }
     }
-    Ok(rows)
+
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let vectors = embed_many(engine, pending.iter().map(|(_, t, _)| t.clone()).collect()).await?;
+
+    Ok(pending
+        .into_iter()
+        .zip(vectors)
+        .map(|((source, text, i), vector)| Row {
+            id: format!("{source}#{i}"),
+            text,
+            source,
+            vector,
+        })
+        .collect())
 }
 
 /// Turn the rows into a single Arrow `RecordBatch` with a fixed-size-list vector

@@ -9,6 +9,17 @@ use crate::engine::schemas::{TaskStep, ToolResult};
 use crate::tools::{Tool, ToolContext};
 use crate::Result;
 
+/// How many retrieved passages to put in front of the model.
+const EVIDENCE_TOP_K: usize = 8;
+
+/// Characters of evidence to allow, derived from the context window.
+///
+/// Roughly 4 characters per token; spend about half the window on evidence and
+/// leave the rest for the system prompt, the question and the answer.
+fn evidence_budget_chars(num_ctx: u64) -> usize {
+    ((num_ctx as usize) * 4) / 2
+}
+
 /// One tool that serves both analysis task names, distinguished at construction.
 pub struct AnalysisTool {
     task: &'static str,
@@ -57,6 +68,19 @@ impl Tool for AnalysisTool {
                 started.elapsed().as_millis(),
             ));
         }
+
+        // An attachment is routinely longer than the context window. Sending it
+        // whole means the model silently sees only the head of it — the reason a
+        // rate buried on a late page reads back as "no relevant information" — and
+        // makes prefill crawl. Keep the passages that bear on the user's question.
+        let evidence = crate::tools::rag::select_relevant(
+            ctx.engine,
+            ctx.prompt,
+            &evidence,
+            EVIDENCE_TOP_K,
+            evidence_budget_chars(ctx.engine.limits().num_ctx),
+        )
+        .await;
 
         match ctx.engine.analyze(self.instruction, &evidence, ctx.prompt).await {
             Ok(text) => Ok(ToolResult {
