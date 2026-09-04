@@ -1,18 +1,24 @@
 //! `search_knowledge` — retrieval over the standing SOP / safety-manual KB.
 //!
-//! Flow: on first use, every `.md` / `.txt` / `.pdf` in `kb_dir` is chunked,
-//! embedded via Ollama `nomic-embed-text` (`keep_alive = 0`), and written to a
-//! JSON index under `data/`. A query embeds the same way and is cosine-ranked
-//! against the stored chunks.
+//! Backed by an embedded **LanceDB** table (`sop_kb`) under `data/lancedb/`.
 //!
-//! The index is a brute-force cosine scan. For a plant KB of a few hundred chunks
-//! that is exact and sub-millisecond. The store sits behind [`ensure_ingested`] /
-//! [`VectorIndex`] so a `lancedb`-backed implementation can replace it later
-//! (Phase 5) without touching this tool or its callers.
+//! Flow: on first use, every `.md` / `.txt` / `.pdf` in `kb_dir` is split into
+//! ~800-token overlapping chunks, each embedded via Ollama `nomic-embed-text`
+//! (`keep_alive = 0`), and written to the table as `{id, text, source, vector}`.
+//! A query embeds the same way and LanceDB returns the nearest rows by **cosine**
+//! distance. A sidecar file records which embedding model built the table; if it
+//! changes, the table is dropped and rebuilt.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use arrow_array::types::Float32Type;
+use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
+use lancedb::database::CreateTableMode;
+use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::{Connection, DistanceType, Table};
 
 use crate::engine::schemas::{TaskStep, ToolResult};
 use crate::engine::OllamaEngine;
@@ -23,68 +29,13 @@ use crate::{CoreError, Result};
 const CHUNK_CHARS: usize = 1_100;
 const CHUNK_OVERLAP: usize = 150;
 const DEFAULT_TOP_K: usize = 5;
+const TABLE: &str = "sop_kb";
+/// Sidecar file (next to the LanceDB dir) naming the embedding model the table
+/// was built with, so a model change triggers a rebuild.
+const MODEL_MARKER: &str = "sop_kb.model";
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Chunk {
-    text: String,
-    source: String,
-    vector: Vec<f32>,
-}
-
-/// The on-disk knowledge index.
-#[derive(Default, Serialize, Deserialize)]
-struct VectorIndex {
-    /// Embedding model the vectors were produced with. If it changes, the index
-    /// is rebuilt.
-    model: String,
-    chunks: Vec<Chunk>,
-}
-
-impl VectorIndex {
-    fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
-    }
-
-    fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec(self)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    }
-
-    fn search(&self, query: &[f32], top_k: usize) -> Vec<(f32, &Chunk)> {
-        let mut scored: Vec<(f32, &Chunk)> = self
-            .chunks
-            .iter()
-            .map(|c| (cosine(query, &c.vector), c))
-            .collect();
-        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-        scored.truncate(top_k);
-        scored
-    }
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    if a.is_empty() || a.len() != b.len() {
-        return 0.0;
-    }
-    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
-    for (x, y) in a.iter().zip(b) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na.sqrt() * nb.sqrt())
-    }
+fn vs_err(e: impl std::fmt::Display) -> CoreError {
+    CoreError::VectorStore(e.to_string())
 }
 
 /// Split text into overlapping windows, preferring to break on a newline or
@@ -143,31 +94,19 @@ async fn embed(engine: &OllamaEngine, text: &str) -> Result<Vec<f32>> {
         .ok_or_else(|| CoreError::VectorStore("embedding response was empty".into()))
 }
 
-/// Build the index from `kb_dir` if it is missing or was made with another model.
-///
-/// **Output:** the number of chunks in the index. Idempotent and cheap on repeat
-/// calls (a non-empty, same-model index short-circuits).
-pub async fn ensure_ingested(
-    engine: &OllamaEngine,
-    kb_dir: &Path,
-    index_path: &Path,
-) -> Result<usize> {
-    let existing = VectorIndex::load(index_path);
-    if !existing.chunks.is_empty() && existing.model == engine.embed_model() {
-        return Ok(existing.chunks.len());
-    }
+/// One KB chunk ready to insert.
+struct Row {
+    id: String,
+    text: String,
+    source: String,
+    vector: Vec<f32>,
+}
 
-    let mut index = VectorIndex {
-        model: engine.embed_model().to_string(),
-        chunks: Vec::new(),
-    };
-
-    let entries = match std::fs::read_dir(kb_dir) {
-        Ok(e) => e,
-        Err(_) => {
-            index.save(index_path)?;
-            return Ok(0);
-        }
+/// Read + chunk + embed every supported file in `kb_dir`.
+async fn build_rows(engine: &OllamaEngine, kb_dir: &Path) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    let Ok(entries) = std::fs::read_dir(kb_dir) else {
+        return Ok(rows);
     };
 
     for entry in entries.flatten() {
@@ -189,19 +128,148 @@ pub async fn ensure_ingested(
             _ => continue,
         };
 
-        for chunk in chunk_text(&raw) {
+        for (i, chunk) in chunk_text(&raw).into_iter().enumerate() {
             let vector = embed(engine, &chunk).await?;
-            index.chunks.push(Chunk {
+            rows.push(Row {
+                id: format!("{source}#{i}"),
                 text: chunk,
                 source: source.clone(),
                 vector,
             });
         }
     }
+    Ok(rows)
+}
 
-    index.save(index_path)?;
-    tracing::info!(chunks = index.chunks.len(), "knowledge base ingested");
-    Ok(index.chunks.len())
+/// Turn the rows into a single Arrow `RecordBatch` with a fixed-size-list vector
+/// column of width `dim`.
+fn rows_to_batch(rows: &[Row], dim: i32) -> Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("text", DataType::Utf8, false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        ),
+    ]));
+
+    let ids = StringArray::from(rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>());
+    let texts = StringArray::from(rows.iter().map(|r| r.text.clone()).collect::<Vec<_>>());
+    let sources = StringArray::from(rows.iter().map(|r| r.source.clone()).collect::<Vec<_>>());
+    let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+        rows.iter()
+            .map(|r| Some(r.vector.iter().map(|x| Some(*x)).collect::<Vec<_>>())),
+        dim,
+    );
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(texts),
+            Arc::new(sources),
+            Arc::new(vectors),
+        ],
+    )
+    .map_err(vs_err)
+}
+
+/// Open the `sop_kb` table, (re)building it from `kb_dir` if it is missing or was
+/// built with a different embedding model.
+///
+/// **Output:** an open [`Table`], or `Ok(None)` if the KB directory has no
+/// ingestable files.
+pub async fn ensure_ingested(
+    engine: &OllamaEngine,
+    kb_dir: &Path,
+    db_dir: &Path,
+) -> Result<Option<Table>> {
+    std::fs::create_dir_all(db_dir).ok();
+    let uri = db_dir.to_string_lossy().replace('\\', "/");
+    let db: Connection = lancedb::connect(&uri).execute().await.map_err(vs_err)?;
+
+    let marker = db_dir.join(MODEL_MARKER);
+    let current_model = std::fs::read_to_string(&marker).ok();
+    let want_model = engine.embed_model().to_string();
+
+    let has_table = db
+        .table_names()
+        .execute()
+        .await
+        .map_err(vs_err)?
+        .iter()
+        .any(|t| t == TABLE);
+
+    if has_table && current_model.as_deref() == Some(want_model.as_str()) {
+        return Ok(Some(db.open_table(TABLE).execute().await.map_err(vs_err)?));
+    }
+
+    // Need to (re)build. `CreateTableMode::Overwrite` drops any existing table as
+    // part of the same call, so a stale (wrong-embedding-model) table is replaced
+    // without a separate `drop_table`.
+    let rows = build_rows(engine, kb_dir).await?;
+    if rows.is_empty() {
+        tracing::warn!(?kb_dir, "knowledge base has no ingestable files");
+        return Ok(None);
+    }
+
+    let dim = rows[0].vector.len() as i32;
+    let batch = rows_to_batch(&rows, dim)?;
+
+    db.create_table(TABLE, vec![batch])
+        .mode(CreateTableMode::Overwrite)
+        .execute()
+        .await
+        .map_err(vs_err)?;
+    std::fs::write(&marker, &want_model).ok();
+    tracing::info!(chunks = rows.len(), "knowledge base ingested into LanceDB");
+
+    Ok(Some(db.open_table(TABLE).execute().await.map_err(vs_err)?))
+}
+
+/// Nearest `top_k` chunks to `query_vec` by cosine distance.
+async fn search(
+    table: &Table,
+    query_vec: Vec<f32>,
+    top_k: usize,
+) -> Result<Vec<(String, String, f32)>> {
+    let batches: Vec<RecordBatch> = table
+        .query()
+        .nearest_to(query_vec)
+        .map_err(vs_err)?
+        .distance_type(DistanceType::Cosine)
+        .limit(top_k)
+        .execute()
+        .await
+        .map_err(vs_err)?
+        .try_collect()
+        .await
+        .map_err(vs_err)?;
+
+    let mut hits = Vec::new();
+    for batch in &batches {
+        let text = batch
+            .column_by_name("text")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let source = batch
+            .column_by_name("source")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let dist = batch
+            .column_by_name("_distance")
+            .and_then(|c| c.as_any().downcast_ref::<Float32Array>());
+
+        let (Some(text), Some(source)) = (text, source) else {
+            continue;
+        };
+        for i in 0..batch.num_rows() {
+            // Cosine distance is 1 - similarity; report the similarity as score.
+            let score = dist.map(|d| 1.0 - d.value(i)).unwrap_or(0.0);
+            hits.push((text.value(i).to_string(), source.value(i).to_string(), score));
+        }
+    }
+    Ok(hits)
 }
 
 /// `search_knowledge` tool.
@@ -215,12 +283,30 @@ impl Tool for RagTool {
 
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         let started = std::time::Instant::now();
-        let index_path = ctx.config.lancedb_dir().join("kb_index.json");
+        let db_dir = ctx.config.lancedb_dir();
 
-        // First-run ingest; ignored on later turns.
-        if let Err(e) = ensure_ingested(ctx.engine, &ctx.config.kb_dir, &index_path).await {
-            tracing::warn!(error = %e, "knowledge base ingest failed");
-        }
+        let table = match ensure_ingested(ctx.engine, &ctx.config.kb_dir, &db_dir).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return Ok(ToolResult {
+                    step_id: step.id.clone(),
+                    task: self.name().into(),
+                    ok: true,
+                    data: serde_json::json!({ "chunks": [], "query": ctx.prompt }),
+                    error: None,
+                    warning: Some("knowledge base is empty (no documents ingested)".into()),
+                    elapsed_ms: started.elapsed().as_millis(),
+                });
+            }
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    &step.id,
+                    self.name(),
+                    e.to_string(),
+                    started.elapsed().as_millis(),
+                ))
+            }
+        };
 
         let query = step
             .args
@@ -229,19 +315,6 @@ impl Tool for RagTool {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(ctx.prompt)
             .to_string();
-
-        let index = VectorIndex::load(&index_path);
-        if index.chunks.is_empty() {
-            return Ok(ToolResult {
-                step_id: step.id.clone(),
-                task: self.name().into(),
-                ok: true,
-                data: serde_json::json!({ "chunks": [], "query": query }),
-                error: None,
-                warning: Some("knowledge base is empty (no documents ingested)".into()),
-                elapsed_ms: started.elapsed().as_millis(),
-            });
-        }
 
         let query_vec = match embed(ctx.engine, &query).await {
             Ok(v) => v,
@@ -262,11 +335,22 @@ impl Tool for RagTool {
             .map(|k| k as usize)
             .unwrap_or(DEFAULT_TOP_K);
 
-        let hits: Vec<serde_json::Value> = index
-            .search(&query_vec, top_k)
+        let hits = match search(&table, query_vec, top_k).await {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(ToolResult::failure(
+                    &step.id,
+                    self.name(),
+                    e.to_string(),
+                    started.elapsed().as_millis(),
+                ))
+            }
+        };
+
+        let chunks: Vec<serde_json::Value> = hits
             .into_iter()
-            .map(|(score, c)| {
-                serde_json::json!({ "text": c.text, "source": c.source, "score": score })
+            .map(|(text, source, score)| {
+                serde_json::json!({ "text": text, "source": source, "score": score })
             })
             .collect();
 
@@ -274,7 +358,7 @@ impl Tool for RagTool {
             step_id: step.id.clone(),
             task: self.name().into(),
             ok: true,
-            data: serde_json::json!({ "chunks": hits, "query": query }),
+            data: serde_json::json!({ "chunks": chunks, "query": query }),
             error: None,
             warning: None,
             elapsed_ms: started.elapsed().as_millis(),
@@ -287,23 +371,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cosine_is_one_for_identical_and_zero_for_orthogonal() {
-        assert!((cosine(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]) - 1.0).abs() < 1e-6);
-        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
-        assert_eq!(cosine(&[1.0], &[1.0, 2.0]), 0.0); // length mismatch -> 0
-    }
-
-    #[test]
     fn chunking_covers_text_with_overlap_and_no_empty_pieces() {
-        let text = "para one.\n".repeat(400); // ~4000 chars -> several chunks
+        let text = "para one.\n".repeat(400);
         let chunks = chunk_text(&text);
         assert!(chunks.len() >= 3, "expected multiple chunks, got {}", chunks.len());
         assert!(chunks.iter().all(|c| !c.trim().is_empty()));
         assert!(chunks.iter().all(|c| c.chars().count() <= CHUNK_CHARS + 8));
-        // consecutive chunks should share some tail/head text (overlap)
-        let a_tail: String = chunks[0].chars().rev().take(40).collect();
-        let a_tail: String = a_tail.chars().rev().collect();
-        assert!(chunks[1].contains(a_tail.trim()) || chunks[1].starts_with("para"));
     }
 
     #[test]

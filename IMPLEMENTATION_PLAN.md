@@ -45,8 +45,8 @@ Tauri app  (one binary)
      tools/ocr.rs          ocr_image   — ocrs + rten (pure Rust). Degrades if .rten models absent.
      tools/audio.rs        transcribe_audio — whisper-rs; symphonia decode + linear resample to 16k mono.
      tools/vision.rs       analyze_image — moondream via Ollama, keep_alive:0
-     tools/rag.rs          search_knowledge — chunk + embed (nomic-embed-text) + brute-force cosine over a
-                           JSON index. `VectorIndex` seam kept for a lancedb backend later.
+     tools/rag.rs          search_knowledge — chunk + embed (nomic-embed-text) into an embedded LanceDB
+                           table (data/lancedb/sop_kb); cosine-distance nearest-neighbour query.
      tools/analysis.rs     summarize / compare_to_sop — resident model over accumulated evidence
      memory/session.rs     session_context.json — append + rolling compression via the resident model
      memory/persistent.rs  persistent_memory.json — AES-256-GCM, PBKDF2-HMAC-SHA256 over machine-uid
@@ -66,7 +66,7 @@ Tauri app  (one binary)
 | Python + Streamlit + FastAPI sidecar | Pure Rust in the Tauri app; events over Tauri `Channel` | No interpreter to ship; ~500–800 MB of Python deps avoided; no PyInstaller fragility |
 | `pdfplumber` (Python) with OCR fallback for scanned PDFs | `pdfplumber` **Rust crate**; scanned PDFs explicitly unsupported (tool reports "no extractable text") | Keeps it single-binary; scanned docs are a separate OCR path anyway |
 | whisper.cpp binary + Tesseract installer | `whisper-rs` (whisper.cpp compiled in) + `ocrs`/`rten` (pure Rust) | No external binaries; Windows-friendly |
-| ChromaDB / LanceDB vector store | Brute-force cosine over a JSON index behind a `VectorIndex` trait | Removes arrow+datafusion (~5 min/build); identical quality at a few-hundred-chunk KB; lancedb drops in behind the seam later |
+| ChromaDB (Python) | **Embedded LanceDB** (Arrow-backed, `data/lancedb/sop_kb`) | Pure-Rust, no server. (Briefly a hand-rolled JSON cosine loop during development to keep build times down; swapped to LanceDB once the rest was stable.) |
 | "AES-GCM via `cryptography.fernet`" | Literal AES-256-GCM (RustCrypto `aes-gcm`) | The blueprint's phrasing was self-contradictory; this is the stronger option. Machine-derived key = obfuscation-grade, documented in `persistent.rs` |
 | 2 automated re-prompts then HITL | `MAX_PLAN_ATTEMPTS = 3` (1 initial + 2 retries) then park for the user | Exactly the blueprint's ceiling |
 
@@ -116,5 +116,5 @@ The window opens on `BootstrapGate`: it checks Ollama, probes RAM/GPU, shows the
 
 1. **Phase 5 packaging** — `cargo tauri build` installer; pre-cache Ollama models + whisper/ocrs weights for the air-gapped machine; tighten `tauri.conf.json` CSP.
 2. **`resume_turn`** — the HITL modal currently lets the user inspect/copy/close the plan; a `resume_turn` command that re-runs from a user-edited plan is not wired yet.
-3. **lancedb backend** — swap the brute-force `VectorIndex` for a `lancedb` table if KB size ever demands it.
-4. **`git config core.autocrlf`** — repo is CRLF-noisy on this Windows box; harmless, worth a `.gitattributes`.
+3. **`git config core.autocrlf`** — repo is CRLF-noisy on this Windows box; harmless, worth a `.gitattributes`.
+4. **LanceDB ANN index** — the table currently does a flat (exact) scan; `table.create_index(Index::Auto)` would add an approximate index if the KB ever grows past ~10⁴ chunks.

@@ -38,6 +38,15 @@ whisper-rs = "0.16"
 symphonia = { version = "0.5", default-features = false, features = [
     "mp3", "isomp4", "aac", "flac", "vorbis", "ogg", "wav", "pcm", "adpcm",
 ] }
+# RAG vector store: embedded LanceDB (Apache Arrow-backed, file-on-disk).
+# arrow-array / arrow-schema MUST match lancedb's arrow (58 for lancedb 0.38).
+# `remote` is enabled only to work around a build bug in the 0.38.0 release
+# (src/job.rs references Error::Http, which is remote-gated, but default = []).
+# It pulls reqwest/http, already in the tree via ollama-rs.
+lancedb = { version = "0.38", features = ["remote"] }
+arrow-array = "58"
+arrow-schema = "58"
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
