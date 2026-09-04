@@ -80,22 +80,43 @@ pub const TASK_REGISTRY: &[TaskSpec] = &[
     },
 ];
 
+/// Normalise a task name as the planner emitted it before registry lookup.
+///
+/// Small models copy the prompt's rendering a little too literally: they wrap the
+/// name in quotes/backticks, or append the stage label (`parse_pdf [Extract]`).
+/// Strip those so a nearly-right answer still resolves instead of burning a retry.
+pub fn normalize_task_name(raw: &str) -> &str {
+    let s = raw.trim().trim_matches(['`', '"', '\'', ' ']);
+    match s.split_once(" [") {
+        Some((name, _)) => name.trim(),
+        None => s,
+    }
+}
+
 /// Look a task up by name. `None` means the planner hallucinated it.
 pub fn lookup(task: &str) -> Option<&'static TaskSpec> {
-    TASK_REGISTRY.iter().find(|t| t.name == task)
+    let name = normalize_task_name(task);
+    TASK_REGISTRY.iter().find(|t| t.name == name)
 }
 
 /// Registry rendered for role B's system prompt, so the planner and the validator
-/// can never drift apart.
+/// can never drift apart. The task name is the only quoted token on each line so
+/// the model has an unambiguous string to copy into the `task` field.
 pub fn registry_prompt_block() -> String {
     TASK_REGISTRY
         .iter()
         .map(|t| {
             let needs = match t.requires_file {
-                Some(k) => format!(" (requires an attached {k:?} file)"),
+                Some(k) => format!("; needs an attached {} file", format!("{k:?}").to_lowercase()),
                 None => String::new(),
             };
-            format!("- {} [{:?}]{}: {}", t.name, t.stage, needs, t.description)
+            format!(
+                "- \"{}\"  (stage: {}{})  — {}",
+                t.name,
+                format!("{:?}", t.stage).to_lowercase(),
+                needs,
+                t.description
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")

@@ -2,7 +2,7 @@
 //! the blueprint names, and accepts a well-formed one.
 
 use workbench_core::engine::schemas::{FileKind, InputFile, Plan, TaskStep};
-use workbench_core::planner::validate_plan;
+use workbench_core::planner::{normalize_task_name, validate_plan};
 
 fn step(id: &str, task: &str, deps: &[&str]) -> TaskStep {
     TaskStep {
@@ -78,6 +78,27 @@ fn rejects_dependency_listed_after_dependent() {
     assert!(
         errs.iter().any(|e| e.contains("listed before its dependency")),
         "expected a topological-order error, got {errs:?}"
+    );
+}
+
+#[test]
+fn tolerates_stage_label_and_quotes_on_task_name() {
+    assert_eq!(normalize_task_name("parse_pdf [Extract]"), "parse_pdf");
+    assert_eq!(normalize_task_name("`search_knowledge`"), "search_knowledge");
+    assert_eq!(normalize_task_name("  \"summarize\"  "), "summarize");
+    assert_eq!(normalize_task_name("ocr_image"), "ocr_image");
+
+    // A plan whose task names carry the prompt's stage label still validates.
+    let plan = Plan {
+        steps: vec![
+            step("s1", "search_knowledge [Retrieve]", &[]),
+            step("s2", "summarize [Analyze]", &["s1"]),
+        ],
+    };
+    let errs = validate_plan(&plan, &[]);
+    assert!(
+        !errs.iter().any(|e| e.contains("unknown task")),
+        "stage-labelled task names should still resolve, got {errs:?}"
     );
 }
 

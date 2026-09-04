@@ -150,19 +150,32 @@ Choose an ordered sequence of steps using ONLY these tasks:
 {}
 
 Rules:
+- `task` MUST be exactly one of the quoted names above — copy it verbatim, with
+  no stage label, brackets or other suffix (write `parse_pdf`, never `parse_pdf [Extract]`).
 - Extraction and retrieval steps MUST come before analysis steps.
-- List every step after the steps it depends on.
-- Only schedule a task whose required file kind is actually attached.
+- List every step after the steps it depends on, using their `id`s in `depends_on`.
+- Only schedule a task whose required file kind is in ATTACHED FILES. Never invent a file.
+- Do NOT put file paths in `args`; the executor already has the attachments.
+  Leave `args` as {{}} — the only exception is `search_knowledge`, which may take
+  {{\"query\": \"...\"}}.
 - Give each step a short unique `id`.
 Return STRICT JSON: {{\"steps\":[{{\"id\":string,\"task\":string,\"args\":object,\"depends_on\":[string]}}]}}
 Return JSON only. No prose, no markdown, no code fences.",
             registry_prompt_block()
         );
 
+        let file_list = if uploads.is_empty() {
+            "(none)".to_string()
+        } else {
+            uploads
+                .iter()
+                .map(|f| format!("- {} ({})", f.original_name, format!("{:?}", f.kind).to_lowercase()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let mut user = format!(
-            "USER REQUEST:\n{prompt}\n\nPARSED INTENT:\n{}\n\nATTACHED FILES:\n{}\n",
+            "USER REQUEST:\n{prompt}\n\nPARSED INTENT:\n{}\n\nATTACHED FILES:\n{file_list}\n",
             serde_json::to_string(intent)?,
-            serde_json::to_string(uploads)?,
         );
         if !previous_errors.is_empty() {
             user.push_str(&format!(
@@ -173,7 +186,14 @@ Return JSON only. No prose, no markdown, no code fences.",
         }
         user.push_str("\nReturn the plan JSON.");
 
-        self.generate_json(&system, user, "task_planner").await
+        let mut plan: Plan = self.generate_json(&system, user, "task_planner").await?;
+        // Belt-and-braces: fold `"parse_pdf [Extract]"` etc. back to the bare
+        // registry name so validation and the executor both resolve it.
+        for step in &mut plan.steps {
+            let clean = crate::planner::registry::normalize_task_name(&step.task).to_string();
+            step.task = clean;
+        }
+        Ok(plan)
     }
 
     /// **Role C.** Fold tool outputs + memory into the final report.
