@@ -148,7 +148,10 @@ The run needed all three attempts. On attempt 3 the plan passed every check:
 > **If all 3 attempts had failed**, it would instead emit
 > `AwaitingUser { errors, plan_json }` and `run_turn` returns
 > `TurnOutcome::AwaitingUser`. The UI shows `HitlModal` with the complaints and
-> the last plan. No infinite loop, ever.
+> the last plan. No infinite loop, ever. The user edits the plan and clicks
+> **Re-run with this plan** — that calls `resume_turn`, which re-runs
+> `validate_plan` (unless *Run anyway*), then jumps straight to stage 3 below via
+> the shared `run_from_plan` tail. The model is not consulted again.
 
 ---
 

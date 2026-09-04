@@ -66,6 +66,33 @@ export function submitTurn(
   });
 }
 
+/**
+ * Resume a parked turn with the plan the user reviewed in the HITL modal.
+ * `force: true` skips re-validation ("run anyway"); otherwise a still-invalid
+ * plan re-emits an `awaiting_user` event. Streams `StepEvent`s like `submitTurn`.
+ */
+export function resumeTurn(
+  args: {
+    prompt: string;
+    sessionId: string;
+    files: UploadedFile[];
+    planJson: string;
+    force: boolean;
+  },
+  onEvent: (e: StepEvent) => void,
+) {
+  const channel = new Channel<StepEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("resume_turn", {
+    prompt: args.prompt,
+    sessionId: args.sessionId,
+    files: args.files,
+    planJson: args.planJson,
+    force: args.force,
+    onEvent: channel,
+  });
+}
+
 /** Read a File into the base64 shape `submit_turn` expects. */
 export function fileToUpload(file: File): Promise<UploadedFile> {
   return new Promise((resolve, reject) => {

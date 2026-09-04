@@ -179,6 +179,28 @@ fn persist_uploads(
     Ok(out)
 }
 
+/// Shared setup for [`submit_turn`] / [`resume_turn`]: resolve the pipeline config
+/// for the active model plan, materialise the uploads on disk, and build the
+/// engine. `persist_uploads` is idempotent for a given session, so a resume that
+/// re-sends the same files just rewrites them.
+fn turn_setup(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    session_id: &str,
+    files: &[UploadedFile],
+) -> Result<(PipelineConfig, Vec<InputFile>, OllamaEngine), String> {
+    let plan = state.plan();
+    let config = pipeline_config(app, &plan)?;
+    let uploads = persist_uploads(&config, session_id, files)?;
+    let engine = OllamaEngine::new(
+        &config.ollama_url,
+        plan.llm.clone(),
+        plan.vision.clone(),
+        plan.embed.clone(),
+    );
+    Ok((config, uploads, engine))
+}
+
 /// Run one turn of the pipeline, streaming [`StepEvent`]s to the front-end.
 ///
 /// **Inputs:** the user prompt, any attached files (base64), a session id, and a
@@ -193,21 +215,49 @@ async fn submit_turn(
     files: Vec<UploadedFile>,
     on_event: Channel<StepEvent>,
 ) -> Result<(), String> {
-    let plan = state.plan();
-    let config = pipeline_config(&app, &plan)?;
-    let uploads = persist_uploads(&config, &session_id, &files)?;
-
-    let engine = OllamaEngine::new(
-        &config.ollama_url,
-        plan.llm.clone(),
-        plan.vision.clone(),
-        plan.embed.clone(),
-    );
+    let (config, uploads, engine) = turn_setup(&app, &state, &session_id, &files)?;
     let registry = default_registry();
     let sink = ChannelSink(on_event);
 
     match workbench_core::run_turn(
         &engine, &registry, &config, &session_id, &prompt, &uploads, &sink,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            sink.emit(StepEvent::Error {
+                message: e.to_string(),
+            });
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Resume a turn the planner parked, running the plan the user reviewed in the
+/// HITL modal instead of asking the model for one.
+///
+/// **Inputs:** the original prompt + files (the front-end still has them), the
+/// session id, the (possibly edited) `plan_json` from the modal, and `force` —
+/// `true` when the user clicked "run anyway", which skips re-validation. A plan
+/// that still fails validation (and `force = false`) re-emits `AwaitingUser`.
+#[tauri::command]
+async fn resume_turn(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    prompt: String,
+    session_id: String,
+    files: Vec<UploadedFile>,
+    plan_json: String,
+    force: bool,
+    on_event: Channel<StepEvent>,
+) -> Result<(), String> {
+    let (config, uploads, engine) = turn_setup(&app, &state, &session_id, &files)?;
+    let registry = default_registry();
+    let sink = ChannelSink(on_event);
+
+    match workbench_core::resume_turn(
+        &engine, &registry, &config, &session_id, &prompt, &uploads, &plan_json, force, &sink,
     )
     .await
     {
@@ -240,6 +290,7 @@ pub fn run() {
             warm_model,
             audit_paths,
             submit_turn,
+            resume_turn,
             end_session,
         ])
         .run(tauri::generate_context!())

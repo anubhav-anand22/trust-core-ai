@@ -141,21 +141,23 @@ change without touching callers:
 
 ---
 
-## Wire the HITL resume path (currently a stub)
+## The HITL resume path
 
-Today, when the planner exhausts its retries the run returns
+When the planner exhausts its retries the run returns
 `TurnOutcome::AwaitingUser { errors, plan_json }` and the UI shows `HitlModal`
-with an editable plan — but there's no command to *run* the edited plan.
+with an editable plan. The modal's **Re-run with this plan** / **Run anyway**
+buttons resume the turn from that plan:
 
-To finish it:
+- `workbench_core::resume_turn(engine, registry, config, session_id, prompt,
+  uploads, plan_json, force, sink)` — deserialises the `Plan`; if `force` is
+  false it runs `validate_plan` once more (a still-invalid plan re-emits
+  `awaiting_user`); then hands off to `run_from_plan`, the shared tail that
+  `run_turn` also uses (execute → quality → synthesise → memory). No state is
+  parked server-side between the pause and the resume.
+- `src-tauri/src/lib.rs` — the `resume_turn` command; `turn_setup()` is the bit
+  of turn bootstrapping it shares with `submit_turn`.
+- `src/lib/pipeline.ts::resumeTurn` + `App.tsx::resume` re-send the original
+  prompt and the already-decoded uploads (`lastTurn` ref) with the edited plan.
 
-1. `src-tauri/src/lib.rs` — a `resume_turn(session_id, plan_json, on_event)`
-   command that deserialises the edited `Plan`, runs `validate_plan` once more,
-   and if it passes, calls a new `workbench_core::run_plan(engine, registry,
-   config, session_id, prompt, uploads, plan, sink)` that skips stages 1–2 and
-   starts at `execute_plan`.
-2. `src/lib/pipeline.ts` — a `resumeTurn(...)` wrapper.
-3. `src/components/HitlModal.tsx` — an "Approve & run" button that calls it.
-
-The pieces (`validate_plan`, `execute_plan`, the `Channel` plumbing) already
-exist; this is wiring, not new machinery.
+`resume_turn` is the pattern to copy if you ever want a "run this exact plan"
+entry point that bypasses the model entirely.

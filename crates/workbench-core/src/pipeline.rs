@@ -7,21 +7,21 @@
 //!      → append session memory → Done
 //! ```
 
-use crate::engine::schemas::{FinalReport, InputFile};
+use crate::engine::schemas::{FinalReport, InputFile, Plan};
 use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::{assert_sane, compiler, execute_plan, ToolRegistry};
 use crate::memory::{PersistentMemory, SessionContext, TurnSummary};
-use crate::planner::{plan_turn, PlanOutcome};
+use crate::planner::{plan_turn, validate_plan, PlanOutcome};
 use crate::{PipelineConfig, Result};
 
 /// Terminal state of one turn.
 pub enum TurnOutcome {
     /// Pipeline ran to completion.
     Completed(FinalReport),
-    /// Planner could not produce a valid plan; the host must surface the HITL
-    /// modal and later call `run_turn` again with the user-approved plan (Phase 2
-    /// wires the resume path).
+    /// Planner could not produce a valid plan (or a resumed plan still failed
+    /// validation). The host surfaces the HITL modal; the user edits the plan and
+    /// calls [`resume_turn`] with it.
     AwaitingUser { errors: Vec<String>, plan_json: String },
 }
 
@@ -56,6 +56,64 @@ pub async fn run_turn(
         }
     };
 
+    run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, sink).await
+}
+
+/// Resume a turn the planner parked: execute a user-approved (optionally edited)
+/// plan instead of asking the model to produce one.
+///
+/// **Inputs:** the same context as [`run_turn`], plus `plan_json` (the plan the
+/// HITL modal returned) and `force`. With `force = false` the deterministic
+/// validator runs again and a still-invalid plan simply re-parks. With
+/// `force = true` — the modal's "run anyway" — validation is skipped and the plan
+/// executes exactly as given.
+///
+/// The caller re-supplies `prompt` and `uploads` (the front-end still holds them);
+/// nothing is stashed server-side between the park and the resume.
+pub async fn resume_turn(
+    engine: &OllamaEngine,
+    registry: &ToolRegistry,
+    config: &PipelineConfig,
+    session_id: &str,
+    prompt: &str,
+    uploads: &[InputFile],
+    plan_json: &str,
+    force: bool,
+    sink: &dyn ProgressSink,
+) -> Result<TurnOutcome> {
+    sink.emit(StepEvent::Idle);
+
+    let plan: Plan = serde_json::from_str(plan_json)?;
+
+    if !force {
+        sink.emit(StepEvent::ValidatingPlan { attempt: 1 });
+        let errors = validate_plan(&plan, uploads);
+        if !errors.is_empty() {
+            let plan_json = serde_json::to_string(&plan)?;
+            sink.emit(StepEvent::AwaitingUser {
+                errors: errors.clone(),
+                plan_json: plan_json.clone(),
+            });
+            return Ok(TurnOutcome::AwaitingUser { errors, plan_json });
+        }
+    }
+
+    run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, sink).await
+}
+
+/// The shared tail of [`run_turn`] / [`resume_turn`]: run a validated plan through
+/// execution → quality gate → synthesis → memory, streaming progress on `sink`.
+#[allow(clippy::too_many_arguments)]
+async fn run_from_plan(
+    engine: &OllamaEngine,
+    registry: &ToolRegistry,
+    config: &PipelineConfig,
+    session_id: &str,
+    prompt: &str,
+    uploads: &[InputFile],
+    plan: Plan,
+    sink: &dyn ProgressSink,
+) -> Result<TurnOutcome> {
     // --- strictly sequential tool execution --------------------------------
     let results = execute_plan(&plan, registry, uploads, config, engine, prompt, sink).await?;
 

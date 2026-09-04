@@ -107,7 +107,7 @@ The window opens on `BootstrapGate`: it checks Ollama, probes RAM/GPU, shows the
 3. Watch the stepper: `Parsing → Validating → parse_pdf → analyze_image → search_knowledge → summarize/compare_to_sop → Synthesizing → Done`.
 4. Report panel shows findings + SOP citations (SOP-COR-014 / SOP-ROT-007) + a `degraded` badge if audio/OCR models are absent.
 5. Expand the audit sidebar: per-step timings, active model context, resolved local paths.
-6. HITL demo: a prompt that yields an unschedulable plan → exactly 2 silent retries → modal with the validator's complaints + editable plan.
+6. HITL demo: a prompt that yields an unschedulable plan → exactly 2 silent retries → modal with the validator's complaints + editable plan → fix the plan and **Re-run with this plan** (or **Run anyway** to bypass the validator) → the turn resumes from `execute_plan`.
 7. Restart the app → persistent memory (`persistent_memory.json`, ciphertext on disk) reloads the facility digest.
 
 ---
@@ -115,6 +115,10 @@ The window opens on `BootstrapGate`: it checks Ollama, probes RAM/GPU, shows the
 ## Open items
 
 1. **Phase 5 packaging** — `cargo tauri build` installer; pre-cache Ollama models + whisper/ocrs weights for the air-gapped machine; tighten `tauri.conf.json` CSP.
-2. **`resume_turn`** — the HITL modal currently lets the user inspect/copy/close the plan; a `resume_turn` command that re-runs from a user-edited plan is not wired yet.
-3. **`git config core.autocrlf`** — repo is CRLF-noisy on this Windows box; harmless, worth a `.gitattributes`.
-4. **LanceDB ANN index** — the table currently does a flat (exact) scan; `table.create_index(Index::Auto)` would add an approximate index if the KB ever grows past ~10⁴ chunks.
+2. **`.gitattributes`** — repo is CRLF-noisy on this Windows box; harmless, worth a one-liner.
+3. **LanceDB ANN index** — the table currently does a flat (exact) scan; `table.create_index(Index::Auto)` would add an approximate index if the KB ever grows past ~10⁴ chunks.
+
+### Done since Phase 4
+- **RAG on embedded LanceDB** — `tools/rag.rs`, verified end-to-end (SOP retrieved + cited).
+- **`resume_turn`** — the HITL modal's *Re-run with this plan* / *Run anyway* buttons resume a parked turn from the user-edited plan (`workbench_core::resume_turn` → shared `run_from_plan` tail; `resume_turn` Tauri command; `resumeTurn` UI wrapper).
+- **Planner robustness** — task names are tolerated with a trailing ` [Stage]` label / quotes (`normalize_task_name`), and the registry prompt block quotes just the name.

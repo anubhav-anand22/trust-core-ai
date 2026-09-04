@@ -9,8 +9,8 @@ import { HitlModal } from "./components/HitlModal";
 import { PromptPanel } from "./components/PromptPanel";
 import { ReportView } from "./components/ReportView";
 import { Stepper } from "./components/Stepper";
-import { endSession, fileToUpload, submitTurn } from "./lib/pipeline";
-import type { FinalReport, ModelPlan, StepEvent } from "./types";
+import { endSession, fileToUpload, resumeTurn, submitTurn } from "./lib/pipeline";
+import type { FinalReport, ModelPlan, StepEvent, UploadedFile } from "./types";
 
 function newSessionId(): string {
   return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -24,6 +24,9 @@ function App() {
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
   const sessionId = useRef<string>(newSessionId());
+  // The prompt + already-decoded uploads of the in-flight turn, kept so the HITL
+  // modal can resume with an edited plan without re-reading the File objects.
+  const lastTurn = useRef<{ prompt: string; uploads: UploadedFile[] } | null>(null);
 
   // Persist long-term memory when the window is closing/reloading.
   useEffect(() => {
@@ -42,6 +45,22 @@ function App() {
     [events],
   );
 
+  // Fold a StepEvent stream into UI state. Shared by the initial turn and a resume.
+  function onEvent(e: StepEvent) {
+    setEvents((prev) => [...prev, e]);
+    if (e.stage === "done") {
+      try {
+        setReport(JSON.parse(e.report_json) as FinalReport);
+      } catch {
+        /* leave report null */
+      }
+    } else if (e.stage === "awaiting_user") {
+      setHitl({ errors: e.errors, planJson: e.plan_json });
+    } else if (e.stage === "error") {
+      setFatal(e.message);
+    }
+  }
+
   async function run(prompt: string, files: File[]) {
     setBusy(true);
     setEvents([]);
@@ -50,20 +69,40 @@ function App() {
     setFatal(null);
     try {
       const uploads = await Promise.all(files.map(fileToUpload));
-      await submitTurn({ prompt, sessionId: sessionId.current, files: uploads }, (e) => {
-        setEvents((prev) => [...prev, e]);
-        if (e.stage === "done") {
-          try {
-            setReport(JSON.parse(e.report_json) as FinalReport);
-          } catch {
-            /* leave report null */
-          }
-        } else if (e.stage === "awaiting_user") {
-          setHitl({ errors: e.errors, planJson: e.plan_json });
-        } else if (e.stage === "error") {
-          setFatal(e.message);
-        }
-      });
+      lastTurn.current = { prompt, uploads };
+      await submitTurn({ prompt, sessionId: sessionId.current, files: uploads }, onEvent);
+    } catch (e) {
+      setFatal(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Resume a parked turn with the plan from the HITL modal. `force` skips the
+  // deterministic validator ("run anyway"); otherwise a still-invalid plan just
+  // re-opens the modal via another `awaiting_user` event.
+  async function resume(planJson: string, force: boolean) {
+    const ctx = lastTurn.current;
+    if (!ctx) {
+      setFatal("nothing to resume — submit a prompt first");
+      return;
+    }
+    setBusy(true);
+    setEvents([]);
+    setReport(null);
+    setHitl(null);
+    setFatal(null);
+    try {
+      await resumeTurn(
+        {
+          prompt: ctx.prompt,
+          sessionId: sessionId.current,
+          files: ctx.uploads,
+          planJson,
+          force,
+        },
+        onEvent,
+      );
     } catch (e) {
       setFatal(String(e));
     } finally {
@@ -123,6 +162,8 @@ function App() {
         <HitlModal
           errors={hitl.errors}
           planJson={hitl.planJson}
+          busy={busy}
+          onResume={resume}
           onClose={() => setHitl(null)}
         />
       )}
