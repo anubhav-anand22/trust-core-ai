@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HardwareInfo {
     pub total_ram_gb: f32,
+    /// Logical CPU cores. The dominant signal when there is no GPU: without
+    /// offload, generation speed tracks core count, not system RAM.
+    pub cpu_cores: usize,
     /// "NVIDIA", "AMD", "Intel", or "none".
     pub gpu_vendor: String,
     pub gpu_name: String,
@@ -21,7 +24,23 @@ pub struct HardwareInfo {
     pub cuda_available: bool,
 }
 
-/// Probe RAM (via `sysinfo`) and the GPU (via `nvidia-smi`, then Windows CIM).
+impl HardwareInfo {
+    /// Can Ollama actually offload to a GPU here?
+    ///
+    /// Requires CUDA *and* a VRAM reading — an integrated Intel/AMD adapter with
+    /// no usable VRAM figure means CPU inference, whatever the adapter is called.
+    pub fn has_usable_gpu(&self) -> bool {
+        self.cuda_available && self.vram_gb.unwrap_or(0.0) >= 4.0
+    }
+
+    /// Threads to hand to a compute-heavy step, always leaving one core for the
+    /// OS so the desktop stays responsive while a turn runs.
+    pub fn worker_threads(&self) -> usize {
+        self.cpu_cores.saturating_sub(1).max(1)
+    }
+}
+
+/// Probe RAM + cores (via `sysinfo`) and the GPU (via `nvidia-smi`, then Windows CIM).
 #[tauri::command]
 pub fn detect_hardware() -> HardwareInfo {
     let total_ram_gb = read_total_ram_gb();
@@ -29,6 +48,9 @@ pub fn detect_hardware() -> HardwareInfo {
 
     HardwareInfo {
         total_ram_gb,
+        cpu_cores: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
         gpu_vendor: gpu.vendor,
         gpu_name: gpu.name,
         vram_gb: gpu.vram_gb,

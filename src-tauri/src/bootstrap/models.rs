@@ -49,15 +49,32 @@ impl ModelPlan {
 /// used when known; otherwise system RAM, which is always reliable. Vision and
 /// embedding models are small and fixed across every tier.
 pub fn recommend_models(hw: &HardwareInfo) -> ModelPlan {
-    let vram = hw.vram_gb.unwrap_or(0.0);
     let ram = hw.total_ram_gb;
 
-    let (llm, tier) = if vram >= 8.0 || ram >= 16.0 {
-        ("qwen2.5:7b-instruct", "7B tier — ≥8 GB VRAM or ≥16 GB RAM")
-    } else if vram >= 6.0 || ram >= 12.0 {
-        ("phi4-mini", "mini tier — ≥6 GB VRAM or ≥12 GB RAM")
+    // Two different worlds. With GPU offload, VRAM sets the ceiling and a 7B is
+    // comfortable. Without it, every token is computed on the CPU and *model size
+    // is the latency*: system RAM only decides whether the weights fit, not how
+    // fast they run. Recommending a 3-4B model to a 4-core CPU-only box (which the
+    // old `vram >= 8 || ram >= 16` rule did, on the RAM branch alone) produced
+    // multi-minute steps and starved the desktop. Stay small on CPU.
+    let (llm, tier) = if hw.has_usable_gpu() {
+        let vram = hw.vram_gb.unwrap_or(0.0);
+        if vram >= 8.0 {
+            ("qwen2.5:7b-instruct", "7B tier — GPU, ≥8 GB VRAM")
+        } else if vram >= 6.0 {
+            ("phi4-mini", "mini tier — GPU, ≥6 GB VRAM")
+        } else {
+            ("llama3.2:3b", "3B tier — GPU, <6 GB VRAM")
+        }
+    } else if hw.cpu_cores >= 12 && ram >= 16.0 {
+        ("llama3.2:3b", "3B tier — CPU-only, ≥12 cores")
+    } else if hw.cpu_cores >= 8 && ram >= 8.0 {
+        ("qwen2.5:3b-instruct", "3B tier — CPU-only, ≥8 cores")
     } else {
-        ("qwen2.5:1.5b-instruct", "lite tier — CPU / low RAM")
+        (
+            "qwen2.5:1.5b-instruct",
+            "lite tier — CPU-only, few cores (small model keeps turns responsive)",
+        )
     };
 
     ModelPlan {
@@ -65,6 +82,62 @@ pub fn recommend_models(hw: &HardwareInfo) -> ModelPlan {
         vision: "moondream".into(),
         embed: "nomic-embed-text".into(),
         tier_label: tier.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hw(cores: usize, ram: f32, vram: Option<f32>, cuda: bool) -> HardwareInfo {
+        HardwareInfo {
+            total_ram_gb: ram,
+            cpu_cores: cores,
+            gpu_vendor: if cuda { "NVIDIA".into() } else { "none".into() },
+            gpu_name: if cuda { "test gpu".into() } else { "none".into() },
+            vram_gb: vram,
+            cuda_available: cuda,
+        }
+    }
+
+    /// The regression that made the app unusable: a CPU-only host with plenty of
+    /// RAM was handed a multi-billion-parameter model because the old rule read
+    /// `vram >= 8 || ram >= 16`. System RAM says the weights *fit*, not that they
+    /// run fast.
+    #[test]
+    fn plenty_of_ram_without_a_gpu_does_not_get_a_big_model() {
+        let plan = recommend_models(&hw(4, 16.0, None, false));
+        assert_eq!(plan.llm, "qwen2.5:1.5b-instruct", "got {}", plan.tier_label);
+    }
+
+    #[test]
+    fn a_real_gpu_still_gets_the_big_model() {
+        let plan = recommend_models(&hw(8, 32.0, Some(12.0), true));
+        assert_eq!(plan.llm, "qwen2.5:7b-instruct");
+    }
+
+    /// An integrated adapter reporting no usable VRAM is a CPU host, whatever the
+    /// adapter is named.
+    #[test]
+    fn integrated_graphics_counts_as_cpu_only() {
+        let plan = recommend_models(&hw(4, 16.0, Some(1.0), false));
+        assert!(
+            plan.llm.contains("1.5b"),
+            "expected a lite model, got {}",
+            plan.llm
+        );
+    }
+
+    #[test]
+    fn many_cores_without_a_gpu_can_afford_a_mid_model() {
+        let plan = recommend_models(&hw(16, 32.0, None, false));
+        assert_eq!(plan.llm, "llama3.2:3b");
+    }
+
+    #[test]
+    fn one_core_is_always_left_for_the_os() {
+        assert_eq!(hw(4, 16.0, None, false).worker_threads(), 3);
+        assert_eq!(hw(1, 8.0, None, false).worker_threads(), 1);
     }
 }
 
