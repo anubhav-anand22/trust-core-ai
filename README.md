@@ -124,6 +124,182 @@ times. `.vscode/settings.json` in this repo sets that up.
 
 ---
 
+## Manual testing walkthrough
+
+This is the exact sequence to reproduce what has been tested so far. Please
+follow it in order — later steps assume earlier ones worked.
+
+### 0. Before you start
+
+- Ollama must be running (`ollama serve`, or as a Windows service). Check with
+  `curl http://127.0.0.1:11434/api/tags`.
+- Close anything heavy. Inference will use every core it is allowed to, and on a
+  small machine you will feel it (see *Known problems* below).
+- Generate the fixtures: `python demo/make_fixtures.py` (needs Pillow). You get
+  `inspection.pdf`, `valve.png`, `nameplate.png`, `note.wav` in `demo/fixtures/`.
+
+### 1. Bootstrap screen
+
+`npm run tauri dev`. Expect:
+
+- **"Checking for Ollama…"** → then straight to **"Detected hardware"**. If you
+  instead see *"Installing Ollama…"* and it sits there, that is a bug we thought
+  we fixed — please report it with your OS and how Ollama was installed.
+- A hardware card: RAM, GPU name, CUDA yes/no, and a **tier label**.
+  **Sanity-check this.** If you have no GPU it should say *"CPU-only"* and
+  recommend `qwen2.5:1.5b-instruct`. If it recommends a 7B model to a machine
+  with no GPU, that is a regression — tell us your specs.
+- **Let it use the recommended model.** Overriding to something bigger on a
+  CPU-only box is exactly the mistake that made the app unusable for us.
+- Click **Download & start**, watch the pull progress, then it hands over.
+
+### 2. One normal turn
+
+Prompt: *"Assess corrosion risk on pump P-101 and check it against our SOPs."*
+Attach `demo/fixtures/inspection.pdf` and `demo/fixtures/valve.png`. Run it.
+
+What should happen:
+
+- The **stepper** advances: parsing context → validating plan → each tool in
+  order → quality check → synthesising → done.
+- The **activity list** shows each tool with its elapsed time.
+- The **report** shows a summary, findings, and **citations naming the SOP files**
+  it retrieved (`SOP-COR-014…`, `SOP-ROT-007…`). Citations are the thing to check
+  hardest — they are the evidence retrieval actually worked.
+- `degraded: false` unless you are missing the whisper/OCR model files.
+
+**This will take minutes, not seconds, on a CPU-only machine.** It is slow, not
+hung. See *Known problems*.
+
+### 3. The interesting test: a document with a specific fact buried in it
+
+This is where we currently have a **known failure we are not sure is fixed**.
+Attach a long PDF (a service agreement, a rate card — anything with a specific
+number deep inside it) and ask a question that requires finding that number and
+doing something with it. For example: *"What transaction fee applies to a ₹1000
+credit card payment?"*
+
+- **Good outcome:** it quotes the rate exactly and does the arithmetic.
+- **Bad outcome:** *"no relevant information available"* — which is the bug we
+  hit. If you see this, please grab the PDF (or say what kind it is) and report
+  it. We need to distinguish two different causes: the text not fitting in the
+  model's context window (believed fixed), versus `pdfplumber` not being able to
+  extract the text from that particular PDF at all (not fixed, and a different
+  problem entirely).
+
+### 4. Human-in-the-loop (least-tested code path)
+
+Give it something that cannot produce a valid plan — a vague prompt with no
+attachments, e.g. *"compare everything"*. After exactly two silent retries you
+should get a modal with the validator's complaints and an editable plan.
+
+Test all three buttons: **Re-run with this plan** (re-validates), **Run anyway**
+(skips validation), **Dismiss**. This was wired recently and **has never been
+exercised through the GUI** — treat anything odd here as expected and report it.
+
+### 5. Audit sidebar and memory
+
+- Expand the audit sidebar: per-step timings, active model, and the resolved
+  on-disk paths (`lancedb/`, `session_context.json`, `persistent_memory.json`).
+- Run 2–3 turns, close the app, reopen. The knowledge base should **not** re-ingest
+  (it is cached), and long-term memory should reload.
+- `persistent_memory.json` should be unreadable ciphertext on disk — worth
+  opening in a text editor to confirm.
+
+### What to report back
+
+For anything that misbehaves, the useful details are: which step, the elapsed
+times from the activity list, whether the report said `degraded`, and — if the
+answer was wrong — what the source document actually contained. Running the
+headless `--example e2e` (bottom of this file) prints every step event and is
+usually the fastest way to see where a turn went wrong.
+
+---
+
+## Known problems and open questions
+
+Please read this before concluding something is broken — and please do brainstorm
+on any of it.
+
+### 1. CPU-only performance is the central unsolved problem
+
+On a 4-core machine with no GPU, a full turn took roughly **8 minutes**, with the
+two analysis steps (`summarize`, `compare_to_sop`) at ~200s *each*. We have since
+capped output length, shrunk prompts via retrieval, and stopped recommending
+oversized models — but **the improvement is not yet measured**, and the physics
+does not change: local inference on 4 CPU cores is slow.
+
+Open questions worth thinking about:
+- Are two separate analysis steps justified, or should `summarize` and
+  `compare_to_sop` collapse into one model call?
+- Should the vision step be opt-in? `moondream` cost ~48s for a photo.
+- Is there a smaller viable resident model than `qwen2.5:1.5b-instruct`?
+- Would streaming partial output make the wait *feel* acceptable even if the
+  total time does not change?
+
+### 2. Long documents may still fail (unverified fix)
+
+Symptom: asked about a fee buried deep in a PDF, the model answered *"no relevant
+information available"*. Diagnosis: the entire document was being stuffed into a
+4096-token context window, so the relevant page was silently truncated away. Fix:
+the evidence is now chunked, embedded, and only passages relevant to the question
+are sent. **This has not been re-tested against the original failing document.**
+
+There is a second possible cause we have not ruled out: `pdfplumber` may simply
+fail to extract text from some PDFs. Which of the two it was, we do not yet know.
+
+### 3. Scanned PDFs are not supported, by design
+
+`pdfplumber` reads digital text only. A scanned or image-only PDF reports "no
+extractable text" rather than being OCR'd. This was a deliberate scope decision,
+but it is a real limitation for a document-heavy demo.
+
+### 4. Small models write bad plans
+
+`llama3.2:3b` has been observed to:
+- copy the task registry's formatting into the task name (`"parse_pdf [Extract]"`),
+- hallucinate tasks that do not exist (`"ochrage_image"`),
+- invent attachments that were never provided.
+
+We added name normalisation and hardened the planner prompt, and it now usually
+validates on the first attempt — but the retry-then-HITL path exists precisely
+because this is not reliable. **`qwen3:4b` is worse, not better**: it returns an
+empty response under structured-output constraints (a thinking-model
+incompatibility) and should not be used as the resident model.
+
+### 5. The app could make the whole desktop unresponsive
+
+Ollama took all cores, and whisper.cpp and the OCR runtime each spawned their own
+unbounded thread pools on top. On a 4-core host this froze the Windows shell
+(dead volume/wifi flyouts) and stuttered video calls. Every path is now capped to
+`cores - 1`. **Please stress-test this** — run something in the background during
+a turn and see whether your machine stays usable.
+
+### 6. `resume_turn` has never been exercised through the GUI
+
+The HITL resume path compiles, is type-checked, and shares its execution tail with
+the normal path, but nobody has clicked those buttons in a running app. See
+walkthrough step 4.
+
+### 7. Build environment fragility
+
+- **`cargo test` must use `-j 1`** or it fails with `E0463` and poisons the next
+  run. Explained under *Gotchas*.
+- Alternating cargo subcommands re-resolves features for the `lance-*` crates and
+  forces a full recompile. Pick one and stay on it.
+- `target/` reached **23 GB** before we trimmed dependency debuginfo; it is ~12 GB
+  now. A build did once fail outright with "no space on device".
+- `lancedb 0.38.0` needs `features = ["remote"]` to compile at all — a workaround
+  for a bug in that release, not something we want.
+
+### 8. Not started
+
+Phase 5: packaging into an installer, bundling the whisper/OCR weights, and the
+true air-gapped test (disconnect networking, repeat the demo). Also no
+`.gitattributes`, so line endings are noisy across machines.
+
+---
+
 ## Documentation
 
 The [`docs/`](docs/) folder is written for someone learning the codebase, not
