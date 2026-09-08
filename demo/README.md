@@ -7,6 +7,7 @@
 | File | What it is |
 |---|---|
 | `inspection.pdf` | Hand-built 1-page digital PDF — Pump P-101 external inspection sheet (seal drip, scaling, bearing temp, vibration, coating loss) |
+| `fee_card.pdf` | A **borderless** PayU MDR rate card — columns aligned with whitespace, no ruled lines. Exercises the `Strategy::Stream` table fallback. The answer to "fee on a ₹1000 credit-card payment" (2.00%) is one row of it. |
 | `valve.png` | Synthetic equipment photo (shapes + a "corrosion" label) for the VLM |
 | `nameplate.png` | Text-heavy plate (tag, model, pressure, serial, inspect-due) for OCR |
 | `note.wav` | 2 s 16 kHz tone — exercises the audio decode + whisper path (transcribes to ~nothing, as expected for a non-speech tone) |

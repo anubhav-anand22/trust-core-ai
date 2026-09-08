@@ -14,6 +14,9 @@ reference. Read them in order the first time.
 | 06 | [RAG and the vector store](06-rag-and-why-not-a-vector-db.md) | What retrieval-augmented generation is, the embedding + cosine-similarity maths, and the embedded-LanceDB store (with the tradeoff vs a plain cosine loop) |
 | 07 | [Build, test, run](07-build-test-run.md) | Toolchain, environment variables, every command, where files live, troubleshooting |
 | 08 | [Extending it](08-extending.md) | How to add a tool, a task, a pipeline stage, a UI panel |
+| 09 | [Running on a CPU-only machine](09-running-on-cpu.md) | Model tiers, thread budgets, process priority, timeouts and Stop — why the desktop used to freeze and what fixed it |
+| 10 | [Documents and tables](10-documents-and-tables.md) | How a PDF becomes evidence, the three ways a fact gets lost on that path, and Fast vs Deep read |
+| 11 | [Conversations and memory](11-conversations-and-memory.md) | Per-session chat storage, the sidebar, how follow-up questions are answered, and the two memory tiers |
 
 ## Glossary (quick reference)
 
@@ -35,9 +38,21 @@ reference. Read them in order the first time.
 | **ANN** | Approximate Nearest Neighbour — an index (HNSW, IVF-PQ) that finds *almost* the closest vectors very fast. Worth it at 10⁴+ vectors; below that a plain scan is exact and just as quick. |
 | **DAG** | Directed Acyclic Graph. The plan's steps form one: each step may depend on earlier steps, no cycles. |
 | **Deterministic validation** | Checking the plan with plain `if`/`for` code (no AI), so the result is reproducible and explainable. |
-| **HITL** | Human-in-the-loop. When the planner fails twice, the run *pauses* and asks the user instead of looping forever. |
+| **HITL** | Human-in-the-loop. Reached only if even the deterministic fallback plan fails validation — normally the planner's retries end in a fallback plan, not a pause. |
+| **`file_for`** | `ToolContext` method: resolve which attachment a step operates on from `args["file"]`, falling back to the first file of that kind. Makes multi-file turns work. |
+| **Fallback plan** | A plan built with no model call — one extraction step per attachment, then analysis. Used when the LLM planner can't produce a valid one. |
+| **Session** | One chat, stored as `sessions/<id>.json`: a full transcript (`exchanges`) plus a bounded model-context summary (`turns` + `rolling_summary`). Listed in the sidebar. |
+| **`answer_followup`** | A task for a conversational follow-up ("and debit cards?") — runs the transcript through the resident model, no new files or KB. Valid as a lone step. |
+| **Transcript vs. model context** | The transcript keeps every turn for redisplay; the model only ever sees the last N turns plus a rolling summary of the rest. |
 | **Stepper** | The UI strip showing which pipeline stage is active. Driven by `StepEvent`s streamed from Rust. |
 | **`keep_alive`** | Ollama parameter: how long to keep a model in RAM after a request. `-1` = forever, `0` = unload immediately. |
+| **Physical vs logical cores** | Physical = real execution units. Logical = those times the hyperthread count. Thread pools are sized off *physical* here; logical flatters the number and starves the scheduler. |
+| **`CancelFlag`** | A shared `AtomicBool` the Stop button flips. The pipeline polls it before every model call and between every step — the one way to interrupt a long `await`. |
+| **`StepEvent::Warning`** | A non-fatal notice from the pipeline (skipped file, timed-out step). Renders as an amber strip; the turn still finishes. |
+| **`guarded` call** | Every Ollama request is raced against a wall-clock timeout and the cancel flag, so a call can't hang the turn. |
+| **`tables_text`** | A PDF's tables flattened to `col \| col \| col` lines with the header repeated per row. What the model actually reads — the structured `tables` field was being dropped. |
+| **Fast / Deep read** | Fast retrieves the passages nearest the question; Deep maps the analysis over every window of the whole document and reduces. Deep is a checkbox, slower, misses nothing. |
+| **Embedding prefix** | `nomic-embed-text` wants `search_query:` on queries and `search_document:` on passages; it is measurably worse without them. |
 | **GGUF / quantised** | A compressed on-disk format for LLM weights. `ggml-base.en.bin` is a quantised Whisper model. |
 | **Tauri** | A framework for desktop apps: a Rust backend + a web-tech frontend (here React) in a native window. |
 | **Crate** | A Rust package/library. `workbench-core` and `tauri-app` are our two crates; everything in `Cargo.toml` `[dependencies]` is a third-party crate. |

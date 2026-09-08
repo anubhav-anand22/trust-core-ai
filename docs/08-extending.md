@@ -37,7 +37,9 @@ impl Tool for GaugeTool {
 
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         let started = std::time::Instant::now();
-        let Some(file) = ctx.first_file_of(FileKind::Image) else {
+        // `file_for` honours a `{"file": "..."}` arg so three images get
+        // three steps; it falls back to the first image when no name is given.
+        let Some(file) = ctx.file_for(step, FileKind::Image) else {
             return Ok(ToolResult::failure(&step.id, self.name(), "no image attached",
                 started.elapsed().as_millis()));
         };

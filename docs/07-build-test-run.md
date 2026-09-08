@@ -116,8 +116,46 @@ click **Download & start**, then attach files and run an inspection.
 | `session_context.json` | this session's rolling context (plain JSON) |
 | `persistent_memory.json` | long-term memory (**AES-256-GCM ciphertext**) |
 | `models/` | `ggml-base.en.bin`, `*.rten` (if you added them) |
+| `logs/workbench.log.<date>` | daily rotating diagnostics (see below) |
 
 The `AuditSidebar` in the GUI shows these resolved paths live.
+
+## Reading the logs
+
+`src-tauri/src/logging.rs` installs the `tracing` subscriber at startup and fans
+every event out to two places: **stdout** (the `npm run tauri dev` terminal) and a
+**daily rotating file** under `logs/`. The React side ships its own events down
+the `ui_log` command, so one file holds the whole story of a turn in order — the
+button that was clicked, the command it invoked, each pipeline stage, and the
+failure at the end.
+
+A healthy turn looks roughly like this:
+
+```
+INFO tauri_app_lib::logging: workbench starting version="0.1.0" …
+INFO ui: bootstrap: checking for Ollama
+INFO ui: probeSystem: ok elapsed_ms=412
+INFO tauri_app_lib: submit_turn: start session_id=s-… prompt_chars=64 file_count=2
+INFO workbench_core::executor: tool: start tool="parse_pdf" …
+INFO workbench_core::executor: tool: ok tool="parse_pdf" elapsed_ms=1832 …
+INFO workbench_core::pipeline: report synthesised citations=3 degraded=false
+```
+
+Turn the volume up with `WB_LOG` (same syntax as `RUST_LOG`):
+
+```bash
+WB_LOG=debug npm run tauri dev
+WB_LOG=workbench_core::tools=trace,info npm run tauri dev
+```
+
+Two traps, both of which we hit for real and both now guarded:
+
+- **A target with no directive is silent.** The default filter starts with `warn`,
+  so any target it does not name (the front-end's `ui`, for one) has its `info!`
+  and `debug!` dropped with no error. `logging::tests` asserts the defaults.
+- **The `WorkerGuard` must outlive the process.** Dropping it joins the file
+  writer thread, and every later line vanishes. `lib.rs` parks it in Tauri's
+  managed state for exactly this reason.
 
 ## Troubleshooting
 

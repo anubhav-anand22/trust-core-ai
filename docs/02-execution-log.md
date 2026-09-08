@@ -230,11 +230,349 @@ After that the e2e ran clean on the first plan attempt: 6 tools in order,
 `search_knowledge` hitting LanceDB, a grounded report citing `SOP-ROT-007`,
 `degraded: false`.
 
+## Post-demo — the "useless and slow" report, part 1: don't hang the machine
+
+The first real hands-on test on a 4-core, 16 GB, no-GPU laptop went badly. Three
+complaints: a wrong answer on a PDF (covered in part 2), turns that took minutes,
+and — twice — the whole Windows desktop freezing mid-run: a stuck volume overlay,
+a dead Start button, an unusable tray. A background build of *this project* later
+reproduced the freeze exactly, which told us the cause was not the model at all.
+
+### Why the desktop froze
+
+Ollama runs as a **separate process**. Our pipeline caps how many CPU threads it
+asks Ollama to use (`num_thread`), but nothing capped Ollama's *scheduling
+priority*. On a 4-core box, inference at normal priority competes with the window
+manager for cores, and the shell loses. The freeze outlives the run because the
+shell's XAML hosts, once starved, draw an overlay and then never run the timer
+that dismisses it.
+
+Two more multipliers:
+
+- **Logical vs physical cores.** `detect_hardware` read
+  `std::thread::available_parallelism()` — hyperthreads. A 4-core/8-thread laptop
+  reported `8`, which pushed it up a model tier *and* made `worker_threads()`
+  hand out `7` threads for `4` real cores. Now `sysinfo::physical_core_count()` is
+  the number every thread budget is derived from.
+- **Two uncapped model calls.** `warm_model` (the first, heaviest load) and the
+  RAG embedder both issued requests with no options block, so they ran at
+  Ollama's default *unbounded* thread count. Both now carry the same ceilings as
+  every other call.
+
+### What changed
+
+- **`bootstrap::ollama::lower_ollama_priority()`** — sets every `ollama*` process
+  to below-normal priority, at startup and again after the model is warmed (the
+  per-model runner is spawned lazily). Inference stays fast; the shell always
+  wins a contested core.
+- **A sized model catalogue.** `recommend_models` no longer compares core counts
+  and RAM to bare thresholds. `LLM_CATALOG` carries each model's approximate
+  resident RAM, download size and context window, and the tiers are gated on
+  **physical cores** and **available** (not total) RAM:
+
+  | Tier | CPU-only condition | Model | ~RAM |
+  |---|---|---|---|
+  | standard | ≥6 physical cores, ≥10 GB free | `qwen2.5:3b-instruct` | 1.9 GB |
+  | floor | ≥4 physical cores, ≥5 GB free | `qwen2.5:1.5b-instruct` | 1.0 GB |
+  | minimal | ≥2 physical cores, ≥3 GB free | `qwen2.5:0.5b-instruct` | 0.4 GB |
+  | unusable | below that | (refuses, explains why) | — |
+
+  Every model is an *instruct* model: the pipeline constrains decoding to a JSON
+  schema, and a "thinking" model (`qwen3:4b`) emits its reasoning first and
+  returns an empty body under that constraint. It was removed from the dropdown.
+
+- **`assess_llm` + the `assess_model` command.** Overriding the recommendation
+  used to produce only a log line the user never saw. Now the bootstrap screen
+  shows the download size, and a warning strip: *caution* if the pick is much
+  bigger than the tier ("expect turns ~2× slower"), *blocked* — with the Download
+  button disabled — if it will not fit in available RAM, with the real numbers in
+  the message.
+
+- **A disk pre-flight** in `ensure_models`: it sums the download estimate for the
+  missing models and refuses up front if the drive holding the app-data dir does
+  not have that plus 2 GB. A build here once died with "no space on device" after
+  a 20-minute partial download; this is that failure caught early.
+
+- **Timeouts.** Every Ollama call now goes through `OllamaEngine::guarded`, which
+  races the request against a wall-clock deadline (`ResourceLimits::call_timeout`,
+  240 s by default — generous, because CPU inference of a long prompt is *slow*,
+  not stuck) and a poll of the cancel flag. A call that blows the deadline is
+  abandoned as `CoreError::Timeout`; the step degrades and the user gets a
+  warning strip, instead of the turn hanging forever.
+
+- **A Stop button.** `CancelFlag` is a shared `AtomicBool` — the one way into a
+  pipeline that is otherwise one long `await`. It is polled before every model
+  call and between every tool step, so Stop ends a turn *within* a step, not
+  after it. Blocking tools (PDF, OCR, whisper) still finish their current call —
+  nothing can safely kill a `spawn_blocking` mid-flight — but no further step
+  begins. A user-pressed Stop is reported as a warning, not a red error.
+
+- **`StepEvent::Warning`** — the pipeline had no way to tell the user anything
+  short of a fatal error, so a degraded turn looked identical to a clean one.
+  Warnings now render as a dismissible amber strip above the report.
+
+### Deliberately not done
+
+- **Killing a blocking tool mid-call.** `spawn_blocking` tasks (whisper, OCR,
+  pdfplumber) cannot be safely aborted from outside. The cancel check between
+  steps is the pragmatic compromise; a turn cancelled during a 40-second OCR
+  still waits out that OCR.
+- **GPU layer offload tuning (`num_gpu`, `low_vram`).** Real value for low-VRAM
+  machines, but this milestone was about the CPU-only floor. Left for later.
+- **A hard per-*turn* timeout.** Only per-*call* timeouts exist. A pathological
+  plan with many slow steps could still run long — but each step is now bounded
+  and the user can Stop, which covers the real case.
+
+### Takeaway
+
+When something "hangs the computer", separate *your* process from the ones it
+talks to. The model was never the freeze; an unpriotised sibling process was.
+And size a thread pool off physical cores — hyperthreads flatter the number and
+punish the scheduler.
+
+## Post-demo — the "useless and slow" report, part 2: the answer that was never there
+
+The other half of the bad demo: a PayU rate card was attached and the ask was
+"what transaction fee on a 1000 INR credit-card payment?". The number — 2% — was
+in a table. The model said *"no relevant information available."*
+
+The README's guess was context-window truncation. It was wrong, or at least
+incomplete. A read-only trace found **four** places the figure could be lost, and
+the first one is the whole story:
+
+### The tables were extracted, then thrown away
+
+`parse_pdf` puts its tables in `data["tables"]`. A repo-wide grep for that field
+returns exactly one hit — a string in a prompt. **No code ever read it.** The
+analysis step's `collect()` did `data["text"]` and returned; tables never entered
+the evidence. Every table in every PDF had been silently dropped since the tool
+was written.
+
+### And three multipliers
+
+- **Lattice-only table detection.** `TableSettings::default()` is
+  `Strategy::Lattice`, which needs ruled lines. A zebra-striped or whitespace
+  rate card yields *zero* tables. Now: try Lattice, fall back to `Strategy::Stream`
+  (text-alignment) per page when it finds nothing.
+- **Flat text extraction.** `TextOptions::default()` has `layout: false`, so a
+  row collapses to `"Credit card 2.00 0.00 18%"` — no columns, an ambiguous
+  number soup. Now `layout: true`, which keeps the whitespace grid.
+- **Role C still dumped the whole document.** Commit `5c0a3b6` narrowed the
+  *analysis* step's input via retrieval but left `compile_report` doing
+  `serde_json::to_string_pretty(results)` — the entire raw text, into an 8k
+  window. And `serde_json` runs with `preserve_order` in this build, so the giant
+  `text` field serialised *before* `tables`, making the tables the first thing
+  truncation ate. Now role C renders each result to readable text (capped per
+  result), tables included, and runs it through the same retrieval narrowing.
+
+### Retrieval got three fixes of its own
+
+- **Chunking split decimals.** The splitter broke on `
+` *or* `.`, and in a
+  numeric table the last `.` before the window edge is usually a decimal point —
+  `2.00%` became `"… 2."` + `"00% …"`. Now it breaks only on line boundaries, so
+  a rendered table row stays whole.
+- **Half the context window was unreachable.** `select_relevant` capped at
+  `top_k` (8) chunks × 1100 chars ≈ 8.8k, against a 16k budget. `top_k` is a
+  floor now; it fills the budget.
+- **No embedding task prefixes.** `nomic-embed-text` is trained to receive
+  `search_query:` on queries and `search_document:` on passages and is
+  measurably worse without them. Both are applied now; the KB rebuilds once to
+  re-embed with the scheme.
+
+### And the model was being told the question was out of scope
+
+Every role prompt said *"offline industrial inspection assistant"*, three times.
+Hand that a payments fee schedule and ask for `safety_notes` and SOP clauses, and
+*"no relevant information"* is a very natural completion. The framing is now
+"analysis assistant … industrial *and* business documents", role C is told to
+quote any rate/fee/percentage verbatim and show the arithmetic, and `analyze()`
+finally has a real `.system(...)` instead of that instruction tacked onto the end
+of the user message.
+
+### Fast vs Deep
+
+Two modes now, picked with a checkbox:
+
+- **Fast** (default): the retrieval path above. Seconds; the right passage or
+  nothing.
+- **Deep**: `windows()` splits the whole document into gap-free windows, the
+  analysis instruction is mapped over every one, and the partials are reduced
+  into one answer. Nothing is skipped, at one model call per window — minutes on
+  CPU, so each window emits a progress event and the cancel flag is checked
+  between them.
+
+### A quality check that could have caught it
+
+`quality.rs` only checked that `text` was non-empty, so *"No relevant
+information."* passed every gate. New check: if `parse_pdf` produced tables, their
+flat rendering must be non-empty — a `render_tables` regression fails the run
+loudly instead of silently dropping every figure.
+
+### Deliberately not done
+
+- **Rebuilding pdfplumber's table detection.** Stream is a real improvement but
+  a genuinely adversarial layout (nested cells, multi-line cells) will still
+  defeat it. The escape hatch stays Deep mode, which reads the raw text.
+- **A dedicated table-QA fixture in CI.** `demo/make_fixtures.py` now emits a
+  borderless `fee_card.pdf`, and there are unit tests on `render_tables`,
+  `chunk_text` and `collect()` — but a full extract-to-answer assertion needs a
+  running Ollama, so it stays a manual check.
+
+### Takeaway
+
+"The model can't find X" has three very different causes — X was never extracted,
+X was extracted but dropped before the prompt, or X was in the prompt but past
+the truncation point. They need different fixes and the only way to tell them
+apart is a log line at each hop. That is why `parse_pdf: extracted` now logs
+`text_chars`, `tables`, `tables_text_chars` and `stream_fallback_pages`.
+
+## Post-demo — part 3: many files, mixed types, one turn
+
+"Analyse this audio, this photo and this PDF together" did not work, and not
+where you would guess. Validation was fine; the results map was fine. The failure
+was one line, repeated in four tools:
+
+```rust
+let file = ctx.first_file_of(FileKind::Image);   // ← the FIRST image, always
+```
+
+Attach three photos and the planner emits three `ocr_image` steps? All three read
+**image #1**, three times, at triple the cost. Images 2 and 3 are never opened.
+The helper that would have fixed it — `files_of` — was written when the trait was
+designed and has *zero* call sites.
+
+### The fix: name the file
+
+- **`ToolContext::file_for(step, kind)`** resolves `step.args["file"]` (the
+  planner names an attachment by its `original_name`) against the uploads, and
+  falls back to `first_file_of` only when no name is given — so single-file turns
+  still work with empty `args`. Matching is by **name, never path**: a
+  hallucinated `/etc/passwd` resolves to `None`, not a file read. All four
+  extraction tools now call it.
+- **Role B's rules were rewritten.** They used to say *"Leave `args` as {}"* and
+  *"schedule a task whose required file kind is in ATTACHED FILES"* — both of
+  which push the model toward one step per *kind*. Now: *one extraction step per
+  attached file*, each with `{"file": "<exact name>"}`, and the file list is
+  rendered numbered with `name="…"` so copying the name is unambiguous.
+
+### One bad file no longer blocks the good ones
+
+`FileKind::Unknown` (a `.mov`, a `.zip`) used to become a validation error the
+planner could never repair, so it burned every retry and parked the turn — one
+unsupported attachment blocking four fine ones. Now `pipeline::screen_uploads`
+drops unusable attachments *before* planning, with a `StepEvent::Warning` naming
+each, and the turn proceeds on what remains. (A file missing from disk is still a
+hard error — that means something is genuinely broken.)
+
+### A plan can never dead-end now
+
+When the model exhausts its retries, `plan_turn` builds a **deterministic
+fallback**: one extraction step per attachment (`parse_pdf` / `transcribe_audio`
+/ `analyze_image`), a `search_knowledge` step if intent flagged it, then
+`summarize` (+ `compare_to_sop` when knowledge is in play). It is validated like
+any other plan; only if *that* fails does the turn actually park in the HITL
+modal. On a 0.5–1.5B CPU model this is the difference between "usually answers"
+and "answers".
+
+### Smaller fixes
+
+- **`warn_uncovered_files`** — `validate_plan` counts nothing, so a 1-step plan
+  "covers" fifty images silently. Now any attachment no step reads produces a
+  warning.
+- **Per-source evidence cap** (`collect()`): 12k chars per attachment, so one
+  verbose PDF cannot crowd the audio and photos out of the ranking.
+- **Upload de-duplication** (`persist_uploads`): `IMG 1.jpg` and `IMG_1.jpg`
+  sanitise to the same on-disk name and used to overwrite each other, leaving two
+  `InputFile`s pointing at one file. The on-disk name is now disambiguated; the
+  user-facing `original_name` is untouched.
+- **`ACCEPT` synced** with `FileKind::from_extension` (it was missing `.aac` /
+  `.wma`) and the drop zone now screens by extension — it previously bypassed the
+  picker's filter entirely.
+
+### Deliberately not done
+
+- **Video.** No `FileKind::Video`, no ffmpeg. A dropped `.mp4` warns and is
+  skipped; the rest of the turn runs. Out of scope for now by decision.
+- **`ocr_image` *and* `analyze_image` on every image.** The fallback picks
+  `analyze_image` (visual condition) for a photo; a nameplate that needs OCR
+  still needs the model to plan it, or a second turn.
+
+### Takeaway
+
+A helper written "for later" with no caller is a latent bug, not a convenience.
+`files_of` sat unused while `first_file_of` quietly dropped the user's data in
+four places. If you add the plural form, wire it the same day.
+
+## Post-demo — part 4: it is a chat now, not a form
+
+The app was a single-shot form: type a prompt, get one report, and the next
+prompt wiped it. Three structural facts made a real conversation impossible:
+
+- **One shared `session_context.json`.** The path had no session id in it, so
+  every chat wrote the same file. Starting a new chat overwrote the old one, and
+  a page reload minted a fresh id that orphaned whatever was there.
+- **Only 200 characters survived per turn.** `TurnSummary` kept a truncated
+  prompt and a truncated summary — findings, citations and safety notes were
+  dropped — so a past chat could not be redrawn even if you found it.
+- **The planner never saw the conversation.** Only role C got a session blob.
+  A follow-up like *"and what about debit cards?"* was planned with zero context,
+  and `validate_plan` then rejected any analysis step with no preceding
+  extraction step, so the turn parked in the HITL modal with no answer.
+
+### What changed
+
+- **One file per session** under `sessions/<id>.json`, keeping the existing
+  atomic temp+rename write. A one-time migration moves a pre-Stage-4
+  `session_context.json` in on first launch so an existing user's last chat is
+  not lost.
+- **`SessionContext` now carries a full `exchanges` transcript** — prompt, the
+  complete `FinalReport`, attachment names, timestamp — alongside the bounded
+  `turns` + `rolling_summary` that feed the model. The transcript on disk is
+  complete; only what the model sees is capped (still `MAX_VERBATIM_TURNS`, then
+  compress).
+- **The session is loaded *before* planning** and its `context_blob` is passed
+  into role A and role B, not just role C. `plan_turn` gained `history` and
+  `has_history` parameters.
+- **`answer_followup`** — a new `Stage::Retrieve` task, valid as a lone step,
+  that runs the transcript through the resident model. The planner is told to
+  use it for a follow-up that needs no new files; the deterministic fallback
+  emits it when there are no uploads, no knowledge need, and a conversation
+  exists. A bare follow-up resolves instead of parking.
+- **Commands** `list_sessions` / `load_session` / `delete_session` /
+  `rename_session`, backed by `SessionContext::list` (a `read_dir` over
+  `sessions/`, newest-updated first). No fs plugin, so the frontend cannot read
+  those files directly — every listing goes through a command.
+- **The UI is a chat.** `App.tsx` holds a transcript list with the prompt at the
+  bottom; a new `SessionSidebar` lists past chats (click to reopen, rename,
+  delete, New chat). The session id lives in `localStorage`, so a reload keeps
+  the same conversation instead of orphaning it.
+
+### Deliberately not done
+
+- **LanceDB for sessions.** Its only pattern in this repo is
+  `CreateTableMode::Overwrite` with a mandatory `vector` column — storing chats
+  there would mean embedding every message. Plain per-session JSON matches the
+  existing `session.rs` idiom and needs no model call to list.
+- **Capping how many sessions are kept.** The sidebar and `sessions/` grow
+  unbounded for now; pruning is a later concern.
+- **Streaming the assistant's answer token by token.** The turn still lands as
+  one report. The stepper and per-window progress cover "is it working"; live
+  token streaming is a separate piece of work.
+
+### Takeaway
+
+"Add a session id to the filename" sounds like a one-line fix. It was — but it
+sat behind two others (keep the whole transcript, show the planner the history)
+that only became visible once the first was done. A feature that "does not work"
+often has a stack of causes, and you find the second only after fixing the first.
+
 ## Where it ended
 
-Phases 0–4 done, RAG on LanceDB. `cargo test -p workbench-core -j 1` green (20).
-`tsc` clean. Headless e2e green (report cites a retrieved SOP).
-`feature/sovereign-workbench`.
+Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`
+and `cargo test -p tauri-app -j 1 --lib` green; `tsc` clean;
+`cargo check --workspace` clean. Not yet verified end-to-end against a running
+model. `feature/sovereign-workbench`.
 
 ### Takeaways for an aspiring engineer
 

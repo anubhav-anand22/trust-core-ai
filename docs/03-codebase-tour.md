@@ -308,6 +308,15 @@ impl ProgressSink for ChannelSink {
 Eight lines. The only glue between "the pipeline emits events" and "Tauri streams
 them to the browser".
 
+### `src/logging.rs`
+
+Installs the `tracing` subscriber (stdout + a daily rotating file) and exposes the
+`ui_log` command so the React side logs into the same stream. Before this existed
+the codebase was full of `tracing::` calls with no subscriber to receive them —
+macros with no subscriber are no-ops, so all of it was dead code. See
+[07 · Build, test, run](07-build-test-run.md#reading-the-logs) for how to read the
+output and the two silent-failure traps it guards against.
+
 ---
 
 ## `src/` — the React frontend

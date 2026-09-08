@@ -82,10 +82,13 @@ You rarely *write* lifetimes; you read them as "this borrows from something".
 
 - `Option<T>` = `Some(T)` or `None`. Replaces null.
   ```rust
-  match ctx.first_file_of(FileKind::Pdf) {
+  match ctx.file_for(step, FileKind::Pdf) {
       Some(file) => { /* use it */ }
       None => return Ok(ToolResult::failure(&step.id, self.name(), "no PDF attached", …)),
   }
+  // `file_for` reads `step.args["file"]` (the planner names the attachment),
+  // falling back to the first file of that kind. `first_file_of` still exists;
+  // use `file_for` in a tool so multi-file turns work.
   ```
 - `Result<T, E>` = `Ok(T)` or `Err(E)`. Replaces exceptions. **Errors are values**
   you must handle or pass on.

@@ -136,7 +136,9 @@ follow it in order — later steps assume earlier ones worked.
 - Close anything heavy. Inference will use every core it is allowed to, and on a
   small machine you will feel it (see *Known problems* below).
 - Generate the fixtures: `python demo/make_fixtures.py` (needs Pillow). You get
-  `inspection.pdf`, `valve.png`, `nameplate.png`, `note.wav` in `demo/fixtures/`.
+  `inspection.pdf`, `fee_card.pdf`, `valve.png`, `nameplate.png`, `note.wav` in
+  `demo/fixtures/`. `fee_card.pdf` is the borderless rate card for testing the
+  table path.
 
 ### 1. Bootstrap screen
 
@@ -208,11 +210,24 @@ exercised through the GUI** — treat anything odd here as expected and report i
 
 ### What to report back
 
-For anything that misbehaves, the useful details are: which step, the elapsed
-times from the activity list, whether the report said `degraded`, and — if the
-answer was wrong — what the source document actually contained. Running the
-headless `--example e2e` (bottom of this file) prints every step event and is
-usually the fastest way to see where a turn went wrong.
+**Attach the log file.** Every UI click, every backend command, every pipeline
+stage and every tool timing is written to a daily file:
+
+```
+Windows   %APPDATA%\com.anubhav_anand.tauri-app\logs\workbench.log.<date>
+macOS     ~/Library/Application Support/com.anubhav_anand.tauri-app/logs/
+Linux     ~/.local/share/com.anubhav_anand.tauri-app/logs/
+```
+
+The audit sidebar has an **Open log folder** button that takes you straight
+there. For more detail than the default, set `WB_LOG` before launching — it takes
+`RUST_LOG` syntax, e.g. `WB_LOG=debug` or `WB_LOG=workbench_core::tools=trace,info`.
+
+Beyond the log, the useful details are: which step, the elapsed times from the
+activity list, whether the report said `degraded`, and — if the answer was wrong —
+what the source document actually contained. Running the headless `--example e2e`
+(bottom of this file) prints every step event and is usually the fastest way to
+see where a turn went wrong.
 
 ---
 
@@ -221,32 +236,54 @@ usually the fastest way to see where a turn went wrong.
 Please read this before concluding something is broken — and please do brainstorm
 on any of it.
 
-### 1. CPU-only performance is the central unsolved problem
+### 1. CPU-only performance is slow by nature (but no longer dangerous)
 
 On a 4-core machine with no GPU, a full turn took roughly **8 minutes**, with the
-two analysis steps (`summarize`, `compare_to_sop`) at ~200s *each*. We have since
-capped output length, shrunk prompts via retrieval, and stopped recommending
-oversized models — but **the improvement is not yet measured**, and the physics
-does not change: local inference on 4 CPU cores is slow.
+two analysis steps (`summarize`, `compare_to_sop`) at ~200s *each*. The physics
+does not change — every token is a CPU matrix multiply — but the milestone in
+[docs/09-running-on-cpu.md](docs/09-running-on-cpu.md) made it *safe* and
+*bounded*:
 
-Open questions worth thinking about:
-- Are two separate analysis steps justified, or should `summarize` and
-  `compare_to_sop` collapse into one model call?
-- Should the vision step be opt-in? `moondream` cost ~48s for a photo.
-- Is there a smaller viable resident model than `qwen2.5:1.5b-instruct`?
-- Would streaming partial output make the wait *feel* acceptable even if the
-  total time does not change?
+- The model recommender is rebuilt around a sized catalogue and gates tiers on
+  **physical** cores and **available** RAM. An 8 GB / 4-core / no-GPU box gets
+  `qwen2.5:1.5b-instruct`; a 2-core box gets `qwen2.5:0.5b-instruct`; below that
+  the app says so instead of pretending.
+- Overriding to a bigger model now shows a warning (or blocks entirely, with the
+  RAM numbers) instead of a silent log line.
+- Every model call has a 240 s timeout, and there is a **Stop** button.
 
-### 2. Long documents may still fail (unverified fix)
+Still open, and worth thinking about:
+- The improvement in wall-clock time is **not yet measured** against a baseline.
+- Are two analysis steps justified, or should `summarize` + `compare_to_sop`
+  collapse into one call?
+- Would streaming partial output make the wait *feel* acceptable?
+- `moondream` still costs ~48 s per photo on 4 cores and is pulled on every tier.
 
-Symptom: asked about a fee buried deep in a PDF, the model answered *"no relevant
-information available"*. Diagnosis: the entire document was being stuffed into a
-4096-token context window, so the relevant page was silently truncated away. Fix:
-the evidence is now chunked, embedded, and only passages relevant to the question
-are sent. **This has not been re-tested against the original failing document.**
+### 2. Long documents / tables (largely rewritten, still unverified end-to-end)
 
-There is a second possible cause we have not ruled out: `pdfplumber` may simply
-fail to extract text from some PDFs. Which of the two it was, we do not yet know.
+Symptom: asked about a fee in a PDF rate card, the model answered *"no relevant
+information available"*. The README used to blame context-window truncation. That
+was incomplete — a read-only trace found the real chain
+([docs/10-documents-and-tables.md](docs/10-documents-and-tables.md)):
+
+1. **Tables were extracted and then dropped.** `parse_pdf` filled `data["tables"]`
+   and nothing ever read it. Fixed: a flat `tables_text` rendering (header
+   repeated per row) now flows into the evidence.
+2. **Borderless tables were never detected** (`Strategy::Lattice` needs ruled
+   lines). Fixed: `Strategy::Stream` fallback per page, and `layout: true` text.
+3. **Role C still dumped the whole document** into an 8k window — the half of
+   commit `5c0a3b6` that was never applied. Fixed: it renders + narrows now.
+4. **Chunking split `2.00%`** on the decimal point. Fixed: line-boundary splits.
+5. Plus: `nomic-embed-text` task prefixes, a budget-filling passage selector, and
+   role prompts that no longer frame a payments question as "out of scope".
+
+There is also a new **Deep read** checkbox: map-reduce over the whole document,
+slower, misses nothing.
+
+**Still needs verifying end-to-end** against the real PayU document. Unit tests
+cover `render_tables`, `chunk_text` and `collect()`; `demo/make_fixtures.py` now
+emits a borderless `fee_card.pdf`. A full extract-to-answer test needs a running
+Ollama and has not been done.
 
 ### 3. Scanned PDFs are not supported, by design
 
@@ -254,32 +291,64 @@ fail to extract text from some PDFs. Which of the two it was, we do not yet know
 extractable text" rather than being OCR'd. This was a deliberate scope decision,
 but it is a real limitation for a document-heavy demo.
 
-### 4. Small models write bad plans
+### 4. Small models write bad plans (now with a safety net)
 
-`llama3.2:3b` has been observed to:
-- copy the task registry's formatting into the task name (`"parse_pdf [Extract]"`),
-- hallucinate tasks that do not exist (`"ochrage_image"`),
-- invent attachments that were never provided.
+`llama3.2:3b` and smaller have been observed to copy the registry's formatting
+into the task name (`"parse_pdf [Extract]"`), hallucinate tasks, and invent
+attachments. Name normalisation and prompt hardening reduced it; **it is still not
+reliable** on a 0.5–1.5B CPU model.
 
-We added name normalisation and hardened the planner prompt, and it now usually
-validates on the first attempt — but the retry-then-HITL path exists precisely
-because this is not reliable. **`qwen3:4b` is worse, not better**: it returns an
-empty response under structured-output constraints (a thinking-model
-incompatibility) and should not be used as the resident model.
+What changed (Stage 3): when the planner exhausts its retries, `plan_turn` now
+builds a **deterministic fallback plan** — one extraction step per attachment,
+then analysis — validates it, and runs that instead of parking in the HITL modal.
+A turn can no longer dead-end with no answer. The HITL modal is now only reached
+if even the deterministic plan fails validation (it should not).
 
-### 5. The app could make the whole desktop unresponsive
+**`qwen3:4b` is still out**: it returns an empty body under structured output (a
+thinking-model incompatibility). It was removed from the bootstrap dropdown.
 
-Ollama took all cores, and whisper.cpp and the OCR runtime each spawned their own
-unbounded thread pools on top. On a 4-core host this froze the Windows shell
-(dead volume/wifi flyouts) and stuttered video calls. Every path is now capped to
-`cores - 1`. **Please stress-test this** — run something in the background during
-a turn and see whether your machine stays usable.
+### 4b. Multi-file, mixed-type turns now work
 
-### 6. `resume_turn` has never been exercised through the GUI
+Every extraction tool used to call `first_file_of(kind)` and ignore every other
+file of that kind — three photos meant photo #1 read three times. Fixed:
+`ToolContext::file_for(step, kind)` resolves `args["file"]` (the planner names
+each attachment), and the planner is now instructed to emit one step per file. An
+unsupported type (`.mp4`) is dropped with a warning rather than blocking the
+turn. **Not yet verified end-to-end** with a running model — see
+[docs/02-execution-log.md](docs/02-execution-log.md) "part 3".
 
-The HITL resume path compiles, is type-checked, and shares its execution tail with
-the normal path, but nobody has clicked those buttons in a running app. See
-walkthrough step 4.
+### 5. The app could make the whole desktop unresponsive (should be fixed)
+
+Two independent causes, both now addressed:
+
+1. **Thread pools sized off logical cores.** Ollama, whisper.cpp and the OCR
+   runtime each sized their pools off `available_parallelism()` — hyperthreads —
+   so a 4-core/8-thread laptop ran ~7 compute threads per pool on 4 real cores.
+   Everything is now derived from `sysinfo::physical_core_count()`.
+2. **Ollama's scheduling priority.** Ollama is a separate process; capping its
+   thread *count* did not stop it out-prioritising the window manager. Bootstrap
+   now drops every `ollama*` process to below-normal priority.
+
+**Still worth stress-testing:** run a video call during a turn and confirm the
+shell stays responsive, and that **Stop** aborts within a second or two. A build
+of this project at normal priority did freeze the shell once during development —
+that is the failure mode to check has not returned.
+
+### 6. The whole GUI needs a real click-through
+
+Several code paths compile and are type-checked but nobody has driven them in a
+running app:
+
+- **HITL resume** (`resume_turn`) — the "Re-run with this plan" / "Run anyway"
+  buttons. Shares its execution tail with the normal path.
+- **Chat sessions** (Stage 4) — the session sidebar, New chat, rename, delete,
+  reopening a past chat's transcript, and a **follow-up question** (a second turn
+  with no attachments) resolving instead of parking. The Rust side has unit tests
+  (`session.rs`, `planner_retry.rs`); the React side has not been exercised.
+- **Deep read**, the **Stop** button, and the **override warning** on the
+  bootstrap screen.
+
+See the walkthrough. When you run these, watch `workbench.log.*` (problem 8).
 
 ### 7. Build environment fragility
 
@@ -292,7 +361,31 @@ walkthrough step 4.
 - `lancedb 0.38.0` needs `features = ["remote"]` to compile at all — a workaround
   for a bug in that release, not something we want.
 
-### 8. Not started
+### 8. The logging is new and has never watched a complete turn
+
+The diagnostics above were only just fixed. Two bugs meant that until now the log
+file held exactly one line: the `WorkerGuard` was dropped at the end of Tauri's
+`setup` hook (which joins the writer thread, so every later line was discarded),
+and the front-end's `ui` target matched no directive in the filter, so all React
+`info`/`debug` events were dropped before either sink. Both are fixed and there is
+a unit test on the filter, but **no one has yet watched a full turn go through
+with logging working.**
+
+So: the first turn you run is also the first real test of the logging. If the log
+file has only a `workbench starting` line in it, the fix did not take — that is a
+bug worth reporting on its own. A healthy file shows, in order: `workbench
+starting` → `ui:` bootstrap lines → `submit_turn` → per-tool `tool: start` /
+`tool: ok` → `report synthesised`.
+
+### 9. Persistent memory is still not visible
+
+Chat sessions persist (Stage 4), but the cross-session `persistent_memory.json`
+still only accumulates a rolling prose digest. `facility_metadata` and
+`recurrent_tags` are structurally present and never written. The
+"propose → you confirm" memory panel (company name, industry, facility) — the
+visible indicator that the system is learning — is designed but not built.
+
+### 10. Not started
 
 Phase 5: packaging into an installer, bundling the whisper/OCR weights, and the
 true air-gapped test (disconnect networking, repeat the demo). Also no
