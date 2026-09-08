@@ -7,6 +7,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
+  assessModel,
   ensureModels,
   ensureOllamaInstalled,
   isOllamaInstalled,
@@ -14,7 +15,8 @@ import {
   setModelPlan,
   warmModel,
 } from "../lib/pipeline";
-import type { ModelPlan, SystemProbe } from "../types";
+import { log as logger } from "../lib/log";
+import type { LlmAssessment, ModelPlan, SystemProbe } from "../types";
 
 type Phase =
   | "checking-ollama"
@@ -25,16 +27,17 @@ type Phase =
   | "warming"
   | "error";
 
-// Resident-LLM options offered in the override dropdown. The recommended tier is
-// pre-selected; the others cover both fresh pulls and models a machine may
-// already have locally.
+// Resident-LLM options offered in the override dropdown, smallest first. Mirrors
+// LLM_CATALOG in src-tauri/src/bootstrap/models.rs. Deliberately no "thinking"
+// model (e.g. qwen3): they return an empty body under this app's structured-output
+// mode. The backend's assess_model call is what warns if a pick is too big.
 const LLM_CHOICES = [
-  "qwen2.5:7b-instruct",
-  "phi4-mini",
-  "qwen2.5:3b-instruct",
+  "qwen2.5:0.5b-instruct",
   "qwen2.5:1.5b-instruct",
+  "qwen2.5:3b-instruct",
   "llama3.2:3b",
-  "qwen3:4b",
+  "phi4-mini",
+  "qwen2.5:7b-instruct",
 ];
 
 export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void }) {
@@ -44,6 +47,10 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
   const [llm, setLlm] = useState<string>("");
   const [pullLines, setPullLines] = useState<Record<string, string>>({});
   const [error, setError] = useState<string>("");
+  // Risk check for the currently-selected model against this host. Refreshed
+  // whenever the dropdown changes; drives the warning strip and blocks an
+  // impossible pick.
+  const [assessment, setAssessment] = useState<LlmAssessment | null>(null);
 
   const push = (line: string) => setLog((l) => [...l.slice(-40), line]);
 
@@ -51,7 +58,12 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
   useEffect(() => {
     (async () => {
       try {
+        logger.info("bootstrap: checking for Ollama");
         if (!(await isOllamaInstalled())) {
+          // Worth a warning: on a machine where Ollama *is* installed, reaching
+          // this branch means detection failed and the user is about to sit
+          // through a pointless reinstall.
+          logger.warn("bootstrap: Ollama not detected; running the installer");
           setPhase("installing-ollama");
           await ensureOllamaInstalled(push);
         }
@@ -59,8 +71,14 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
         const p = await probeSystem();
         setProbe(p);
         setLlm(p.recommended.llm);
+        setAssessment(p.assessment);
         setPhase("choose");
+        logger.info("bootstrap: awaiting model confirmation", {
+          recommended: p.recommended.llm,
+          tier: p.recommended.tier_label,
+        });
       } catch (e) {
+        logger.error("bootstrap failed", { error: String(e) });
         setError(String(e));
         setPhase("error");
       }
@@ -72,8 +90,48 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
     return { ...probe.recommended, llm };
   }, [probe, llm]);
 
+  // Ask the backend how risky the current pick is on this machine.
+  useEffect(() => {
+    if (!probe || !llm) return;
+    let live = true;
+    assessModel(llm)
+      .then((a) => {
+        if (!live) return;
+        setAssessment(a);
+        if (a.severity !== "ok") {
+          logger.warn("bootstrap: model assessment", {
+            model: a.severity,
+            severity: a.severity,
+            warnings: a.warnings,
+          });
+        }
+      })
+      .catch((e) => logger.error("assess_model failed", { error: String(e) }));
+    return () => {
+      live = false;
+    };
+  }, [probe, llm]);
+
+  const blocked = assessment?.severity === "blocked";
+
   async function confirm() {
     if (!chosenPlan) return;
+    // Whether the user accepted the recommendation matters: overriding to a
+    // larger model on a weak host is the known cause of unusable turn times.
+    const overrode = probe != null && chosenPlan.llm !== probe.recommended.llm;
+    logger.info("bootstrap: user confirmed model plan", {
+      llm: chosenPlan.llm,
+      recommended: probe?.recommended.llm,
+      overrode_recommendation: overrode,
+    });
+    if (overrode) {
+      logger.warn("bootstrap: recommendation overridden", {
+        chosen: chosenPlan.llm,
+        recommended: probe?.recommended.llm,
+        cpu_cores: probe?.hardware.cpu_cores,
+        cuda: probe?.hardware.cuda_available,
+      });
+    }
     try {
       setPhase("pulling");
       await setModelPlan(chosenPlan);
@@ -88,8 +146,12 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
       );
       setPhase("warming");
       await warmModel();
+      logger.info("bootstrap: complete, handing over to the workbench", {
+        llm: chosenPlan.llm,
+      });
       onReady(chosenPlan);
     } catch (e) {
+      logger.error("bootstrap: model setup failed", { error: String(e) });
       setError(String(e));
       setPhase("error");
     }
@@ -117,7 +179,22 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
           <ul className="hw-list">
             <li>
               <span>System RAM</span>
-              <b>{probe.hardware.total_ram_gb.toFixed(1)} GB</b>
+              <b>
+                {probe.hardware.total_ram_gb.toFixed(1)} GB
+                <span className="muted small">
+                  {" "}
+                  · {probe.hardware.available_ram_gb.toFixed(1)} GB free
+                </span>
+              </b>
+            </li>
+            <li>
+              <span>CPU cores</span>
+              <b>
+                {probe.hardware.physical_cores} physical
+                {probe.hardware.cpu_cores !== probe.hardware.physical_cores
+                  ? ` · ${probe.hardware.cpu_cores} logical`
+                  : ""}
+              </b>
             </li>
             <li>
               <span>GPU</span>
@@ -153,11 +230,34 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
           </label>
           <p className="muted small">
             vision: {probe.recommended.vision} · embeddings: {probe.recommended.embed}
+            {assessment != null
+              ? ` · ~${assessment.approx_download_gb.toFixed(1)} GB download`
+              : ""}
           </p>
 
+          {assessment != null && assessment.warnings.length > 0 && (
+            <ul
+              className={`assess assess-${assessment.severity}`}
+              aria-label="Model suitability"
+            >
+              {assessment.warnings.map((w, i) => (
+                <li key={i}>{w}</li>
+              ))}
+            </ul>
+          )}
+
           {phase === "choose" && (
-            <button className="run-btn" onClick={confirm}>
-              Download &amp; start
+            <button
+              className="run-btn"
+              onClick={confirm}
+              disabled={blocked}
+              title={
+                blocked
+                  ? "This model will not fit on this machine — pick a smaller one."
+                  : undefined
+              }
+            >
+              {blocked ? "Model too large for this machine" : "Download & start"}
             </button>
           )}
 

@@ -13,9 +13,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HardwareInfo {
     pub total_ram_gb: f32,
-    /// Logical CPU cores. The dominant signal when there is no GPU: without
-    /// offload, generation speed tracks core count, not system RAM.
+    /// RAM actually free right now. Total RAM only says the weights *fit*; this
+    /// says whether they fit **alongside** the browser, the webview and Ollama's
+    /// own working set, which is what decides whether the machine starts swapping.
+    pub available_ram_gb: f32,
+    /// Logical CPU cores — hyperthreads. Reported for display only.
     pub cpu_cores: usize,
+    /// Physical cores, and the number that actually matters. Hyperthreads share
+    /// one set of execution units, so they roughly double the *count* without
+    /// doubling throughput. Sizing a thread pool off the logical count on a
+    /// 4-core/8-thread laptop asks for 7 threads on 4 real cores, which is how
+    /// this app twice froze the Windows shell mid-turn.
+    pub physical_cores: usize,
     /// "NVIDIA", "AMD", "Intel", or "none".
     pub gpu_vendor: String,
     pub gpu_name: String,
@@ -35,34 +44,72 @@ impl HardwareInfo {
 
     /// Threads to hand to a compute-heavy step, always leaving one core for the
     /// OS so the desktop stays responsive while a turn runs.
+    ///
+    /// Derived from **physical** cores. See [`HardwareInfo::physical_cores`].
     pub fn worker_threads(&self) -> usize {
-        self.cpu_cores.saturating_sub(1).max(1)
+        self.physical_cores.saturating_sub(1).max(1)
     }
 }
 
 /// Probe RAM + cores (via `sysinfo`) and the GPU (via `nvidia-smi`, then Windows CIM).
+///
+/// Not cheap: on a machine without NVIDIA this shells out to PowerShell, so cache
+/// the result rather than calling it per turn.
 #[tauri::command]
 pub fn detect_hardware() -> HardwareInfo {
-    let total_ram_gb = read_total_ram_gb();
+    let (total_ram_gb, available_ram_gb) = read_ram_gb();
+    let (cpu_cores, physical_cores) = read_cores();
     let gpu = detect_gpu();
 
-    HardwareInfo {
+    let hw = HardwareInfo {
         total_ram_gb,
-        cpu_cores: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4),
+        available_ram_gb,
+        cpu_cores,
+        physical_cores,
         gpu_vendor: gpu.vendor,
         gpu_name: gpu.name,
         vram_gb: gpu.vram_gb,
         cuda_available: gpu.cuda,
-    }
+    };
+    tracing::info!(
+        total_ram_gb = hw.total_ram_gb,
+        available_ram_gb = hw.available_ram_gb,
+        cpu_cores = hw.cpu_cores,
+        physical_cores = hw.physical_cores,
+        gpu = %hw.gpu_name,
+        vram_gb = ?hw.vram_gb,
+        cuda = hw.cuda_available,
+        worker_threads = hw.worker_threads(),
+        "hardware probe"
+    );
+    hw
 }
 
-fn read_total_ram_gb() -> f32 {
+/// `(total, available)` in GB. `sysinfo` reports bytes.
+fn read_ram_gb() -> (f32, f32) {
+    const BYTES_PER_GB: f32 = 1024.0 * 1024.0 * 1024.0;
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
-    // sysinfo reports bytes.
-    sys.total_memory() as f32 / (1024.0 * 1024.0 * 1024.0)
+    (
+        sys.total_memory() as f32 / BYTES_PER_GB,
+        sys.available_memory() as f32 / BYTES_PER_GB,
+    )
+}
+
+/// `(logical, physical)` core counts.
+///
+/// `physical_core_count()` can fail (containers, exotic platforms). When it does,
+/// assume hyperthreading and halve the logical count rather than trusting it —
+/// guessing high here is what starves the desktop.
+fn read_cores() -> (usize, usize) {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let physical = sysinfo::System::new()
+        .physical_core_count()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (logical / 2).max(1));
+    (logical, physical.min(logical))
 }
 
 struct GpuInfo {

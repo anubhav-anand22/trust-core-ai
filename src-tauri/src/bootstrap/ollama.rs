@@ -143,3 +143,58 @@ pub async fn ensure_ollama_installed(on_progress: Channel<String>) -> Result<boo
     );
     Err("Installation failed".into())
 }
+
+/// Drop every running Ollama process to below-normal scheduling priority.
+///
+/// Ollama is a *separate* process from this app, so the pipeline's `num_thread`
+/// cap limits how many CPU workers it spawns but not how the OS schedules them.
+/// On a CPU-only machine a full-core inference run at normal priority competes
+/// with the window manager, and the desktop stops responding for the length of a
+/// turn — the failure this app hit twice on a 4-core laptop. Below-normal keeps
+/// inference fast while guaranteeing the shell always wins a contested core.
+///
+/// Best-effort and idempotent: model *runner* subprocesses are spawned lazily on
+/// the first inference, so this is called again after warm-up. Returns how many
+/// processes were adjusted, for the log.
+pub fn lower_ollama_priority() -> usize {
+    let output = if cfg!(target_os = "windows") {
+        // `ollama*` covers the server (`ollama.exe`), the tray app
+        // (`ollama app.exe`) and the per-model runner, whose exact name has
+        // changed across releases.
+        Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "$p = Get-Process | Where-Object { $_.Name -like 'ollama*' }; \
+                 $n = 0; \
+                 foreach ($proc in $p) { \
+                   try { $proc.PriorityClass = 'BelowNormal'; $n++ } catch {} \
+                 }; \
+                 Write-Output $n",
+            ])
+            .output()
+    } else {
+        // `renice` to +5; `pgrep -f` catches the runner even when it is argv[0]
+        // `ollama` invoked as a subcommand.
+        Command::new("sh")
+            .args([
+                "-c",
+                "pids=$(pgrep -f '[o]llama'); [ -n \"$pids\" ] && renice -n 5 $pids >/dev/null 2>&1; \
+                 echo $pids | wc -w",
+            ])
+            .output()
+    };
+
+    let count = output
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    if count > 0 {
+        tracing::info!(count, "lowered Ollama process priority to below-normal");
+    } else {
+        tracing::debug!("no Ollama processes found to deprioritise (yet)");
+    }
+    count
+}
