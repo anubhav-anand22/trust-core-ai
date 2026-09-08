@@ -2,7 +2,8 @@
 // resolved on-disk locations. This is the "enterprise explainability" surface.
 
 import { useEffect, useState } from "react";
-import { auditPaths } from "../lib/pipeline";
+import { auditPaths, openLogDir } from "../lib/pipeline";
+import { log } from "../lib/log";
 import type { AuditPaths, ModelPlan, StepEvent } from "../types";
 
 interface ToolTiming {
@@ -103,10 +104,33 @@ export function AuditSidebar({
                   <span>memory (enc)</span>
                   <code>{paths.persistent_memory}</code>
                 </li>
+                <li title={paths.logs}>
+                  <span>logs</span>
+                  <code>{paths.logs}</code>
+                </li>
               </ul>
             ) : (
               <p className="muted">unavailable</p>
             )}
+          </section>
+
+          <section>
+            <h4>Diagnostics</h4>
+            <p className="muted small">
+              Every UI action and pipeline step is written to a daily log file.
+              Attach it to a bug report.
+            </p>
+            <button
+              className="secondary"
+              onClick={() => {
+                log.info("user opened the log directory");
+                openLogDir().catch((e) =>
+                  log.error("could not open log directory", { error: String(e) }),
+                );
+              }}
+            >
+              Open log folder
+            </button>
           </section>
         </div>
       )}

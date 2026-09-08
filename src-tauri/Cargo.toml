@@ -28,3 +28,8 @@ tokio-stream = "0.1.19"
 sysinfo = "0.33"
 base64 = "0.22"
 workbench-core = { path = "../crates/workbench-core" }
+# Diagnostics. The core crate emits `tracing` events; without a subscriber here
+# they go nowhere, so the host owns setup and writes to console + a daily file.
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
