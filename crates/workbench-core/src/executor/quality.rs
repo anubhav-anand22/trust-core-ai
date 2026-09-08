@@ -98,6 +98,35 @@ pub fn assert_sane(
         }
     }
 
+    // 4b. If a PDF yielded tables, their flat rendering must have come through.
+    //     A regression in `render_tables` would otherwise silently drop every
+    //     figure in a rate card — exactly the bug this whole stage was about.
+    for r in results.iter().filter(|r| r.ok && r.task == "parse_pdf") {
+        let table_count = r
+            .data
+            .get("tables")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if table_count > 0 {
+            let rendered = r
+                .data
+                .get("tables_text")
+                .and_then(|t| t.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            checks.push(QualityCheck {
+                name: "pdf_tables_rendered".into(),
+                passed: rendered,
+                detail: if rendered {
+                    format!("{table_count} table(s) extracted and rendered to text")
+                } else {
+                    format!("{table_count} table(s) extracted but not rendered — the model will not see them")
+                },
+            });
+        }
+    }
+
     // 5. The report must actually say something.
     if let Some(rep) = report {
         checks.push(QualityCheck {

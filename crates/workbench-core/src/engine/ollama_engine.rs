@@ -21,30 +21,40 @@ use serde::de::DeserializeOwned;
 
 use crate::engine::schemas::{FinalReport, InputFile, IntentResult, Plan, ToolResult};
 use crate::planner::registry::registry_prompt_block;
-use crate::{CoreError, Result};
+use std::time::Duration;
+
+use crate::{CancelFlag, CoreError, Result, TurnMode};
 
 /// Role A — turn the raw ask + attachment kinds into structured intent.
 const ROLE_A_SYSTEM: &str = "\
-You are the Intent Parser of an offline industrial inspection assistant.
+You are the Intent Parser of an offline analysis assistant. The user works
+with industrial *and* business documents — inspection reports, SOPs, invoices,
+payment-services rate cards, contracts — treat every domain as in scope.
 Read the user's request and the list of attached file kinds, then return STRICT JSON:
 {\"intents\":[string,...],\"file_kinds\":[\"audio\"|\"pdf\"|\"image\"],\"needs_knowledge\":boolean}
 - `intents`: one short phrase per distinct thing the user wants.
 - `file_kinds`: echo only kinds that were actually attached.
-- `needs_knowledge`: true if answering requires plant SOPs, safety procedures or standards.
+- `needs_knowledge`: true only if answering needs reference material that would
+  live in a knowledge base (plant SOPs, safety procedures, standards). A
+  question answerable from the attached documents alone is `false`.
 Return JSON only. No prose, no markdown, no code fences.";
 
 /// Role C — synthesise everything the tools produced into the user-facing report.
 const ROLE_C_SYSTEM: &str = "\
-You are the Output Compiler of an offline industrial inspection assistant.
+You are the Output Compiler of an offline analysis assistant. The request may
+concern an inspection, an SOP, an invoice, a fee schedule or a contract — all
+are in scope; do not treat a non-inspection question as out of scope.
 You are given the user's request, the raw outputs of the tools that ran, a summary of
 earlier turns, and long-term facility memory. Synthesise them into STRICT JSON:
 {\"summary\":string,\"findings\":[string],\"citations\":[string],\"safety_notes\":[string],\"degraded\":boolean}
 - `summary`: 2-4 sentences answering the user directly.
 - `findings`: concrete observations, each traceable to a tool output.
 - `citations`: names of knowledge-base sources you actually used. Empty if none.
-- `safety_notes`: hazards or required precautions surfaced by the SOPs.
+- `safety_notes`: hazards or required precautions surfaced by the evidence. Empty if none.
 - `degraded`: true if any tool failed or evidence was missing.
-Never invent measurements, tag numbers or SOP clauses that are not in the tool outputs.
+When the evidence contains a rate, fee, percentage or amount the user asked about,
+quote it verbatim in `summary` and show the arithmetic for their figures.
+Never invent measurements, tag numbers, rates or clauses that are not in the tool outputs.
 Return JSON only. No prose, no markdown, no code fences.";
 
 /// How much context, generation and CPU one session may use.
@@ -62,6 +72,11 @@ pub struct ResourceLimits {
     /// Ceiling on generated tokens, so a rambling small model cannot burn
     /// minutes of CPU on one step.
     pub num_predict: i32,
+    /// Wall-clock ceiling on a single model call. A call that blows past this is
+    /// abandoned with [`CoreError::Timeout`] rather than hanging the turn (and,
+    /// on a small box, the desktop) indefinitely. Deliberately generous: CPU
+    /// inference of a long prompt is slow, not stuck.
+    pub call_timeout: Duration,
 }
 
 impl Default for ResourceLimits {
@@ -73,6 +88,7 @@ impl Default for ResourceLimits {
             num_ctx: 8192,
             num_thread: cores.saturating_sub(1).max(1) as u32,
             num_predict: 640,
+            call_timeout: Duration::from_secs(240),
         }
     }
 }
@@ -84,6 +100,11 @@ pub struct OllamaEngine {
     vision_model: String,
     embed_model: String,
     limits: ResourceLimits,
+    /// Set by the host for the duration of one turn; polled inside every model
+    /// call so a user pressing Stop is honoured mid-call, not just between steps.
+    cancel: Option<CancelFlag>,
+    /// Fast (retrieve then answer) vs Deep (map-reduce the whole document).
+    mode: TurnMode,
 }
 
 impl OllamaEngine {
@@ -105,6 +126,8 @@ impl OllamaEngine {
             vision_model: vision_model.into(),
             embed_model: embed_model.into(),
             limits: ResourceLimits::default(),
+            cancel: None,
+            mode: TurnMode::Fast,
         }
     }
 
@@ -118,9 +141,76 @@ impl OllamaEngine {
         self.limits
     }
 
+    /// Attach a per-turn cancellation flag. See [`CancelFlag`].
+    pub fn with_cancel(mut self, flag: CancelFlag) -> Self {
+        self.cancel = Some(flag);
+        self
+    }
+
+    /// Set the read mode for this turn. See [`TurnMode`].
+    pub fn with_mode(mut self, mode: TurnMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> TurnMode {
+        self.mode
+    }
+
+    /// `Err(CoreError::Cancelled)` if the current turn was cancelled. Cheap;
+    /// the executor calls it between steps so a stop during a blocking tool is
+    /// caught before the next step starts.
+    pub fn cancel_check(&self) -> Result<()> {
+        match &self.cancel {
+            Some(c) => c.check(),
+            None => Ok(()),
+        }
+    }
+
+    /// Drive one Ollama call to completion, but never past two limits: the
+    /// wall-clock `call_timeout`, and a Stop from the user. Polls the cancel flag
+    /// on a 200 ms tick so neither the timeout nor the flag can be missed while
+    /// the request future is parked.
+    async fn guarded<F, T>(&self, what: &str, fut: F) -> Result<T>
+    where
+        F: std::future::Future<Output = std::result::Result<T, ollama_rs::error::OllamaError>>,
+    {
+        tokio::pin!(fut);
+        let deadline = tokio::time::sleep(self.limits.call_timeout);
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut fut => {
+                    return r.map_err(|e| {
+                        tracing::error!(what, error = %e, "ollama request failed");
+                        CoreError::Ollama(e.to_string())
+                    });
+                }
+                _ = &mut deadline => {
+                    let secs = self.limits.call_timeout.as_secs();
+                    tracing::error!(what, secs, "model call exceeded its time budget; abandoning it");
+                    return Err(CoreError::Timeout { what: what.to_string(), secs });
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)), if self.cancel.is_some() => {
+                    if self.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                        tracing::info!(what, "model call cancelled by user");
+                        return Err(CoreError::Cancelled);
+                    }
+                }
+            }
+        }
+    }
+
     /// The options every request carries: bounded context, bounded threads,
     /// bounded output.
-    fn opts(&self) -> ModelOptions {
+    ///
+    /// `pub(crate)` because the RAG embedder builds its own request type and must
+    /// carry the same ceilings — an embedding call that skips these runs with
+    /// Ollama's default *unbounded* thread count, which is enough on its own to
+    /// starve the desktop for the length of a turn.
+    pub(crate) fn opts(&self) -> ModelOptions {
         ModelOptions::default()
             .num_ctx(self.limits.num_ctx)
             .num_thread(self.limits.num_thread)
@@ -141,6 +231,19 @@ impl OllamaEngine {
         &self.client
     }
 
+    /// Run an embeddings request under the same timeout + cancellation guard as
+    /// every other model call. The RAG embedder builds its own request type, so
+    /// it hands it here rather than reaching for [`Self::client`] directly — an
+    /// unguarded embedding of a long document was one hot path that could still
+    /// hang a turn.
+    pub(crate) async fn embed_request(
+        &self,
+        request: ollama_rs::generation::embeddings::request::GenerateEmbeddingsRequest,
+    ) -> Result<ollama_rs::generation::embeddings::GenerateEmbeddingsResponse> {
+        self.guarded("embeddings", self.client.generate_embeddings(request))
+            .await
+    }
+
     /// Issue one schema-constrained generation against the resident model and
     /// deserialise it into `T`.
     ///
@@ -155,30 +258,63 @@ impl OllamaEngine {
         user: String,
         role: &'static str,
     ) -> Result<T> {
+        let started = std::time::Instant::now();
+        let prompt_chars = user.len() + system.len();
+
         let request = GenerationRequest::new(self.llm_model.clone(), user)
             .system(system.to_string())
             .format(FormatType::StructuredJson(Box::new(JsonStructure::new::<T>())))
             .options(self.opts())
             .keep_alive(KeepAlive::Indefinitely);
 
-        let response = self
-            .client
-            .generate(request)
-            .await
-            .map_err(|e| CoreError::Ollama(e.to_string()))?;
+        let response = self.guarded(role, self.client.generate(request)).await?;
+
+        // Prompt size against the context window is the first thing to check when
+        // a model claims it cannot find something that is in the document.
+        tracing::debug!(
+            role,
+            model = %self.llm_model,
+            prompt_chars,
+            response_chars = response.response.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            ctx_budget_chars = self.limits.num_ctx * 4,
+            "llm call (structured)"
+        );
+        if prompt_chars as u64 > self.limits.num_ctx * 4 {
+            tracing::warn!(
+                role,
+                prompt_chars,
+                ctx_budget_chars = self.limits.num_ctx * 4,
+                "prompt likely exceeds the context window; the tail will be truncated"
+            );
+        }
 
         let body = strip_code_fence(response.response.trim());
-        serde_json::from_str::<T>(body).map_err(|source| CoreError::Schema { role, source })
+        serde_json::from_str::<T>(body).map_err(|source| {
+            tracing::warn!(role, body = %body.chars().take(400).collect::<String>(), "malformed JSON from model");
+            CoreError::Schema { role, source }
+        })
     }
 
     /// **Role A.** Extract intent and confirm which attachment kinds are in play.
-    pub async fn parse_intent(&self, prompt: &str, uploads: &[InputFile]) -> Result<IntentResult> {
+    pub async fn parse_intent(
+        &self,
+        prompt: &str,
+        history: &str,
+        uploads: &[InputFile],
+    ) -> Result<IntentResult> {
         let kinds: Vec<String> = uploads
             .iter()
             .map(|f| format!("{:?}", f.kind).to_lowercase())
             .collect();
+        let history_block = if history.trim().is_empty() {
+            String::new()
+        } else {
+            format!("EARLIER IN THIS CONVERSATION:\n{history}\n\n")
+        };
         let user = format!(
-            "USER REQUEST:\n{prompt}\n\nATTACHED FILE KINDS: [{}]\n\nReturn the intent JSON.",
+            "{history_block}USER REQUEST:\n{prompt}\n\nATTACHED FILE KINDS: [{}]\n\n\
+             Return the intent JSON.",
             kinds.join(", ")
         );
         self.generate_json(ROLE_A_SYSTEM, user, "intent_parser").await
@@ -191,13 +327,15 @@ impl OllamaEngine {
     pub async fn build_plan(
         &self,
         prompt: &str,
+        history: &str,
         intent: &IntentResult,
         uploads: &[InputFile],
         previous_errors: &[String],
     ) -> Result<Plan> {
         let system = format!(
             "\
-You are the Task Planner of an offline industrial inspection assistant.
+You are the Task Planner of an offline analysis assistant (industrial and
+business documents alike).
 Choose an ordered sequence of steps using ONLY these tasks:
 
 {}
@@ -207,10 +345,16 @@ Rules:
   no stage label, brackets or other suffix (write `parse_pdf`, never `parse_pdf [Extract]`).
 - Extraction and retrieval steps MUST come before analysis steps.
 - List every step after the steps it depends on, using their `id`s in `depends_on`.
-- Only schedule a task whose required file kind is in ATTACHED FILES. Never invent a file.
-- Do NOT put file paths in `args`; the executor already has the attachments.
-  Leave `args` as {{}} — the only exception is `search_knowledge`, which may take
-  {{\"query\": \"...\"}}.
+- ONE extraction step per attached file. If three images are attached, emit three
+  `ocr_image` (or `analyze_image`) steps, one per image — never one step for all.
+- Name the file each extraction step operates on in `args` as
+  {{\"file\": \"<exact name from ATTACHED FILES>\"}}. Copy the name verbatim.
+- Never invent a file. Only name files that appear in ATTACHED FILES.
+- `search_knowledge` takes {{\"query\": \"...\"}} and no `file`. Analysis steps take
+  no `args`.
+- If the request is a FOLLOW-UP to EARLIER IN THIS CONVERSATION and needs no new
+  files or knowledge (e.g. \"and what about debit cards?\", \"show that as a
+  table\"), the whole plan is a single `answer_followup` step with no `args`.
 - Give each step a short unique `id`.
 Return STRICT JSON: {{\"steps\":[{{\"id\":string,\"task\":string,\"args\":object,\"depends_on\":[string]}}]}}
 Return JSON only. No prose, no markdown, no code fences.",
@@ -222,12 +366,26 @@ Return JSON only. No prose, no markdown, no code fences.",
         } else {
             uploads
                 .iter()
-                .map(|f| format!("- {} ({})", f.original_name, format!("{:?}", f.kind).to_lowercase()))
+                .enumerate()
+                .map(|(i, f)| {
+                    format!(
+                        "{}. name=\"{}\"  kind={}",
+                        i + 1,
+                        f.original_name,
+                        format!("{:?}", f.kind).to_lowercase()
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let history_block = if history.trim().is_empty() {
+            String::new()
+        } else {
+            format!("EARLIER IN THIS CONVERSATION:\n{history}\n\n")
+        };
         let mut user = format!(
-            "USER REQUEST:\n{prompt}\n\nPARSED INTENT:\n{}\n\nATTACHED FILES:\n{file_list}\n",
+            "{history_block}USER REQUEST:\n{prompt}\n\nPARSED INTENT:\n{}\n\n\
+             ATTACHED FILES:\n{file_list}\n",
             serde_json::to_string(intent)?,
         );
         if !previous_errors.is_empty() {
@@ -250,6 +408,12 @@ Return JSON only. No prose, no markdown, no code fences.",
     }
 
     /// **Role C.** Fold tool outputs + memory into the final report.
+    ///
+    /// The tool outputs are rendered to readable text (not raw JSON — that dumped
+    /// base64, timings and, because of field order, put a huge `text` field ahead
+    /// of the `tables` a fee question needs) and, if still oversized, narrowed to
+    /// the passages that bear on the request. Commit `5c0a3b6` did this for the
+    /// analysis step but never here, so this path still overflowed the window.
     pub async fn compile_report(
         &self,
         prompt: &str,
@@ -257,13 +421,68 @@ Return JSON only. No prose, no markdown, no code fences.",
         session_summary: &str,
         facility_memory: &str,
     ) -> Result<FinalReport> {
+        /// Per-result cap so one verbose extraction cannot crowd out the rest.
+        const PER_RESULT_CHARS: usize = 6_000;
+
+        let rendered: String = results
+            .iter()
+            .map(|r| {
+                let head = match r.data.get("source").and_then(|s| s.as_str()) {
+                    Some(src) if !src.is_empty() => format!("## {} (from {src})", r.task),
+                    _ => format!("## {}", r.task),
+                };
+                let mut body = if !r.ok {
+                    format!("(this step failed: {})", r.error.as_deref().unwrap_or("unknown"))
+                } else if let Some(t) = r.data.get("text").and_then(|t| t.as_str()) {
+                    let mut b = t.to_string();
+                    if let Some(tbl) = r.data.get("tables_text").and_then(|t| t.as_str()) {
+                        if !tbl.trim().is_empty() {
+                            b.push_str("\n\nTABLES:\n");
+                            b.push_str(tbl);
+                        }
+                    }
+                    b
+                } else if let Some(o) = r.data.get("observation").and_then(|o| o.as_str()) {
+                    o.to_string()
+                } else if let Some(chunks) = r.data.get("chunks").and_then(|c| c.as_array()) {
+                    chunks
+                        .iter()
+                        .filter_map(|c| {
+                            let text = c.get("text")?.as_str()?;
+                            let s = c.get("source").and_then(|s| s.as_str()).unwrap_or("kb");
+                            Some(format!("[{s}] {text}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    serde_json::to_string(&r.data).unwrap_or_default()
+                };
+                if body.chars().count() > PER_RESULT_CHARS {
+                    body = body.chars().take(PER_RESULT_CHARS).collect::<String>() + " …[truncated]";
+                }
+                if let Some(w) = &r.warning {
+                    body.push_str(&format!("\n(note: {w})"));
+                }
+                format!("{head}\n{body}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        // Leave ~40% of the window for the system prompt, the question, the
+        // memory blocks and the answer.
+        let budget = ((self.limits.num_ctx as usize) * 4 * 3) / 5;
+        let tool_outputs = if rendered.chars().count() > budget {
+            crate::tools::rag::select_relevant(self, prompt, &rendered, 12, budget).await
+        } else {
+            rendered
+        };
+
         let user = format!(
             "USER REQUEST:\n{prompt}\n\n\
-             TOOL OUTPUTS:\n{}\n\n\
+             TOOL OUTPUTS:\n{tool_outputs}\n\n\
              EARLIER IN THIS SESSION:\n{}\n\n\
              FACILITY MEMORY:\n{}\n\n\
              Return the report JSON.",
-            serde_json::to_string_pretty(results)?,
             if session_summary.is_empty() { "(none)" } else { session_summary },
             if facility_memory.is_empty() { "(none)" } else { facility_memory },
         );
@@ -280,11 +499,17 @@ Return JSON only. No prose, no markdown, no code fences.",
             .add_image(Image::from_base64(image_base64.to_string()))
             .options(self.opts())
             .keep_alive(KeepAlive::UnloadOnCompletion);
-        let response = self
-            .client
-            .generate(request)
-            .await
-            .map_err(|e| CoreError::Ollama(e.to_string()))?;
+
+        let started = std::time::Instant::now();
+        let response = self.guarded("vision", self.client.generate(request)).await?;
+
+        tracing::debug!(
+            model = %self.vision_model,
+            image_b64_chars = image_base64.len(),
+            response_chars = response.response.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "vlm call"
+        );
         Ok(response.response.trim().to_string())
     }
 
@@ -296,23 +521,62 @@ Return JSON only. No prose, no markdown, no code fences.",
         evidence: &str,
         user_prompt: &str,
     ) -> Result<String> {
+        // A real system prompt: the fee/arithmetic instruction was previously a
+        // tail sentence on the user message, competing with a wall of evidence
+        // for a 1.5B model's attention.
+        let system = "\
+You analyse a supplied EVIDENCE block and answer strictly from it. The evidence
+may be an inspection report, an SOP, an invoice, or a payment-services fee
+schedule — every domain is in scope. Rules:
+- Use only what is in EVIDENCE. If it does not contain the answer, say so plainly.
+- When EVIDENCE gives a rate, fee, percentage or amount the request asks about,
+  quote it verbatim and show the arithmetic for the user's numbers.
+- A row in a TABLES section is evidence like any prose line.
+- Be concise. No preamble.";
+
         let request = GenerationRequest::new(
             self.llm_model.clone(),
-            format!(
-                "USER REQUEST:\n{user_prompt}\n\nTASK:\n{instruction}\n\nEVIDENCE:\n{evidence}\n\n\
-                 Answer concisely and only from the evidence. When the evidence gives a \
-                 rate, fee or percentage the request asks about, quote it exactly and show \
-                 the arithmetic for the user's figures."
-            ),
+            format!("USER REQUEST:\n{user_prompt}\n\nTASK:\n{instruction}\n\nEVIDENCE:\n{evidence}"),
         )
+        .system(system.to_string())
         .options(self.opts())
         .keep_alive(KeepAlive::Indefinitely);
-        let response = self
-            .client
-            .generate(request)
-            .await
-            .map_err(|e| CoreError::Ollama(e.to_string()))?;
+
+        let started = std::time::Instant::now();
+        let response = self.guarded("analysis", self.client.generate(request)).await?;
+
+        tracing::debug!(
+            model = %self.llm_model,
+            evidence_chars = evidence.len(),
+            response_chars = response.response.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "llm call (analysis)"
+        );
         Ok(response.response.trim().to_string())
+    }
+
+    /// Load the resident model into RAM ahead of the first real turn.
+    ///
+    /// An empty prompt is enough to make Ollama read the weights off disk; the
+    /// point is to pay that cost during bootstrap rather than inside the user's
+    /// first question. Goes through the engine (rather than a bare client) so the
+    /// very first model load is bounded by the same thread ceiling as every other
+    /// call — this is the load most likely to thrash a small machine.
+    pub async fn warm(&self) -> Result<()> {
+        let request = GenerationRequest::new(self.llm_model.clone(), String::new())
+            .options(self.opts())
+            .keep_alive(KeepAlive::Indefinitely);
+
+        let started = std::time::Instant::now();
+        self.guarded("warm-up", self.client.generate(request)).await?;
+
+        tracing::info!(
+            model = %self.llm_model,
+            elapsed_ms = started.elapsed().as_millis(),
+            limits = ?self.limits,
+            "resident model warmed"
+        );
+        Ok(())
     }
 
     /// Plain-text summarisation used by the rolling session-memory compressor.
@@ -331,10 +595,8 @@ Return JSON only. No prose, no markdown, no code fences.",
         .keep_alive(KeepAlive::Indefinitely);
 
         let response = self
-            .client
-            .generate(request)
-            .await
-            .map_err(|e| CoreError::Ollama(e.to_string()))?;
+            .guarded("session-summary", self.client.generate(request))
+            .await?;
         Ok(response.response.trim().to_string())
     }
 }

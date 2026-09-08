@@ -4,10 +4,25 @@
 
 export interface HardwareInfo {
   total_ram_gb: number;
+  /** RAM free right now — what decides whether a model fits beside everything else. */
+  available_ram_gb: number;
+  /** Logical cores (hyperthreads). Shown for information. */
+  cpu_cores: number;
+  /** Physical cores — the number the thread budget and model tier are sized on. */
+  physical_cores: number;
   gpu_vendor: string;
   gpu_name: string;
   vram_gb: number | null;
   cuda_available: boolean;
+}
+
+// workbench_core::bootstrap::models::LlmAssessment — the override risk check.
+export interface LlmAssessment {
+  model: string;
+  approx_ram_gb: number;
+  approx_download_gb: number;
+  severity: "ok" | "caution" | "blocked";
+  warnings: string[];
 }
 
 export interface ModelPlan {
@@ -15,11 +30,14 @@ export interface ModelPlan {
   vision: string;
   embed: string;
   tier_label: string;
+  /** Context window the resident model runs with, chosen with the tier. */
+  num_ctx: number;
 }
 
 export interface SystemProbe {
   hardware: HardwareInfo;
   recommended: ModelPlan;
+  assessment: LlmAssessment;
 }
 
 export interface ModelProgress {
@@ -34,6 +52,7 @@ export interface AuditPaths {
   lancedb: string;
   session_context: string;
   persistent_memory: string;
+  logs: string;
 }
 
 // One attachment, base64-encoded, as `submit_turn` expects it.
@@ -49,6 +68,7 @@ export type StepEvent =
   | { stage: "parsing_context"; attempt: number }
   | { stage: "validating_plan"; attempt: number }
   | { stage: "awaiting_user"; errors: string[]; plan_json: string }
+  | { stage: "warning"; message: string; detail?: string | null }
   | { stage: "executing_tool"; tool: string; index: number; total: number }
   | { stage: "tool_finished"; tool: string; ok: boolean; elapsed_ms: number }
   | { stage: "quality_check"; passed: boolean }
@@ -57,6 +77,31 @@ export type StepEvent =
   | { stage: "error"; message: string };
 
 export type StepStage = StepEvent["stage"];
+
+// workbench_core::memory::session::Exchange — one turn in the transcript.
+export interface Exchange {
+  prompt: string;
+  attachments: string[];
+  report: FinalReport | null;
+  ts: number;
+}
+
+// workbench_core::memory::SessionContext (subset the UI needs).
+export interface SessionContext {
+  session_id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  exchanges: Exchange[];
+}
+
+// workbench_core::memory::session::SessionMeta — one sidebar row.
+export interface SessionMeta {
+  session_id: string;
+  title: string;
+  updated_at: number;
+  exchange_count: number;
+}
 
 // workbench_core::engine::schemas::FinalReport
 export interface FinalReport {

@@ -30,7 +30,7 @@ impl Tool for VisionTool {
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         let started = std::time::Instant::now();
 
-        let file = match ctx.first_file_of(FileKind::Image) {
+        let file = match ctx.file_for(step, FileKind::Image) {
             Some(f) => f,
             None => {
                 return Ok(ToolResult::failure(

@@ -30,18 +30,35 @@ const CHUNK_CHARS: usize = 1_100;
 const CHUNK_OVERLAP: usize = 150;
 const DEFAULT_TOP_K: usize = 5;
 const TABLE: &str = "sop_kb";
-/// Sidecar file (next to the LanceDB dir) naming the embedding model the table
-/// was built with, so a model change triggers a rebuild.
+/// Sidecar file (next to the LanceDB dir) naming the embedding config the table
+/// was built with, so a change triggers a rebuild. Includes the prefix-scheme
+/// version so switching that on rebuilds the KB once.
 const MODEL_MARKER: &str = "sop_kb.model";
+/// `nomic-embed-text` is trained with task-instruction prefixes and is measurably
+/// worse without them: a passage is embedded as `search_document: <text>` and a
+/// query as `search_query: <text>`. Bump the suffix if this scheme changes.
+const EMBED_SCHEME: &str = "nomic-prefix-v1";
+
+fn as_query(text: &str) -> String {
+    format!("search_query: {text}")
+}
+fn as_document(text: &str) -> String {
+    format!("search_document: {text}")
+}
 
 fn vs_err(e: impl std::fmt::Display) -> CoreError {
     CoreError::VectorStore(e.to_string())
 }
 
-/// Split text into overlapping windows, preferring to break on a newline or
-/// sentence end near the window edge.
+/// Split text into overlapping windows, breaking only on **line boundaries**.
+///
+/// The previous version also broke on `.`, which in a numeric table happily
+/// splits `2.00%` into `"… 2."` and `"00% …"` — the exact figure a fee question
+/// turns on, severed. Breaking only on `\n` keeps every rendered table row
+/// (`header ▸ Credit Card | 2.00% | …`) intact inside one chunk.
 fn chunk_text(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.replace("\r\n", "\n").chars().collect();
+    let normalised = text.replace("\r\n", "\n");
+    let chars: Vec<char> = normalised.chars().collect();
     let mut chunks = Vec::new();
     let mut start = 0;
 
@@ -49,10 +66,8 @@ fn chunk_text(text: &str) -> Vec<String> {
         let hard_end = (start + CHUNK_CHARS).min(chars.len());
         let mut end = hard_end;
         if hard_end < chars.len() {
-            if let Some(pos) = chars[start..hard_end]
-                .iter()
-                .rposition(|&c| c == '\n' || c == '.')
-            {
+            // Prefer the last newline in the back half of the window.
+            if let Some(pos) = chars[start..hard_end].iter().rposition(|&c| c == '\n') {
                 if pos > CHUNK_CHARS / 2 {
                     end = start + pos + 1;
                 }
@@ -70,6 +85,27 @@ fn chunk_text(text: &str) -> Vec<String> {
     chunks
 }
 
+/// Non-overlapping windows over the whole text, split on line boundaries.
+///
+/// Unlike [`chunk_text`] (small, overlapping, for retrieval), these are large and
+/// gap-free — the deep-read pass analyses *every* window, so overlap would just
+/// cost extra model calls.
+pub(crate) fn windows(text: &str, window_chars: usize) -> Vec<String> {
+    let normalised = text.replace("\r\n", "\n");
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for line in normalised.split_inclusive('\n') {
+        if cur.chars().count() + line.chars().count() > window_chars && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push_str(line);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Embed a batch of strings in **one** request.
 ///
 /// Batching matters more than it looks: the embedding model is called with
@@ -85,17 +121,20 @@ pub(crate) async fn embed_many(engine: &OllamaEngine, texts: Vec<String>) -> Res
     }
     let expected = texts.len();
 
+    // The same ceilings every other model call carries. Without `.options(...)`
+    // Ollama embeds with its *default* thread count, i.e. every core — and this
+    // call fires on every analysis step, over every chunk of the document. It was
+    // the one hot path in the pipeline that could still freeze the desktop.
     let request = GenerateEmbeddingsRequest::new(
         engine.embed_model().to_string(),
         EmbeddingsInput::Multiple(texts),
     )
+    .options(engine.opts())
     .keep_alive(KeepAlive::UnloadOnCompletion);
 
-    let response = engine
-        .client()
-        .generate_embeddings(request)
-        .await
-        .map_err(|e| CoreError::VectorStore(format!("embedding request failed: {e}")))?;
+    // Goes through the engine's guard, so a stuck or cancelled embedding of a
+    // long document fails fast instead of hanging the turn.
+    let response = engine.embed_request(request).await?;
 
     if response.embeddings.len() != expected {
         return Err(CoreError::VectorStore(format!(
@@ -149,18 +188,30 @@ pub(crate) async fn select_relevant(
     top_k: usize,
     budget_chars: usize,
 ) -> String {
-    if text.chars().count() <= budget_chars {
+    let total_chars = text.chars().count();
+    if total_chars <= budget_chars {
+        tracing::debug!(
+            total_chars,
+            budget_chars,
+            "evidence fits the budget; using it whole"
+        );
         return text.to_string();
     }
 
     let chunks = chunk_text(text);
+    tracing::info!(
+        total_chars,
+        budget_chars,
+        chunks = chunks.len(),
+        "evidence exceeds budget; selecting relevant passages"
+    );
     if chunks.len() <= 1 {
         return text.chars().take(budget_chars).collect();
     }
 
     let mut inputs = Vec::with_capacity(chunks.len() + 1);
-    inputs.push(query.to_string());
-    inputs.extend(chunks.iter().cloned());
+    inputs.push(as_query(query));
+    inputs.extend(chunks.iter().map(|c| as_document(c)));
 
     let vectors = match embed_many(engine, inputs).await {
         Ok(v) => v,
@@ -178,25 +229,37 @@ pub(crate) async fn select_relevant(
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-    // Take the best chunks up to the budget, then put them back in document order
-    // so the excerpt still reads coherently.
+    // Fill the budget with the highest-ranked chunks, then restore document order
+    // so the excerpt reads coherently. `top_k` is only a *floor* now: the old
+    // `.take(top_k)` capped evidence at ~8 chunks even when the budget had room
+    // for far more, so roughly half the context window went unused.
     let mut picked: Vec<usize> = Vec::new();
     let mut used = 0usize;
-    for (idx, _) in ranked.into_iter().take(top_k) {
+    for (idx, _score) in ranked {
         let len = chunks[idx].chars().count();
-        if used + len > budget_chars && !picked.is_empty() {
-            continue;
+        let spills_budget = !picked.is_empty() && used + len > budget_chars;
+        if spills_budget && picked.len() >= top_k {
+            break;
         }
         used += len;
         picked.push(idx);
     }
     picked.sort_unstable();
 
-    picked
-        .into_iter()
-        .map(|i| chunks[i].as_str())
+    let selected = picked
+        .iter()
+        .map(|&i| chunks[i].as_str())
         .collect::<Vec<_>>()
-        .join("\n…\n")
+        .join("\n…\n");
+
+    tracing::info!(
+        kept_chunks = picked.len(),
+        of_total = chunks.len(),
+        kept_chars = selected.chars().count(),
+        dropped_chars = total_chars.saturating_sub(selected.chars().count()),
+        "evidence narrowed"
+    );
+    selected
 }
 
 /// One KB chunk ready to insert.
@@ -244,7 +307,11 @@ async fn build_rows(engine: &OllamaEngine, kb_dir: &Path) -> Result<Vec<Row>> {
         return Ok(Vec::new());
     }
 
-    let vectors = embed_many(engine, pending.iter().map(|(_, t, _)| t.clone()).collect()).await?;
+    let vectors = embed_many(
+        engine,
+        pending.iter().map(|(_, t, _)| as_document(t)).collect(),
+    )
+    .await?;
 
     Ok(pending
         .into_iter()
@@ -309,7 +376,7 @@ pub async fn ensure_ingested(
 
     let marker = db_dir.join(MODEL_MARKER);
     let current_model = std::fs::read_to_string(&marker).ok();
-    let want_model = engine.embed_model().to_string();
+    let want_model = format!("{}|{}", engine.embed_model(), EMBED_SCHEME);
 
     let has_table = db
         .table_names()
@@ -340,7 +407,7 @@ pub async fn ensure_ingested(
         .execute()
         .await
         .map_err(vs_err)?;
-    std::fs::write(&marker, &want_model).ok();
+    std::fs::write(&marker, want_model.as_bytes()).ok();
     tracing::info!(chunks = rows.len(), "knowledge base ingested into LanceDB");
 
     Ok(Some(db.open_table(TABLE).execute().await.map_err(vs_err)?))
@@ -433,7 +500,7 @@ impl Tool for RagTool {
             .unwrap_or(ctx.prompt)
             .to_string();
 
-        let query_vec = match embed(ctx.engine, &query).await {
+        let query_vec = match embed(ctx.engine, &as_query(&query)).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult::failure(
@@ -500,5 +567,38 @@ mod tests {
     fn short_text_is_a_single_chunk() {
         let chunks = chunk_text("just a short SOP note about flange torque.");
         assert_eq!(chunks.len(), 1);
+    }
+
+    /// The regression that lost the PayU fee: the old splitter broke on `.` and
+    /// happily cut `2.00%` into `"… 2."` + `"00% …"`. A chunk boundary must never
+    /// fall inside a decimal number.
+    #[test]
+    fn chunking_never_severs_a_decimal() {
+        // Long enough to force several splits; every line carries a rate.
+        let row = "Credit card domestic | 2.00% | 0.00 | 18% GST applies here always\n";
+        let text = row.repeat(120);
+        for c in chunk_text(&text) {
+            assert!(
+                !c.ends_with("2.") && !c.starts_with("00%"),
+                "chunk boundary fell inside a decimal: {:?}",
+                &c[c.len().saturating_sub(20)..]
+            );
+            // Every occurrence of the figure must be intact somewhere.
+            assert!(
+                !c.contains("2.\n") && !c.contains("\n00%"),
+                "a decimal was split across the newline join in: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_cover_everything_without_overlap() {
+        let text = (1..=200)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
+        let ws = windows(&text, 400);
+        assert!(ws.len() > 1, "expected multiple windows");
+        // Concatenation is the original (windows are gap-free and non-overlapping).
+        assert_eq!(ws.concat(), text);
     }
 }

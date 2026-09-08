@@ -7,4 +7,4 @@ pub mod persistent;
 pub mod session;
 
 pub use persistent::PersistentMemory;
-pub use session::{SessionContext, TurnSummary};
+pub use session::{Exchange, SessionContext, SessionMeta, TurnSummary};

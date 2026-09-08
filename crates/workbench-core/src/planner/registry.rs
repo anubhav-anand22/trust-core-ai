@@ -67,6 +67,13 @@ pub const TASK_REGISTRY: &[TaskSpec] = &[
         description: "Search the standing SOP / safety-manual knowledge base for relevant passages.",
     },
     TaskSpec {
+        name: "answer_followup",
+        stage: Stage::Retrieve,
+        requires_file: None,
+        description: "Answer a follow-up question from the conversation so far (no new files, no KB). \
+                      Use as the ONLY step when the request builds on an earlier turn.",
+    },
+    TaskSpec {
         name: "summarize",
         stage: Stage::Analyze,
         requires_file: None,
@@ -238,17 +245,14 @@ pub fn validate_plan(plan: &Plan, uploads: &[InputFile]) -> Vec<String> {
     }
 
     // 6. Every attached file must really be on disk before we invoke anything.
+    //    (Unsupported *types* are screened out before planning — see
+    //    `pipeline::screen_uploads` — and warned about, not treated as a plan
+    //    error, so one bad attachment cannot block the others.)
     for file in uploads {
         if !std::path::Path::new(&file.path).is_file() {
             errors.push(format!(
                 "attached file `{}` was not found at {}",
                 file.original_name, file.path
-            ));
-        }
-        if file.kind == FileKind::Unknown {
-            errors.push(format!(
-                "attached file `{}` has an unsupported type",
-                file.original_name
             ));
         }
     }

@@ -41,6 +41,18 @@ pub enum StepEvent {
         elapsed_ms: u128,
     },
 
+    /// A non-fatal problem the user should see: a skipped attachment, a step that
+    /// timed out and left the report degraded, an oversized prompt. The run keeps
+    /// going. `detail` is optional context for the log and a tooltip.
+    ///
+    /// This is the *only* way the pipeline can surface something short of a hard
+    /// `Error` — before it existed, a degraded turn looked identical to a clean one.
+    Warning {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+
     /// Rule-based sanity assertions completed.
     QualityCheck { passed: bool },
 
@@ -62,6 +74,13 @@ pub enum StepEvent {
 /// to know which transport it is talking to.
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, event: StepEvent);
+}
+
+/// Emit a [`StepEvent::Warning`] without constructing the variant by hand.
+pub fn warn(sink: &dyn ProgressSink, message: impl Into<String>, detail: Option<String>) {
+    let message = message.into();
+    tracing::warn!(%message, detail = detail.as_deref().unwrap_or(""), "pipeline warning");
+    sink.emit(StepEvent::Warning { message, detail });
 }
 
 /// Discards every event — for code paths and tests that don't observe progress.

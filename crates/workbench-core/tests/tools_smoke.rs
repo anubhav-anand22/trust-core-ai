@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use workbench_core::engine::schemas::TaskStep;
 use workbench_core::engine::OllamaEngine;
 use workbench_core::planner::TASK_REGISTRY;
+use workbench_core::events::NullSink;
 use workbench_core::tools::{default_registry, ToolContext};
 use workbench_core::PipelineConfig;
 
@@ -61,7 +62,9 @@ async fn extraction_tools_fail_cleanly_with_no_file() {
         uploads: &[], // nothing attached
         outputs: &outputs,
         prompt: "inspect pump P-101",
+        session_blob: "",
         engine: &engine,
+        sink: &NullSink,
     };
 
     // These four check for their input file before touching Ollama or a model.
@@ -90,7 +93,9 @@ async fn analysis_tool_fails_cleanly_with_no_evidence() {
         uploads: &[],
         outputs: &outputs,
         prompt: "summarise",
+        session_blob: "",
         engine: &engine,
+        sink: &NullSink,
     };
 
     let registry = default_registry();
@@ -103,7 +108,11 @@ async fn analysis_tool_fails_cleanly_with_no_evidence() {
 #[test]
 fn config_paths_resolve_under_data_dir() {
     let config = cfg(&PathBuf::from("/data"));
-    assert!(config.session_path().ends_with("session_context.json"));
+    assert!(config.session_path_for("s-abc").ends_with("sessions/s-abc.json"));
     assert!(config.persistent_path().ends_with("persistent_memory.json"));
     assert!(config.uploads_dir().ends_with("uploads"));
+    // Session ids are sanitised into a safe file stem.
+    assert!(config
+        .session_path_for("../../etc/passwd")
+        .starts_with(config.sessions_dir()));
 }

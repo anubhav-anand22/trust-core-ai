@@ -33,18 +33,24 @@ function positionFor(stage: StepStage): number {
       return 5;
     case "error":
       return -1;
+    case "warning":
+      // A warning is an aside, not a stage — the caller filters these out before
+      // asking for a position, so this is only here for exhaustiveness.
+      return 0;
   }
 }
 
 export function Stepper({ events }: { events: StepEvent[] }) {
-  const last = events[events.length - 1];
+  // Warnings interleave with real stage events; they must not rewind the track.
+  const staged = events.filter((e) => e.stage !== "warning");
+  const last = staged[staged.length - 1];
   const stage = last?.stage ?? "idle";
   const pos = positionFor(stage);
   const errored = stage === "error";
   const awaiting = stage === "awaiting_user";
 
   const currentTool =
-    [...events].reverse().find((e) => e.stage === "executing_tool")?.tool ??
+    [...staged].reverse().find((e) => e.stage === "executing_tool")?.tool ??
     null;
 
   return (

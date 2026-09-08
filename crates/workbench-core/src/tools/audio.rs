@@ -24,7 +24,7 @@ impl Tool for AudioTool {
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         let started = std::time::Instant::now();
 
-        let file = match ctx.first_file_of(FileKind::Audio) {
+        let file = match ctx.file_for(step, FileKind::Audio) {
             Some(f) => f,
             None => {
                 return Ok(ToolResult::failure(
