@@ -25,8 +25,10 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. Ignore Rust dirs. `target/` is at the WORKSPACE ROOT now (not under
+      //    src-tauri), and watching it makes Vite's FSWatcher crash on locked
+      //    build artifacts (EBUSY on tauri_app_lib.dll) mid-build.
+      ignored: ["**/src-tauri/**", "**/target/**", "**/crates/**/target/**"],
     },
   },
 }));

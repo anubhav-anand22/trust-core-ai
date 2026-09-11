@@ -1,0 +1,52 @@
+[package]
+name = "workbench-core"
+description = "Pure-Rust agentic pipeline for the Sovereign On-Premise AI Workbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+ollama-rs.workspace = true
+async-trait = "0.1"
+# JSON-Schema derive, used to constrain Ollama structured outputs. Kept on the
+# same major as ollama-rs's own schemars dep so the Schema type matches.
+schemars = "1"
+
+# --- Phase 3: persistent-memory encryption --------------------------------
+aes-gcm = { version = "0.10", features = ["getrandom"] }
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+sha2 = "0.10"
+machine-uid = "0.5"
+base64 = "0.22"
+
+# --- Phase 2: sequential tools -------------------------------------------
+# PDF (digital only): text + tables, pure Rust.
+pdfplumber = "0.4"
+# OCR: pure-Rust engine on the rten runtime.
+ocrs = "0.13"
+rten = "0.26"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff", "webp"] }
+# Audio: whisper.cpp bindings + container decode (linear resample is hand-rolled).
+whisper-rs = "0.16"
+symphonia = { version = "0.5", default-features = false, features = [
+    "mp3", "isomp4", "aac", "flac", "vorbis", "ogg", "wav", "pcm", "adpcm",
+] }
+# RAG vector store: embedded LanceDB (Apache Arrow-backed, file-on-disk).
+# arrow-array / arrow-schema MUST match lancedb's arrow (58 for lancedb 0.38).
+# `remote` is enabled only to work around a build bug in the 0.38.0 release
+# (src/job.rs references Error::Http, which is remote-gated, but default = []).
+# It pulls reqwest/http, already in the tree via ollama-rs.
+lancedb = { version = "0.38", features = ["remote"] }
+arrow-array = "58"
+arrow-schema = "58"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,12 @@
+{
+  "//": "Shared editor settings. rust-analyzer runs its own cargo builds; by default they contend with terminal builds on the target/ lock and roughly double build times on this dependency graph. targetDir gives it a private target/ so the two never collide.",
+  "rust-analyzer.cargo.targetDir": true,
+  "rust-analyzer.checkOnSave": false,
+  "files.watcherExclude": {
+    "**/target/**": true
+  },
+
+  "//constrained-machines": "On a low-core host you can also disable these two. They cut CPU further, at the cost of worse IDE analysis: without proc-macro expansion the serde/schemars derives do not resolve and the editor shows errors that are not real. Leave them on unless builds are genuinely painful.",
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.procMacro.enable": true
+}
