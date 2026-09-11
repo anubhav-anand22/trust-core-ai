@@ -1,7 +1,7 @@
 // Prompt textarea + multi-file drop zone (audio / pdf / image), plus the
 // fast/deep read toggle.
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { cancelTurn, type TurnMode } from "../lib/pipeline";
 
 // Kept in sync with `FileKind::from_extension` in
@@ -22,9 +22,12 @@ function extOf(name: string): string {
 export function PromptPanel({
   busy,
   onSubmit,
+  resetToken,
 }: {
   busy: boolean;
   onSubmit: (prompt: string, files: File[], mode: TurnMode) => void;
+  /** Bumped by `App` each time a turn actually delivers a report. */
+  resetToken: number;
 }) {
   const [prompt, setPrompt] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -33,6 +36,28 @@ export function PromptPanel({
   const [deep, setDeep] = useState(false);
   const [rejected, setRejected] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Empty the box once a turn has delivered its answer, so a follow-up starts
+  // from a clean prompt and no stale attachments.
+  //
+  // Driven by a counter from the parent rather than by `busy` going false,
+  // because a turn that FAILED or parked in the HITL modal must keep what the
+  // user typed — clearing there would throw away their prompt and files at the
+  // exact moment they need to retry with them. `App` bumps this only on a
+  // committed report.
+  //
+  // The `deep` toggle deliberately survives: it reads as a session preference,
+  // not per-question input.
+  useEffect(() => {
+    if (resetToken === 0) return; // first mount, nothing delivered yet
+    setPrompt("");
+    setFiles([]);
+    setRejected([]);
+    // The hidden <input type="file"> keeps its own value. Without this, picking
+    // the SAME file again fires no `change` event and the attachment silently
+    // never comes back.
+    if (inputRef.current) inputRef.current.value = "";
+  }, [resetToken]);
 
   function addFiles(list: FileList | null) {
     if (!list) return;

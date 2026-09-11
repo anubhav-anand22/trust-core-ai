@@ -10,6 +10,13 @@
   --warn: #e8b451;
   --err: #ef6b73;
   font-synthesis: none;
+
+  /* The webview draws native widgets — the <select> popup list, scrollbars, the
+     checkbox — in LIGHT mode unless the page says otherwise. Everything else here
+     is dark, so the dropdown opened as a bright white panel with our near-white
+     --text on it: barely readable, and jarring next to the rest of the screen.
+     This one line is the actual fix; it also darkens scrollbars app-wide. */
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -67,6 +74,24 @@ select, textarea, input[type="text"] {
   border-radius: 6px;
   padding: 8px 10px;
   font: inherit;
+}
+/* The popup list is drawn by the OS, so `color-scheme: dark` above is what
+   actually themes it. These state the same intent explicitly for engines that
+   honour per-option colours, and keep the contrast deliberate rather than
+   inherited by accident. */
+select option, select optgroup {
+  background: var(--panel-2);
+  color: var(--text);
+}
+select:not(:disabled) { cursor: pointer; }
+select:focus-visible, textarea:focus-visible, input[type="text"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+select:disabled, textarea:disabled, input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 .pull-status { margin-top: 14px; display: grid; gap: 6px; }
 .pull-row { display: flex; gap: 10px; font-size: 12px; }

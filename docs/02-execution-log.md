@@ -679,6 +679,57 @@ one return value, the duplication is downstream and nothing about the model or
 the prompt can explain it. Then look for state that two components render with
 no rule about which owns it.
 
+## Post-demo — part 6: input reset, and a dropdown nobody could read
+
+Two UX fixes from the same demo session. Both small; both worth writing down
+because each has a non-obvious constraint behind it.
+
+### The prompt box did not empty itself
+
+After a turn delivered its answer, the prompt text and the attached files stayed
+in the panel. Asking a follow-up meant manually clearing both first, every time.
+
+The fix is a `resetToken` counter that `App` bumps and `PromptPanel` watches.
+The interesting part is **what it is not keyed on**. The obvious trigger is
+`busy` going false — and it is wrong, because `busy` also goes false when a turn
+**fails** or **parks in the HITL modal**. Clearing there would throw away the
+user's prompt and attachments at the exact moment they need them to retry. So the
+counter is bumped in one place only: inside `commitTurn`'s `if (finished)` block,
+which runs only when a report was actually delivered.
+
+Two details that bite:
+
+- **The hidden `<input type="file">` keeps its own value.** Clearing the React
+  `files` state is not enough — without `inputRef.current.value = ""`, picking the
+  *same* file again fires no `change` event and the attachment silently never
+  comes back.
+- **The `deep` toggle deliberately survives the reset.** It reads as a session
+  preference, not per-question input.
+
+### The model dropdown was a bright white slab
+
+On the hardware screen, opening the *Resident LLM* dropdown produced a glaring
+white popup in an otherwise dark app — and the option text was nearly invisible.
+
+The cause is not a missing `background` rule. The **popup list is drawn by the
+OS**, not by page CSS, and the webview renders native widgets in **light** mode
+unless the page declares otherwise. The closed control looked fine because CSS
+styles it directly (`background: var(--panel-2); color: var(--text)`); the moment
+it opened, that near-white `--text` was painted onto the OS's white popup.
+
+The fix is one line — `color-scheme: dark` on `:root` — which tells the engine to
+render *all* native UI dark. It also darkens scrollbars and the checkbox app-wide,
+which were quietly light for the same reason. Explicit `select option` colours and
+focus/disabled states were added alongside, so the contrast is deliberate rather
+than inherited by accident.
+
+### Takeaway
+
+A colour that "will not apply" is often a control the page does not actually
+paint. Before adding more `background` rules, ask whether the pixels belong to
+the OS — `color-scheme` is the lever for that whole category, and it fixes
+scrollbars, checkboxes and date pickers at the same time.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`

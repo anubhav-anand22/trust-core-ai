@@ -153,6 +153,10 @@ follow it in order — later steps assume earlier ones worked.
   with no GPU, that is a regression — tell us your specs.
 - **Let it use the recommended model.** Overriding to something bigger on a
   CPU-only box is exactly the mistake that made the app unusable for us.
+- **The *Resident LLM* dropdown must be dark and readable** when you open it,
+  matching the rest of the screen. If it opens as a bright white panel with
+  near-invisible text, the `color-scheme: dark` fix did not take — report it with
+  your OS and webview version.
 - Click **Download & start**, watch the pull progress, then it hands over.
 
 ### 2. One normal turn
@@ -190,6 +194,11 @@ After the turn in step 2 finishes, check all of these:
 | the log | exactly one `submit_turn: start` / `submit_turn: done` pair |
 | **audit sidebar after the turn ends** | still shows the step timings — must **not** go blank or say "no tools run yet" |
 | reload the app (Ctrl+R) | the transcript redraws from disk, still **one** card |
+| the prompt box and attachment list | **both empty themselves** — a follow-up starts clean, with no manual clearing |
+
+Then check the reset does **not** fire when it shouldn't: make a turn fail or park
+(step 4), and confirm your typed prompt and attached files are **still there**.
+Losing them on a failed turn is the bug this reset has to avoid.
 
 Then two things that the fix could plausibly have broken:
 

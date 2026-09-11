@@ -71,6 +71,10 @@ function App() {
   // survives that move — the audit sidebar's timings table is derived from it — so
   // this flag, not an empty `events`, is what retires the live transcript block.
   const [turnCommitted, setTurnCommitted] = useState(false);
+  // Bumped only when a turn actually delivers a report; `PromptPanel` watches it
+  // and empties the prompt + attachments. Deliberately NOT driven by `busy`
+  // going false — a failed or parked turn must keep the user's input.
+  const [inputResetToken, setInputResetToken] = useState(0);
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<{ message: string; detail?: string | null }[]>([]);
@@ -191,6 +195,7 @@ function App() {
       setReport(null);
       setLivePrompt("");
       setTurnCommitted(true);
+      setInputResetToken((n) => n + 1);
     }
 
     refreshSessions();
@@ -379,7 +384,7 @@ function App() {
               )}
             </div>
 
-            <PromptPanel busy={busy} onSubmit={run} />
+            <PromptPanel busy={busy} onSubmit={run} resetToken={inputResetToken} />
           </section>
 
           <AuditSidebar events={events} plan={plan} />
