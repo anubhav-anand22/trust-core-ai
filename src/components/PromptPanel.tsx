@@ -136,6 +136,7 @@ export function PromptPanel({
 
       <div className="run-row">
         <button
+          type="button"
           className="run-btn"
           disabled={busy || !prompt.trim()}
           onClick={submit}

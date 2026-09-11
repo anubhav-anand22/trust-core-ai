@@ -173,6 +173,38 @@ What should happen:
 **This will take minutes, not seconds, on a CPU-only machine.** It is slow, not
 hung. See *Known problems*.
 
+### 2b. One input, one answer (regression check)
+
+A bug found on 2026-09-11 rendered **three identical report cards** from a single
+file + prompt. It was a React bug, not a model or pipeline bug (see *Known
+problems* 6b). Please confirm the fix holds on your machine, because the symptom
+depends on React's dev-mode behaviour and is easy to reintroduce.
+
+After the turn in step 2 finishes, check all of these:
+
+| Check | Expected |
+|---|---|
+| Report cards on screen | exactly **one** |
+| User prompt bubbles | exactly **one** |
+| `sessions/<id>.json` | exactly **one** `Exchange` for that turn |
+| the log | exactly one `submit_turn: start` / `submit_turn: done` pair |
+| **audit sidebar after the turn ends** | still shows the step timings — must **not** go blank or say "no tools run yet" |
+| reload the app (Ctrl+R) | the transcript redraws from disk, still **one** card |
+
+Then two things that the fix could plausibly have broken:
+
+- **Warnings must survive.** Attach a `.mov` alongside the PDF. The
+  *"Skipped … unsupported file type"* strip must still be on screen **after** the
+  report lands, not flash and vanish.
+- **The HITL modal must still open** (step 4 below). `commitTurn` runs after
+  every turn including a parked one; if the modal opens and instantly closes,
+  that is this fix regressing.
+
+Finally, **double-click Run** quickly, and press **Ctrl+Enter twice**. The log
+must show exactly one `submit_turn: start` — before the fix, each of those fired
+two real pipeline runs, which on CPU means double the wait and two exchanges
+written to disk.
+
 ### 3. The interesting test: a document with a specific fact buried in it
 
 This is where we currently have a **known failure we are not sure is fixed**.
@@ -349,6 +381,59 @@ running app:
   bootstrap screen.
 
 See the walkthrough. When you run these, watch `workbench.log.*` (problem 8).
+
+### 6b. One input rendered three identical answers (fixed 2026-09-11, needs confirming)
+
+Reported from a demo run: one file + one prompt produced **three identical report
+cards**. Worth reading even though it is fixed, because the triage order is the
+reusable part.
+
+**It was not the model and not the pipeline.** The backend was cleared by
+enumerating every path an answer can take to the screen: `StepEvent::Done` has
+exactly one construction site, `submit_turn` returns `Ok(())` and discards the
+report (so the return value is not a second path), there is no `app.emit` /
+`listen` anywhere (the transport is a `tauri::ipc::Channel` built fresh per
+invoke), and every loop around a model call either re-rolls the *plan* or reduces
+to a single result. Note that `MAX_PLAN_ATTEMPTS` is **3** — a coincidence with
+the symptom, and exactly the kind of thing that sends you down a dead end if you
+start from a hunch instead of from the delivery paths.
+
+Two React defects compounded:
+
+1. **A side effect inside a state updater.** `commitTurn` called `setTranscript`
+   from inside the `setReport` updater. React treats updaters as pure and may call
+   them more than once; `<React.StrictMode>` double-invokes them *on purpose*, in
+   dev, to surface exactly this. Each invocation queued its own append.
+2. **The live pane was never retired.** `clearLive()` only ran at the *start of
+   the next* turn, so a finished report kept rendering below its own transcript
+   copies.
+
+**StrictMode was not the bug** — it revealed one. Defect 2 is unconditional, so a
+production build would still have shown two cards. StrictMode stays on. You can
+see it working in any log file: `app started` appears **twice per launch**,
+milliseconds apart, with the same session id. That is expected.
+
+The fix carries the report out of the async channel callback on a ref (so the
+updater is pure) and *moves* the result into the transcript instead of copying
+it. Two traps were found while fixing it, both from **not asking who else reads
+this state**: calling `clearLive()` on commit also clears `hitl` and would close
+the HITL modal the instant it opened, and clearing `events` blanks the audit
+sidebar, whose timings are derived from them.
+
+A related, genuinely worse bug was fixed in the same pass: `PromptPanel.submit()`
+guarded on the `busy` **prop**, which the parent sets asynchronously, so a
+double-click on Run fired **two real `submit_turn` invokes** — two pipeline runs,
+two exchanges on disk, double the CPU wait. `run()`/`resume()` now hold an
+`inFlight` ref, which updates synchronously.
+
+**What is unverified:** everything above is a code trace plus a clean `tsc`. The
+logs on the dev machine contain **no `submit_turn` lines at all**, so the original
+buggy run was never captured and the fix has not been watched end to end. Walkthrough
+step 2b is the confirmation — please run it.
+
+**Still no automated guard.** There is no vitest/RTL in `package.json`, and
+`workbench-core/tests/` has no assertion that a turn emits exactly one `done`
+stage. Both would have caught this. Neither exists yet.
 
 ### 7. Build environment fragility
 

@@ -342,4 +342,20 @@ output and the two silent-failure traps it guards against.
 - **`App.tsx`** — holds the state (`events`, `report`, `hitl`), renders
   `BootstrapGate` until a `ModelPlan` is chosen, then the workbench.
 
+> **Two rules `App.tsx` learned the hard way** (see execution log, part 5 — one
+> input once rendered three identical answers):
+>
+> 1. **A state updater must be pure.** The function passed to a set-function may
+>    read `prev` and return a new value; nothing else. React may call it more than
+>    once and StrictMode deliberately does. To carry a value out of an async
+>    callback — the report arrives on the channel, not as `submitTurn`'s return
+>    value — use a **ref** (`liveReport`), never a nested `setOther(...)`.
+> 2. **One owner per rendered thing.** A finished turn is drawn by the transcript
+>    *or* by the live pane, never both. `commitTurn` **moves** it: append to
+>    `transcript`, then clear `report`/`livePrompt`. `events` deliberately
+>    survives the move because `AuditSidebar` derives its timings from it, so a
+>    separate `turnCommitted` flag — not an emptied `events` — is what retires the
+>    live block. `warnings` and `fatal` also survive: they are not duplicated
+>    anywhere, so they stay on screen under the finished exchange.
+
 Next: [04 · The agentic pipeline](04-agentic-pipeline.md) — one turn, traced.

@@ -67,6 +67,10 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<FinalReport | null>(null);
   const [livePrompt, setLivePrompt] = useState<string>("");
+  // Set once a turn's result has moved into the transcript. `events` deliberately
+  // survives that move — the audit sidebar's timings table is derived from it — so
+  // this flag, not an empty `events`, is what retires the live transcript block.
+  const [turnCommitted, setTurnCommitted] = useState(false);
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<{ message: string; detail?: string | null }[]>([]);
@@ -76,6 +80,17 @@ function App() {
     uploads: UploadedFile[];
     mode: TurnMode;
   } | null>(null);
+
+  // The report as it arrived on the channel. `commitTurn` reads it from here so the
+  // transcript append never has to live inside a state updater: React treats updaters
+  // as pure and may call them more than once, and StrictMode deliberately does — which
+  // is how one turn used to land in the transcript twice.
+  const liveReport = useRef<FinalReport | null>(null);
+
+  // Authoritative in-flight flag. The `busy` state is set asynchronously, so two fast
+  // activations (double-click Run, Ctrl+Enter twice) both read the stale `busy === false`
+  // and fire two real `submit_turn` invokes — two pipeline runs, two exchanges on disk.
+  const inFlight = useRef(false);
 
   const persistId = useCallback((id: string) => {
     try {
@@ -127,6 +142,8 @@ function App() {
     setFatal(null);
     setWarnings([]);
     setLivePrompt("");
+    setTurnCommitted(false);
+    liveReport.current = null;
   }
 
   // Fold a StepEvent stream into UI state. Shared by the initial turn and a resume.
@@ -134,7 +151,11 @@ function App() {
     setEvents((prev) => [...prev, e]);
     if (e.stage === "done") {
       try {
-        setReport(JSON.parse(e.report_json) as FinalReport);
+        const parsed = JSON.parse(e.report_json) as FinalReport;
+        // The ref is what `commitTurn` reads; the state is what the live pane renders
+        // while the turn is still on screen.
+        liveReport.current = parsed;
+        setReport(parsed);
       } catch {
         /* leave report null */
       }
@@ -147,21 +168,37 @@ function App() {
     }
   }
 
-  // When a turn ends, move its result into the transcript and refresh the rail.
+  // When a turn ends, MOVE its result into the transcript and refresh the rail.
+  //
+  // "Move", not "copy": the live pane renders the same report at the bottom of the
+  // transcript, and it used to stay mounted after the turn finished (`showLive` is still
+  // true because `events` is non-empty), so the finished report was drawn twice.
+  //
+  // Two things this must NOT do:
+  //  - call `clearLive()` — it also clears `hitl`, and this runs after *every* turn
+  //    including one the planner parked, which would close the HITL modal on open;
+  //  - clear `warnings`/`fatal` — they are not duplicated anywhere, and the user should
+  //    still see "Skipped x.mov" after the report lands.
   function commitTurn(prompt: string, attachments: string[]) {
-    setReport((r) => {
-      if (r) {
-        setTranscript((prev) => [
-          ...prev,
-          { prompt, attachments, report: r, ts: Math.floor(Date.now() / 1000) },
-        ]);
-      }
-      return r;
-    });
+    const finished = liveReport.current;
+    liveReport.current = null;
+
+    if (finished) {
+      setTranscript((prev) => [
+        ...prev,
+        { prompt, attachments, report: finished, ts: Math.floor(Date.now() / 1000) },
+      ]);
+      setReport(null);
+      setLivePrompt("");
+      setTurnCommitted(true);
+    }
+
     refreshSessions();
   }
 
   async function run(prompt: string, files: File[], mode: TurnMode) {
+    if (inFlight.current) return;
+    inFlight.current = true;
     log.info("user submitted a turn", { prompt_chars: prompt.length, mode });
     setBusy(true);
     clearLive();
@@ -179,22 +216,27 @@ function App() {
       setFatal(String(e));
     } finally {
       setBusy(false);
+      inFlight.current = false;
     }
   }
 
   async function resume(planJson: string, force: boolean) {
+    if (inFlight.current) return;
     log.info("user resumed a parked turn", { force });
     const ctx = lastTurn.current;
     if (!ctx) {
       setFatal("nothing to resume — submit a prompt first");
       return;
     }
+    inFlight.current = true;
     setBusy(true);
     setEvents([]);
     setReport(null);
     setHitl(null);
     setFatal(null);
     setWarnings([]);
+    setTurnCommitted(false);
+    liveReport.current = null;
     try {
       await resumeTurn(
         { prompt: ctx.prompt, sessionId, files: ctx.uploads, planJson, force, mode: ctx.mode },
@@ -205,6 +247,7 @@ function App() {
       setFatal(String(e));
     } finally {
       setBusy(false);
+      inFlight.current = false;
     }
   }
 
@@ -252,7 +295,10 @@ function App() {
 
   if (!plan) return <BootstrapGate onReady={setPlan} />;
 
-  const showLive = busy || events.length > 0 || !!fatal || warnings.length > 0;
+  // Warnings and a fatal error outlive the commit: they are not duplicated in the
+  // transcript, so they stay on screen under the finished exchange.
+  const showLive =
+    busy || (!turnCommitted && events.length > 0) || !!fatal || warnings.length > 0;
 
   return (
     <div className="workbench">
@@ -303,8 +349,8 @@ function App() {
               {showLive && (
                 <div className="exchange">
                   {livePrompt && <div className="bubble bubble-user">{livePrompt}</div>}
-                  {events.length > 0 && <Stepper events={events} />}
-                  {activity.length > 0 && (
+                  {!turnCommitted && events.length > 0 && <Stepper events={events} />}
+                  {!turnCommitted && activity.length > 0 && (
                     <ul className="activity">
                       {activity.map((e, i) => (
                         <li key={i}>

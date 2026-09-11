@@ -567,6 +567,118 @@ sat behind two others (keep the whole transcript, show the planner the history)
 that only became visible once the first was done. A feature that "does not work"
 often has a stack of causes, and you find the second only after fixing the first.
 
+## Post-demo — part 5: one input, three identical answers
+
+One file, one prompt, **three identical report cards** on screen. The obvious
+suspects — the model looping, the pipeline running three times, a stale event
+listener — were all wrong. Worth writing down because the triage order is the
+lesson, not the fix.
+
+### Ruling out the backend first
+
+The answer can only reach the screen through paths you can enumerate, so
+enumerate them:
+
+| Checked | Finding |
+|---|---|
+| `StepEvent::Done` construction sites | exactly one, `pipeline.rs:287` |
+| the command's return value | `submit_turn` returns `Ok(())` and drops the report — not a second path |
+| global events / multi-window fan-out | none. No `app.emit`, no `emit_all`, no `listen` anywhere: the transport is a `tauri::ipc::Channel` built fresh per invoke |
+| model-call loops | the planner's ≤3 retries re-roll the **plan**, never the answer; the compiler's retry returns on first success; deep-read's per-window calls reduce to one `ToolResult` |
+| the executor | one `ToolResult` per step, no step re-runs |
+
+Ten minutes of grep, and three quarters of the search space is gone. The `3` in
+`MAX_PLAN_ATTEMPTS` is a **coincidence** with the symptom — the kind of
+coincidence that sends you down a two-hour dead end if you start from a hunch
+instead of from the delivery paths.
+
+### Cause 1 — a side effect inside a state updater
+
+```tsx
+setReport((r) => {
+  if (r) setTranscript((prev) => [...prev, { … , report: r }]);
+  return r;                       // ← setTranscript ran as a side effect
+});
+```
+
+React treats the function you hand to a set-function as **pure** and is free to
+call it more than once. `<React.StrictMode>` double-invokes it *on purpose*, in
+dev, to make exactly this kind of impurity visible. Each invocation queued its
+own `setTranscript(prev => [...prev, x])`, and every queued append is applied —
+so one turn landed in the transcript more than once.
+
+It was written that way for an understandable reason: `run()` has no local handle
+on the report, which arrives asynchronously on the channel callback. Reaching for
+it through `setReport` was the path of least resistance. The right way to carry a
+value out of an async callback is a **ref** — `liveReport`.
+
+> **Rule:** an updater passed to `setState` may read `prev` and return a new
+> value. Nothing else. No `setOther(...)`, no logging, no fetch.
+
+### Cause 2 — the live pane was never retired
+
+`clearLive()` only ran at the *start of the next* turn. When a turn finished,
+`busy` went false but `events` was still full, so `showLive` stayed true and the
+live block drew the same prompt bubble and the same `ReportView` one more time,
+on top of the transcript copies. Transcript copies + one live copy = three.
+
+The underlying design error is **two places rendering one thing with no rule
+about which owns it**. `commitTurn` now *moves* the result: appends to the
+transcript, then clears `report` and `livePrompt`.
+
+### The trap in the obvious fix
+
+"Clear the live state on commit" is a one-liner that breaks two things:
+
+- `clearLive()` also clears `hitl`, and `commitTurn` runs after **every** turn —
+  including one the planner parked. Calling it there closes the HITL modal the
+  instant it opens. So `commitTurn` clears fields explicitly and guards on
+  `if (finished)`, which is null on a parked turn.
+- Clearing `events` blanks the **audit sidebar**, whose timings table is derived
+  from them, exactly when the user wants to read it. So `events` survives the
+  commit and a separate `turnCommitted` flag retires the live block instead.
+
+Both were caught by asking "who else reads this state?" before deleting it —
+cheaper than finding out from a demo.
+
+### Not a testing bug
+
+Tempting conclusion: "StrictMode caused it, turn StrictMode off." Wrong twice
+over. StrictMode is a dev-only harness that *revealed* the impurity; cause 2 is
+unconditional, so a production build would still have shown **two** cards. It
+stays on.
+
+### Smaller fixes in the same pass
+
+- **A real in-flight guard.** `PromptPanel.submit()` guarded on the `busy`
+  *prop*, which the parent sets asynchronously — a double-click on Run, or
+  Ctrl+Enter twice, both read the stale `busy === false` and fired two genuine
+  `submit_turn` invokes. That is two pipeline runs and two exchanges on disk, not
+  a render artifact. `run()`/`resume()` now hold an `inFlight` ref, which updates
+  synchronously.
+- **`installGlobalErrorLogging` is idempotent.** It added `window` listeners with
+  no cleanup and no guard, so StrictMode registered them twice and every uncaught
+  error was logged twice — actively misleading when the log is the debugging tool.
+
+### Deliberately not done
+
+- **Stable ids on `Exchange`.** Index keys neither cause nor mask this bug: an
+  append-only list that is never reordered renders correctly with them, and
+  `Exchange` mirrors the Rust struct.
+- **A frontend test runner.** There is no vitest/RTL in `package.json`, so none
+  of this is pinned by an automated test yet, and `workbench-core/tests/` has no
+  assertion that a turn emits exactly one `done`. Both are worth doing; both are
+  bigger than this fix.
+
+### Takeaway
+
+Three identical outputs from one input feels like a duplication bug and is
+usually a **rendering** bug. Count the delivery paths in the backend before
+theorising about the model: if there is provably one emit site, one channel and
+one return value, the duplication is downstream and nothing about the model or
+the prompt can explain it. Then look for state that two components render with
+no rule about which owns it.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`

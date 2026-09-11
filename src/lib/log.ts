@@ -66,8 +66,16 @@ export async function timed<T>(
   }
 }
 
-/** Turn an unexpected `window` error or promise rejection into a log line. */
+// These listeners are never removed, and the effect that installs them runs twice
+// under StrictMode — without this guard every uncaught error was written to the log
+// file twice, which is actively misleading when the log is the debugging tool.
+let errorLoggingInstalled = false;
+
+/** Turn an unexpected `window` error or promise rejection into a log line. Idempotent. */
 export function installGlobalErrorLogging() {
+  if (errorLoggingInstalled) return;
+  errorLoggingInstalled = true;
+
   window.addEventListener("error", (e) => {
     log.error("uncaught error", {
       message: e.message,
