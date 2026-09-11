@@ -17,6 +17,11 @@
      --text on it: barely readable, and jarring next to the rest of the screen.
      This one line is the actual fix; it also darkens scrollbars app-wide. */
   color-scheme: dark;
+
+  /* Industrial, not rounded-friendly: one tight radius scale, used everywhere,
+     instead of the ad-hoc 7/8/10/12px that had accumulated. */
+  --radius: 6px;
+  --radius-sm: 4px;
 }
 
 * { box-sizing: border-box; }
@@ -98,7 +103,10 @@ select:disabled, textarea:disabled, input:disabled {
 .pull-row b { min-width: 150px; }
 
 /* ---------- workbench shell ---------- */
-.workbench { display: flex; flex-direction: column; min-height: 100vh; }
+/* `height`, not `min-height`: the shell owns the viewport and the panes scroll
+   inside it. With min-height the whole page scrolled, which is why the prompt box
+   could be pushed off-screen by a long transcript. */
+.workbench { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .wb-header {
   display: flex;
   align-items: baseline;
@@ -119,7 +127,7 @@ select:disabled, textarea:disabled, input:disabled {
 .wb-body { display: flex; flex: 1; min-height: 0; }
 
 /* --- session rail ------------------------------------------------------- */
-.session-rail { width: 232px; flex-shrink: 0; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; padding: 12px 10px; gap: 10px; overflow: hidden; }
+.session-rail { width: clamp(232px, 15vw, 300px); flex-shrink: 0; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; padding: 12px 10px; gap: 10px; overflow: hidden; }
 .new-chat-btn { background: var(--accent); color: #04121f; border: none; border-radius: 7px; padding: 9px 12px; font-weight: 600; cursor: pointer; }
 .new-chat-btn:disabled { opacity: 0.5; cursor: default; }
 .session-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; display: grid; gap: 3px; }
@@ -138,24 +146,57 @@ select:disabled, textarea:disabled, input:disabled {
 .session-actions button:hover:not(:disabled) { background: var(--line); color: var(--text); }
 
 /* --- transcript ------------------------------------------------------- */
-.transcript { display: flex; flex-direction: column; gap: 22px; margin-bottom: 20px; }
+.transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 20px 22px;
+}
 .transcript-empty { max-width: 46ch; line-height: 1.5; }
 .exchange { display: flex; flex-direction: column; gap: 12px; }
-.bubble { border-radius: 10px; padding: 11px 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
-.bubble-user { background: var(--panel-2); border: 1px solid var(--line); align-self: flex-start; max-width: 90%; }
+.bubble { border-radius: var(--radius); padding: 11px 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
+/* A ch cap, so full-bleed does not turn one sentence into a 1600px line. */
+.bubble-user { background: var(--panel-2); border: 1px solid var(--line); align-self: flex-start; max-width: min(90%, 88ch); }
 .bubble-files { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-.chip { font-size: 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px; color: var(--muted); }
+.chip { font-size: 11px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px 7px; color: var(--muted); }
 
 .wb-main { display: flex; flex: 1; min-height: 0; }
-.wb-left { flex: 1; padding: 20px; overflow: auto; max-width: 860px; }
+
+/* `.wb-left` used to carry `max-width: 860px` inside a flex row, so on anything
+   wider than ~1400px the leftover width became a dead gutter between the
+   transcript and the audit rail. It now fills the row; the rails below take a
+   share of the extra width via clamp() so an ultrawide widens all three columns
+   instead of dumping everything into the middle one.
+
+   Column, not block: the transcript scrolls and the prompt panel stays pinned to
+   the bottom, which is what makes this read as an app rather than a document. */
+.wb-left {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 
 /* ---------- prompt panel ---------- */
-.prompt-panel { display: grid; gap: 12px; }
-.prompt-input { width: 100%; min-height: 84px; resize: vertical; }
+/* Pinned to the bottom of the workspace, separated by a rule rather than a
+   shadow — the transcript scrolls behind it. */
+.prompt-panel {
+  flex-shrink: 0;
+  display: grid;
+  gap: 10px;
+  padding: 14px 22px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.prompt-input { width: 100%; min-height: 68px; resize: vertical; line-height: 1.45; }
 .dropzone {
   border: 1px dashed var(--line);
-  border-radius: 8px;
-  padding: 14px;
+  border-radius: var(--radius);
+  padding: 10px;
   text-align: center;
   color: var(--muted);
   cursor: pointer;
@@ -176,7 +217,7 @@ select:disabled, textarea:disabled, input:disabled {
   justify-self: start;
 }
 .run-btn:disabled { opacity: 0.5; cursor: default; }
-.deep-toggle { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--muted); margin: 6px 0 10px; cursor: pointer; user-select: none; }
+.deep-toggle { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--muted); margin: 0; cursor: pointer; user-select: none; }
 .deep-toggle input { accent-color: var(--accent); }
 .reject-note { display: flex; gap: 8px; align-items: baseline; }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; text-decoration: underline; }
@@ -197,29 +238,64 @@ select:disabled, textarea:disabled, input:disabled {
 .step-waiting { color: var(--warn); border-color: rgba(232, 180, 81, 0.5); }
 .step-error { color: var(--err); border-color: rgba(239, 107, 115, 0.5); }
 
-.activity { list-style: none; margin: 0 0 18px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+.activity { list-style: none; margin: 0 0 18px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
 
-.assess { list-style: none; margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px; font-size: 12.5px; line-height: 1.5; display: grid; gap: 5px; }
+.assess { list-style: none; margin: 10px 0 4px; padding: 10px 12px; border-radius: var(--radius); font-size: 12.5px; line-height: 1.5; display: grid; gap: 5px; }
 .assess-caution { background: rgba(230, 168, 78, 0.12); border: 1px solid rgba(230, 168, 78, 0.4); color: var(--muted); }
 .assess-blocked { background: rgba(239, 107, 115, 0.12); border: 1px solid rgba(239, 107, 115, 0.45); color: var(--err); }
 .warnings { list-style: none; margin: 12px 0; padding: 0; display: grid; gap: 6px; }
-.warnings li { display: flex; gap: 8px; align-items: flex-start; background: rgba(230, 168, 78, 0.12); border: 1px solid rgba(230, 168, 78, 0.4); color: var(--muted); border-radius: 8px; padding: 9px 11px; font-size: 12.5px; line-height: 1.45; }
+.warnings li { display: flex; gap: 8px; align-items: flex-start; background: rgba(230, 168, 78, 0.12); border: 1px solid rgba(230, 168, 78, 0.4); color: var(--muted); border-radius: var(--radius); padding: 9px 11px; font-size: 12.5px; line-height: 1.45; }
 .warnings .warn-icon { color: #e6a84e; flex-shrink: 0; }
-.fatal { background: rgba(239, 107, 115, 0.1); border: 1px solid rgba(239, 107, 115, 0.4); color: var(--err); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.fatal { background: rgba(239, 107, 115, 0.1); border: 1px solid rgba(239, 107, 115, 0.4); color: var(--err); border-radius: var(--radius); padding: 12px; margin: 12px 0; }
 
 /* ---------- report ---------- */
-.report { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-top: 18px; }
+/* On a wide screen a single narrow column of findings left most of the panel
+   empty. Sections now flow into as many columns as fit and collapse to one when
+   narrow — no media query, no JSX change. */
+.report {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px 28px;
+  align-items: start;
+}
+.report-head, .report-summary { grid-column: 1 / -1; }
 .report-head { display: flex; align-items: center; gap: 10px; }
-.report-summary { font-size: 15px; }
-.report section { margin-top: 14px; }
-.report ul { margin: 6px 0; padding-left: 20px; }
+/* The title is a micro-label, matching the audit rail; the summary is the lead. */
+.report-head h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+  margin: 0;
+}
+.report-summary { font-size: 15px; line-height: 1.55; max-width: 96ch; margin: 2px 0 0; }
+.report section { margin-top: 0; border-top: 1px solid var(--line); padding-top: 12px; }
+.report section h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.report ul { margin: 0; padding-left: 18px; display: grid; gap: 5px; }
+.report li { line-height: 1.5; }
+/* A report with only one section (the degraded fallback) would otherwise stretch
+   that section across the whole panel. The panel still fills the width — only the
+   text keeps a measure. No effect in the multi-column case, where a track is
+   already narrower than this. */
+.report section > ul { max-width: 84ch; }
 .report-safety h3 { color: var(--warn); }
-.report-cites { color: var(--muted); }
+.report-cites { color: var(--muted); font-size: 12.5px; }
 .badge { font-size: 11px; border-radius: 999px; padding: 2px 8px; }
 .badge-warn { background: rgba(232, 180, 81, 0.15); color: var(--warn); }
 
 /* ---------- audit sidebar ---------- */
-.audit { width: 320px; border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow: auto; }
+.audit { width: clamp(320px, 21vw, 420px); flex-shrink: 0; border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow: auto; }
 .audit-collapsed { width: 56px; padding: 14px 8px; }
 .audit-toggle { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 12px; width: 100%; }
 .audit-body { display: grid; gap: 18px; margin-top: 14px; }

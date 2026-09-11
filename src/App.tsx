@@ -96,6 +96,15 @@ function App() {
   // and fire two real `submit_turn` invokes — two pipeline runs, two exchanges on disk.
   const inFlight = useRef(false);
 
+  // The transcript is its own scroll container now (the page itself no longer
+  // scrolls), so new output has to be followed deliberately.
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  // Whether to keep following. Updated from the scroll handler rather than
+  // measured inside the effect, because by the time the effect runs the new
+  // content is already in the DOM and "was the user at the bottom?" can no
+  // longer be answered.
+  const stickToBottom = useRef(true);
+
   const persistId = useCallback((id: string) => {
     try {
       localStorage.setItem(SESSION_KEY, id);
@@ -130,6 +139,11 @@ function App() {
     window.addEventListener("beforeunload", onUnload);
     return () => window.removeEventListener("beforeunload", onUnload);
   }, [sessionId]);
+
+  useEffect(() => {
+    const el = transcriptRef.current;
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
+  }, [transcript, events, report, warnings]);
 
   const activity = useMemo(
     () =>
@@ -325,7 +339,17 @@ function App() {
 
         <main className="wb-main">
           <section className="wb-left">
-            <div className="transcript">
+            <div
+              className="transcript"
+              ref={transcriptRef}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                // Scrolling up to re-read an earlier answer must not be yanked
+                // back to the bottom on the next event.
+                stickToBottom.current =
+                  el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+              }}
+            >
               {transcript.length === 0 && !showLive && (
                 <p className="muted transcript-empty">
                   Ask a question, attach a document, and the analysis appears here.
