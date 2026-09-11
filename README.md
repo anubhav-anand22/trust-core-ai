@@ -215,6 +215,38 @@ must show exactly one `submit_turn: start` — before the fix, each of those fir
 two real pipeline runs, which on CPU means double the wait and two exchanges
 written to disk.
 
+### 2c. Layout (quick look, no turn needed)
+
+The shell was rewritten on 2026-09-11 to fill the window; before that a
+`max-width` on the transcript column left a dead gutter on wide monitors.
+Verified with a static harness at 1920 and 1366 — worth 10 seconds on your
+display, especially if it is ultrawide or scaled:
+
+- **No empty gutter** between the transcript and the audit rail at any width.
+- **The page itself never scrolls.** The transcript scrolls inside its pane and
+  the prompt panel stays pinned at the bottom. If the whole window scrolls and
+  the prompt box rides off-screen, that is a regression.
+- **The report reflows** — its Findings / Safety notes / Sources sit side by side
+  on a wide screen and stack on a narrow one.
+- **Scrolling up to re-read an earlier answer must not yank you back down** when
+  the next step event arrives. Scrolling back to the bottom re-enables following.
+
+### 2d. Cross-session memory (regression check)
+
+See *Known problems* 8b. Two chats must not see each other's context.
+
+1. In chat A, run a turn that gives the model something distinctive to
+   remember — e.g. attach `fee_card.pdf` and ask about the credit-card fee.
+2. Click **New chat** (or reopen a different past chat from the sidebar).
+3. Ask something unrelated with no attachments, e.g. *"what did we just talk
+   about?"* or *"summarise our conversation so far."*
+4. **Expected:** the model has no memory of chat A — it should say it has
+   nothing to go on, not repeat the fee-card figures.
+5. **Then go back to chat A** and ask a genuine follow-up (*"what about debit
+   cards?"*). **Expected:** it still has full context of *that* chat. If step 4
+   leaked and step 5 also lost its own history, that is not the fix — that is
+   the memory being off entirely, which is a different, worse bug.
+
 ### 3. The interesting test: a document with a specific fact buried in it
 
 This is where we currently have a **known failure we are not sure is fixed**.
@@ -473,6 +505,32 @@ file has only a `workbench starting` line in it, the fix did not take — that i
 bug worth reporting on its own. A healthy file shows, in order: `workbench
 starting` → `ui:` bootstrap lines → `submit_turn` → per-tool `tool: start` /
 `tool: ok` → `report synthesised`.
+
+### 8b. Cross-session memory leak — global memory temporarily disabled (2026-09-12)
+
+Reported from testing: information from one chat surfaced in an unrelated one.
+Confirmed structural, not incidental — `persistent_memory.json` is a single file
+shared by every session with nothing scoping it, and every turn in every chat
+both read and overwrote it. See execution log part 8 for the full trace.
+
+**Current state:** `GLOBAL_MEMORY_ENABLED = false` in
+`crates/workbench-core/src/pipeline.rs`. A turn no longer reads or writes
+`persistent_memory.json` at all. **Per-session memory is unaffected** — a
+follow-up question inside the *same* chat still has full context, because that
+runs through `SessionContext` (`sessions/<id>.json`), a completely different,
+already-correctly-scoped store. Only the cross-session digest is off.
+
+**What to check:** ask something in one chat, open a *different* chat, and
+confirm nothing from the first appears unprompted in the second. Then confirm
+follow-ups **inside one chat still work** — that is the thing this fix must not
+break.
+
+**Not a fix, a stopgap.** The feature this store existed for — a plant's
+equipment names or a recurring theme surviving across chats — is now off
+entirely, not fixed. The real fix is scoping `PersistentMemory` by something
+narrower than "the machine" (a user/profile id), or making anything crossing a
+session boundary an explicit propose → confirm step. Bigger than a bug fix;
+tracked below in problem 9, which this makes more relevant, not less.
 
 ### 9. Persistent memory is still not visible
 

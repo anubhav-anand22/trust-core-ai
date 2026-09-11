@@ -730,6 +730,165 @@ paint. Before adding more `background` rules, ask whether the pixels belong to
 the OS — `color-scheme` is the lever for that whole category, and it fixes
 scrollbars, checkboxes and date pickers at the same time.
 
+## Post-demo — part 7: the dead gutter, and a shell that owns the viewport
+
+"The chat should be full screen, there is unused space on the right." One line
+caused it:
+
+```css
+.wb-left { flex: 1; padding: 20px; overflow: auto; max-width: 860px; }
+```
+
+`.wb-left` sits in a flex row between a 232px session rail and a 320px audit
+rail. Capped at 860px, the three add up to 1412px — so on a 1920px monitor about
+500px had nowhere to go and rendered as a dead gutter between the transcript and
+the audit panel. The cap was there for a good reason (line length), but it was
+applied to the **container** rather than to the **text**.
+
+### The shape it became
+
+- **`.wb-left` fills the row**, and the two rails take a share of the extra width
+  with `clamp()` — an ultrawide now widens all three columns instead of dumping
+  everything into the middle one.
+- **Prose keeps its measure in `ch`, not the panel.** `.bubble-user` is
+  `min(90%, 88ch)`, `.report-summary` is `96ch`. Panels go full-bleed; lines
+  stay readable. This is the distinction the original cap missed.
+- **`height: 100vh` instead of `min-height`.** The shell owns the viewport and
+  the panes scroll inside it. With `min-height` the whole *page* scrolled, which
+  is why a long transcript could push the prompt box off-screen entirely.
+- **The transcript scrolls; the prompt panel is pinned** with a rule above it.
+  That single change is most of what makes it read as an app rather than a
+  document.
+- **The report uses the width.** Its sections flow into
+  `repeat(auto-fit, minmax(320px, 1fr))` — three columns at 1920px, two at
+  1366px, one on a narrow window. No media query, no JSX change.
+
+### Following the output
+
+Making the transcript its own scroll container created a new obligation: new
+output no longer scrolls into view by itself. Naive auto-scroll is worse than
+none, because it yanks you back to the bottom while you are reading an earlier
+answer. The fix is a `stickToBottom` ref updated from the **scroll handler**, not
+measured inside the effect — by the time the effect runs the new content is
+already in the DOM, so "was the user at the bottom *before* this?" can no longer
+be answered.
+
+### Verifying a layout without running the app
+
+The GUI needs Ollama and a multi-minute turn, which is a poor loop for CSS. So
+the layout was checked against a static harness — the **real `App.css`** plus the
+real DOM structure with fixture content — screenshotted with Playwright at 1920
+and 1366, asserting the numbers that matter:
+
+```
+wide    gap=0px overflow=0px cols=362px 362px 362px
+narrow  gap=0px overflow=0px cols=350px 350px
+```
+
+`gap` is the distance between `.wb-left`'s right edge and `.audit`'s left edge —
+the dead gutter, now zero. `overflow` is page scroll height beyond the viewport —
+zero means the shell really does own the viewport.
+
+That harness also caught an edge case reasoning alone got wrong. A degraded
+report has only one section, and `auto-fit` was expected to stretch it across the
+whole panel. It does not: `.report-head` and `.report-summary` are
+`grid-column: 1 / -1`, so every track is spanned and none is empty for `auto-fit`
+to collapse. The single section stays in one track, correctly.
+
+> One harness artifact worth knowing about: `.bubble` is `white-space: pre-wrap`,
+> so HTML indentation inside the bubble renders as real whitespace and the bubble
+> looks too tall. React passes a single text node and has no such problem. Do not
+> "fix" that one.
+
+### Takeaway
+
+A max-width on a flex child in a three-column shell does not centre anything — it
+leaves a hole. Constrain the **text**, let the **container** fill. And a static
+harness over the real stylesheet is a cheap way to check a layout when the real
+app costs minutes per look.
+
+## Post-demo — part 8: the cross-session leak
+
+Reported from testing: "memory data leaking from different sessions to each
+other." True, and structural rather than a slip in one call site.
+
+### The shape of the leak
+
+`PersistentMemory` (`memory/persistent.rs`) is **one file**,
+`persistent_memory.json`, encrypted with a key derived from the machine —
+not from a session id, not from a user id. Nothing scopes it. Every turn, in
+every chat, did this:
+
+```rust
+// pipeline.rs, run_from_plan — BEFORE this fix
+let facility = PersistentMemory::load(&config.persistent_path());
+...
+&facility.context_blob(),   // → role C's prompt, "long-term facility memory"
+```
+
+and `persist_long_term`, called after **every** turn and on `end_session`,
+folded whichever session had just run into that same single file:
+
+```rust
+let digest = if !session.rolling_summary.is_empty() {
+    session.rolling_summary.clone()
+} else { /* … joined turn summaries … */ };
+memory.history_digest = digest;   // overwrites the ONE global digest
+```
+
+So: ask something in chat A, its digest lands in `persistent_memory.json`. Open
+an unrelated chat B and ask anything — role C loads that same file and receives
+chat A's digest as `HISTORY: …` in its own prompt. Two conversations that never
+should have met.
+
+This is a **different mechanism** from `SessionContext`
+(`sessions/<id>.json`) — that one *is* keyed by session id and was correctly
+scoped from Stage 4 onward (see part 4 / docs 11). It is worth being precise
+about which "memory" leaked, because the fix must not touch the one that
+wasn't broken: a follow-up question inside one chat still needs its own
+history, and does not lose it here.
+
+### The temporary fix
+
+A single `const GLOBAL_MEMORY_ENABLED: bool = false;` in `pipeline.rs`, gating
+both the read and the write:
+
+- the read site now passes `facility_context = String::new()` to `compiler::compile`
+  when disabled — `ollama_engine.rs`'s prompt already renders an empty string as
+  `(none)`, so no prompt-side special-casing was needed;
+- `persist_long_term` returns immediately when disabled, at the top of the
+  function — the **one** function both `pipeline.rs`'s own call and
+  `src-tauri`'s `end_session` command go through, so neither call site can be
+  re-enabled without the other by accident.
+
+Nothing on disk is deleted. An existing `persistent_memory.json` from before
+this flag simply stops being read while the flag is `false` — inert, not
+wiped, in case there is ever a reason to look at what accumulated. Delete it
+by hand if you want a clean slate; it will be recreated empty next time the
+flag is flipped back on.
+
+### Why this is temporary, and what the real fix is
+
+Disabling the file stops the leak but also stops the thing it was *for* — a
+plant's equipment register or a recurring theme surviving across chats, which
+is a real blueprint requirement (`facility_metadata`, `recurrent_tags`; see
+known problem 9 in the README, "persistent memory is still not visible"). The
+actual fix is scoping: either key `PersistentMemory` by something narrower
+than "the machine" (a user profile the app already has an id for), or make
+cross-session memory an explicit **propose → user confirms** step before
+anything crosses a session boundary, rather than an automatic digest fold.
+Either is a bigger design decision than a bug-severity fix warrants on its
+own — hence the flag, not a rewrite.
+
+### Takeaway
+
+"Which store is this?" is the first question, not "where's the bug." Two
+memory tiers existed on purpose (session-scoped, user-scoped) and only one of
+them was actually scoped — the fix is disabling exactly that one, and the
+five extra minutes spent confirming `SessionContext` was unaffected is what
+kept a memory bug from turning into a "does the chat still remember anything"
+regression.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`
