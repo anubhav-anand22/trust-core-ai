@@ -181,8 +181,9 @@ hung. See *Known problems*.
 
 A bug found on 2026-09-11 rendered **three identical report cards** from a single
 file + prompt. It was a React bug, not a model or pipeline bug (see *Known
-problems* 6b). Please confirm the fix holds on your machine, because the symptom
-depends on React's dev-mode behaviour and is easy to reintroduce.
+problems* 6b). **Fixed and confirmed on the dev machine** — please confirm it
+holds on yours too, because the symptom depended on React's dev-mode behaviour
+and is easy to reintroduce.
 
 After the turn in step 2 finishes, check all of these:
 
@@ -391,7 +392,7 @@ running app:
 
 See the walkthrough. When you run these, watch `workbench.log.*` (problem 8).
 
-### 6b. One input rendered three identical answers (fixed 2026-09-11, needs confirming)
+### 6b. One input rendered three identical answers (fixed and confirmed 2026-09-11)
 
 Reported from a demo run: one file + one prompt produced **three identical report
 cards**. Worth reading even though it is fixed, because the triage order is the
@@ -435,10 +436,12 @@ double-click on Run fired **two real `submit_turn` invokes** — two pipeline ru
 two exchanges on disk, double the CPU wait. `run()`/`resume()` now hold an
 `inFlight` ref, which updates synchronously.
 
-**What is unverified:** everything above is a code trace plus a clean `tsc`. The
-logs on the dev machine contain **no `submit_turn` lines at all**, so the original
-buggy run was never captured and the fix has not been watched end to end. Walkthrough
-step 2b is the confirmation — please run it.
+**Confirmed working** on the dev machine on 2026-09-11: one input now produces
+one report card. Worth noting how thin the evidence was *before* that run — the
+diagnosis rested entirely on a code trace and a clean `tsc`, because the logs
+contained no `submit_turn` lines at all and the original buggy run was never
+captured. Walkthrough step 2b remains the check to run on a **second** machine,
+since the symptom depended on React's dev-mode behaviour.
 
 **Still no automated guard.** There is no vitest/RTL in `package.json`, and
 `workbench-core/tests/` has no assertion that a turn emits exactly one `done`
