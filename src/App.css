@@ -116,7 +116,14 @@ select:disabled, textarea:disabled, input:disabled {
   background: var(--panel);
 }
 .wb-header h1 { font-size: 16px; margin: 0; }
+/* Secondary to the wordmark, not a third equal item — the category name, read
+   quietly. */
+.wb-tagline { font-size: 12px; color: var(--muted); }
 .wb-tier {
+  /* Anchors to the header's right edge. Without this, the header — full-width
+     since the layout rework — would reopen the same dead-space problem that was
+     fixed for the workspace below it, just one row higher. */
+  margin-left: auto;
   font-size: 12px;
   color: var(--muted);
   border: 1px solid var(--line);

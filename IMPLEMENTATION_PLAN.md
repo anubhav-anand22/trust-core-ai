@@ -1,4 +1,4 @@
-# Sovereign On-Premise AI Workbench — Build Status
+# TrustCore AI — Build Status
 
 > **Stack:** pure-Rust Tauri v2 desktop app. No Python, no sidecar, single binary.
 > **Event:** SIH 2026, PS SIH26117 (Mangalore Refinery & Petrochemicals). Fully air-gappable after first setup.

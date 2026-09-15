@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM  Sovereign AI Workbench - one-click demo launcher (Windows)
+REM  TrustCore AI - Sovereign AI Agentic Workbench - one-click demo launcher (Windows)
 REM
 REM  Double-click this file to start the app. It exists because launching by
 REM  hand needs a PATH that a fresh terminal does not always have: `winget`
@@ -10,12 +10,12 @@ REM
 REM  Leave this window open while you demo - closing it stops the app.
 REM ============================================================================
 
-title Sovereign AI Workbench - demo
+title TrustCore AI - demo
 cd /d "%~dp0"
 
 echo.
-echo  Sovereign AI Workbench
-echo  ----------------------
+echo  TrustCore AI - Sovereign AI Agentic Workbench
+echo  ---------------------------------------------
 echo.
 
 REM --- Put the toolchain on PATH for this window only -------------------------

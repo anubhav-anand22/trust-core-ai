@@ -1,4 +1,4 @@
-//! Sovereign On-Premise AI Workbench — pipeline core.
+//! TrustCore AI — pipeline core.
 //!
 //! This crate is deliberately Tauri-free. It exposes:
 //!   * [`engine`]   — the single resident LLM (role-swapped) + typed schemas

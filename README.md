@@ -1,4 +1,4 @@
-# Sovereign On-Premise AI Workbench
+# TrustCore AI — Sovereign AI Agentic Workbench
 
 An air-gappable desktop assistant for industrial inspection work. You give it a
 question plus attachments (a digital PDF, a photo, a voice note); it parses your

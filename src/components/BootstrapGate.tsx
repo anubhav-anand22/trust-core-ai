@@ -159,8 +159,8 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
 
   return (
     <div className="bootstrap">
-      <h1>Sovereign AI Workbench</h1>
-      <p className="bootstrap-sub">Offline setup</p>
+      <h1>TrustCore AI</h1>
+      <p className="bootstrap-sub">Sovereign AI Agentic Workbench · Offline setup</p>
 
       {phase === "checking-ollama" && <p>Checking for Ollama…</p>}
 

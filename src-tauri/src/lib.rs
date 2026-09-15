@@ -1,4 +1,4 @@
-//! Tauri host for the Sovereign On-Premise AI Workbench.
+//! Tauri host for TrustCore AI.
 //!
 //! What stays on the Rust side of the app:
 //!   * Ollama bootstrap — install + tier-aware model pulls ([`bootstrap`])

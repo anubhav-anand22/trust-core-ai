@@ -1,4 +1,4 @@
-// Sovereign AI Workbench — app shell.
+// TrustCore AI — app shell.
 // Bootstrap gate -> chat (session rail + transcript + prompt + audit sidebar).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -351,7 +351,8 @@ function App() {
   return (
     <div className="workbench">
       <header className="wb-header">
-        <h1>Sovereign AI Workbench</h1>
+        <h1>TrustCore AI</h1>
+        <span className="wb-tagline">Sovereign AI Agentic Workbench</span>
         <span className="wb-tier">{plan.tier_label}</span>
       </header>
 
