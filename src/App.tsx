@@ -33,6 +33,23 @@ import type {
 
 const SESSION_KEY = "wb.sessionId";
 
+// Two prompts pulled straight from the manual-testing walkthrough (README §2 and
+// §3), against fixtures that ship in `demo/fixtures/` — a judge clicking these is
+// guaranteed a working, already-verified path rather than something invented for
+// the empty state. Clicking a card fills the prompt text only; there is no
+// filesystem capability on the frontend to attach the file for them (see
+// docs/11-conversations-and-memory.md), so the label says which file to drop in.
+const EXAMPLES: { prompt: string; files: string[] }[] = [
+  {
+    prompt: "Assess corrosion risk on pump P-101 and check it against our SOPs.",
+    files: ["inspection.pdf", "valve.png"],
+  },
+  {
+    prompt: "What transaction fee applies to a ₹1000 credit card payment?",
+    files: ["fee_card.pdf"],
+  },
+];
+
 function newSessionId(): string {
   return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -75,6 +92,11 @@ function App() {
   // and empties the prompt + attachments. Deliberately NOT driven by `busy`
   // going false — a failed or parked turn must keep the user's input.
   const [inputResetToken, setInputResetToken] = useState(0);
+  // Text from the last-clicked "try one of these" example card, plus a counter
+  // PromptPanel watches so a repeat click of the same card still re-fills —
+  // same shape as `inputResetToken` above.
+  const [exampleText, setExampleText] = useState("");
+  const [exampleToken, setExampleToken] = useState(0);
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
   const [fatal, setFatal] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<{ message: string; detail?: string | null }[]>([]);
@@ -215,6 +237,13 @@ function App() {
     refreshSessions();
   }
 
+  // A "try one of these" card was clicked. Only fills PromptPanel's text — see
+  // the matching effect there for why the file can't be attached automatically.
+  function applyExample(text: string) {
+    setExampleText(text);
+    setExampleToken((n) => n + 1);
+  }
+
   async function run(prompt: string, files: File[], mode: TurnMode) {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -351,10 +380,39 @@ function App() {
               }}
             >
               {transcript.length === 0 && !showLive && (
-                <p className="muted transcript-empty">
-                  Ask a question, attach a document, and the analysis appears here.
-                  Follow-up questions in the same chat keep their context.
-                </p>
+                <div className="welcome">
+                  <p className="muted transcript-empty">
+                    Ask a question, attach a document, and the analysis appears here.
+                    Follow-up questions in the same chat keep their context.
+                  </p>
+
+                  <div className="examples">
+                    <p className="examples-label">Try one of these</p>
+                    {EXAMPLES.map((ex) => (
+                      <button
+                        key={ex.prompt}
+                        type="button"
+                        className="example-card"
+                        onClick={() => applyExample(ex.prompt)}
+                      >
+                        <span className="example-prompt">“{ex.prompt}”</span>
+                        <span className="example-files">
+                          attach{" "}
+                          {ex.files.map((f, i) => (
+                            <span key={f}>
+                              {i > 0 && " + "}
+                              <code>{f}</code>
+                            </span>
+                          ))}
+                        </span>
+                      </button>
+                    ))}
+                    <p className="examples-hint muted small">
+                      Fixtures live in <code>demo/fixtures/</code>. Missing? Run{" "}
+                      <code>python demo/make_fixtures.py</code>.
+                    </p>
+                  </div>
+                </div>
               )}
 
               {transcript.map((x, i) => (
@@ -408,7 +466,13 @@ function App() {
               )}
             </div>
 
-            <PromptPanel busy={busy} onSubmit={run} resetToken={inputResetToken} />
+            <PromptPanel
+              busy={busy}
+              onSubmit={run}
+              resetToken={inputResetToken}
+              exampleText={exampleText}
+              exampleToken={exampleToken}
+            />
           </section>
 
           <AuditSidebar events={events} plan={plan} />

@@ -161,8 +161,10 @@ follow it in order — later steps assume earlier ones worked.
 
 ### 2. One normal turn
 
-Prompt: *"Assess corrosion risk on pump P-101 and check it against our SOPs."*
-Attach `demo/fixtures/inspection.pdf` and `demo/fixtures/valve.png`. Run it.
+Click the first **"Try one of these"** card in the empty chat (or type it
+yourself): *"Assess corrosion risk on pump P-101 and check it against our
+SOPs."* Attach `demo/fixtures/inspection.pdf` and `demo/fixtures/valve.png` —
+the card names them so you don't have to remember. Run it.
 
 What should happen:
 
@@ -246,6 +248,21 @@ See *Known problems* 8b. Two chats must not see each other's context.
    cards?"*). **Expected:** it still has full context of *that* chat. If step 4
    leaked and step 5 also lost its own history, that is not the fix — that is
    the memory being off entirely, which is a different, worse bug.
+
+### 2e. First impression (no turn needed)
+
+Added 2026-09-15, for a jury walking up without a live walkthrough:
+
+- **The empty chat shows two example prompts** as clickable cards, each naming
+  the fixture(s) to attach. They are the exact prompts from steps 2 and 3 below —
+  clicking one only fills the text box, since the app has no way to reach into
+  the filesystem and attach the file itself; attaching is still one manual drop.
+- **The audit sidebar opens with a permanent "How it works" list** — Parse
+  intent → Validate plan → Execute tools → Quality check → Synthesize — visible
+  before you run anything and still there after, unlike the stepper. Hover a row
+  for the longer explanation. If a judge asks "how do you stop the model from
+  hallucinating a bad plan," the second row is the answer: a Rust validator, not
+  the model grading itself.
 
 ### 3. The interesting test: a document with a specific fact buried in it
 

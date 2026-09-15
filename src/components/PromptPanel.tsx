@@ -23,11 +23,17 @@ export function PromptPanel({
   busy,
   onSubmit,
   resetToken,
+  exampleText,
+  exampleToken,
 }: {
   busy: boolean;
   onSubmit: (prompt: string, files: File[], mode: TurnMode) => void;
   /** Bumped by `App` each time a turn actually delivers a report. */
   resetToken: number;
+  /** Text from the last-clicked "try one of these" card. */
+  exampleText?: string;
+  /** Bumped by `App` on every example click, even a repeat click of the same card. */
+  exampleToken?: number;
 }) {
   const [prompt, setPrompt] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -36,6 +42,7 @@ export function PromptPanel({
   const [deep, setDeep] = useState(false);
   const [rejected, setRejected] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Empty the box once a turn has delivered its answer, so a follow-up starts
   // from a clean prompt and no stale attachments.
@@ -59,6 +66,19 @@ export function PromptPanel({
     if (inputRef.current) inputRef.current.value = "";
   }, [resetToken]);
 
+  // A "try one of these" card was clicked: fill the box with its prompt and put
+  // the cursor there, so the only thing left for a judge to do is attach the
+  // named fixture and hit Run. Only fills the TEXT — the picker can't reach
+  // into the repo to attach the file itself; there is no filesystem capability
+  // on the frontend (see docs/11-conversations-and-memory.md).
+  useEffect(() => {
+    if (!exampleToken) return; // 0/undefined: no example has been clicked yet
+    if (exampleText != null) setPrompt(exampleText);
+    textareaRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the
+    // token so a repeat click of the SAME example still re-fills and refocuses.
+  }, [exampleToken]);
+
   function addFiles(list: FileList | null) {
     if (!list) return;
     const incoming = Array.from(list);
@@ -81,6 +101,7 @@ export function PromptPanel({
   return (
     <div className="prompt-panel">
       <textarea
+        ref={textareaRef}
         className="prompt-input"
         placeholder="Describe the task, e.g. “Assess corrosion risk on pump P-101 from these attachments,” or “What credit-card fee applies to a ₹1000 payment per this rate card?”"
         value={prompt}

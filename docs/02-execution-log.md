@@ -889,6 +889,69 @@ five extra minutes spent confirming `SessionContext` was unaffected is what
 kept a memory bug from turning into a "does the chat still remember anything"
 regression.
 
+## Post-demo — part 9: making the app pitch itself
+
+A jury walks up cold — no one from the team narrating over their shoulder. Two
+gaps stood out on a component read-through, both about the running app, not the
+README: an empty chat that gave no hint what a good question looks like, and a
+pipeline whose only on-screen explanation (the `Stepper`) is a temporary widget
+that is gone the instant a turn finishes.
+
+### Empty state: real prompts, not an invented demo
+
+The two example cards are not new copy — they are the exact prompts from
+walkthrough steps 2 and 3, against the exact fixtures in `demo/fixtures/`.
+Reusing already-verified strings instead of writing fresh ones means a card a
+judge clicks is guaranteed to be a path that has actually been run, not a
+plausible-looking sentence nobody tried.
+
+Clicking a card fills the prompt **text** only. It cannot also attach the file:
+the frontend has no filesystem capability (see part on conversations/memory —
+`load_session` etc. all go through a Tauri command for the same reason), so
+there is no way to turn a repo-relative path into a `File` object without one.
+The card's second line — `attach inspection.pdf + valve.png` — says explicitly
+what the one remaining manual step is, rather than leaving it to be guessed.
+
+### A permanent "how it works," not a temporary one
+
+The `Stepper` already narrates a turn stage by stage, but it is scoped to a
+single live turn and disappears the moment `commitTurn` fires (part 6). A judge
+who arrives, reads the empty state, and hasn't run anything yet — or who is
+looking at the audit rail after a turn already committed — never sees it.
+
+The new "How it works" list lives in `AuditSidebar` instead: that panel is open
+by default and never disappears, so it is the one static description of the
+pipeline a first-time viewer can read without running a turn or opening the
+README. It mirrors `run_turn`'s own doc comment in `pipeline.rs` almost verbatim
+— five stages, condensed from that comment's longer list (HITL and memory are
+implementation detail, not press-facing) — so the in-app description and the
+code it describes cannot quietly drift apart. The one stage worth a visual tag
+is "Validate plan → Rust, deterministic," since that is the concrete answer to
+"how do you keep a small model from hallucinating a bad plan," which is the
+project's actual technical claim over "just prompt an LLM and hope."
+
+### Small deliberate choices
+
+- **A numbered list, not a horizontal strip with arrows.** The audit rail's
+  width floor is 320px (`clamp(320px, 21vw, 420px)`, part 7); five chips in a
+  row would wrap unpredictably at that width. A vertical list degrades to
+  "still five readable rows" instead.
+- **The longer explanation is a `title` tooltip**, not inline text, so the
+  panel stays scannable at a glance and rewards a judge who hovers rather than
+  forcing everyone to read five sentences.
+- **Wired the same way `resetToken` already was** (part 6): a text value plus a
+  counter `PromptPanel` watches, bumped by the parent on every click — a click on
+  the *same* card twice still re-fills and refocuses, because the counter change
+  is what the effect keys on, not the text.
+
+### Takeaway
+
+"Self-explanatory" was being solved one layer too low last time — window title
+and a tagline fix the first five seconds, but a judge who then clicks around
+for two minutes needs the *app*, not the README, to keep explaining itself. The
+right home for that is whatever panel is already permanent, not whichever one
+happens to be easiest to add text to.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`
