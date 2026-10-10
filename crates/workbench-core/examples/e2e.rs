@@ -7,11 +7,14 @@
 //!
 //! Env overrides: `WB_LLM`, `WB_VISION`, `WB_EMBED`, `WB_DATA_DIR`, `WB_KB_DIR`,
 //! `WB_MODELS_DIR` (whisper/ocrs model files).
+//!
+//! Ends with a per-model-call timing table — the before/after benchmark for any
+//! performance change. Compare runs on the same machine, model, prompt and files.
 
 use std::path::PathBuf;
 
 use workbench_core::engine::schemas::{FileKind, InputFile};
-use workbench_core::engine::OllamaEngine;
+use workbench_core::engine::{CallTiming, OllamaEngine};
 use workbench_core::events::{ProgressSink, StepEvent};
 use workbench_core::tools::default_registry;
 use workbench_core::{run_turn, PipelineConfig, TurnOutcome};
@@ -96,7 +99,8 @@ async fn main() {
     );
     let registry = default_registry();
 
-    match run_turn(
+    let turn_started = std::time::Instant::now();
+    let outcome = run_turn(
         &engine,
         &registry,
         &config,
@@ -105,8 +109,11 @@ async fn main() {
         &uploads,
         &StdoutSink,
     )
-    .await
-    {
+    .await;
+    // Printed even when the turn fails: a timeout is exactly when you want it.
+    print_timings(&engine.timings(), turn_started.elapsed());
+
+    match outcome {
         Ok(TurnOutcome::Completed(report)) => {
             println!("\n==== FINAL REPORT ====");
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
@@ -123,6 +130,43 @@ async fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// One row per model call, then totals. `-` = Ollama gave no figure (always the
+/// case for embeddings, which report wall time only).
+fn print_timings(calls: &[CallTiming], turn: std::time::Duration) {
+    let opt = |v: Option<u64>| v.map_or("-".to_string(), |n| n.to_string());
+    let secs = |ms: u128| format!("{:.1}", ms as f64 / 1000.0);
+
+    println!("\n==== TIMING ====");
+    println!(
+        "{:<16} {:>8} {:>8} {:>8} {:>10} {:>8} {:>10} {:>7}",
+        "role", "wall_s", "load_ms", "p_tok", "prefill_ms", "gen_tok", "decode_ms", "tok/s"
+    );
+    for c in calls {
+        println!(
+            "{:<16} {:>8} {:>8} {:>8} {:>10} {:>8} {:>10} {:>7}",
+            c.role,
+            secs(c.wall_ms),
+            opt(c.load_ms),
+            opt(c.prompt_tokens),
+            opt(c.prefill_ms),
+            opt(c.gen_tokens),
+            opt(c.decode_ms),
+            c.decode_tok_per_s().map_or("-".to_string(), |v| format!("{v:.1}")),
+        );
+    }
+    let sum = |f: fn(&CallTiming) -> Option<u64>| calls.iter().filter_map(f).sum::<u64>() as u128;
+    let model_ms: u128 = calls.iter().map(|c| c.wall_ms).sum();
+    println!(
+        "model calls: {}  |  model wall {}s  (load {}s, prefill {}s, decode {}s)  |  turn wall {}s",
+        calls.len(),
+        secs(model_ms),
+        secs(sum(|c| c.load_ms)),
+        secs(sum(|c| c.prefill_ms)),
+        secs(sum(|c| c.decode_ms)),
+        secs(turn.as_millis()),
+    );
 }
 
 fn env_path(key: &str, default: &str) -> PathBuf {

@@ -56,8 +56,10 @@ pub async fn run_turn(
     let history = session.context_blob();
 
     // --- plan + deterministic validation (with retry ceiling) ---------------
+    let plan_started = std::time::Instant::now();
     let (_intent, outcome) =
         plan_turn(engine, prompt, uploads, &history, session.has_history(), sink).await?;
+    tracing::info!(plan_ms = plan_started.elapsed().as_millis(), "turn phase: planning done");
     let plan = match outcome {
         PlanOutcome::Ready(plan) => plan,
         PlanOutcome::AwaitingUser { errors, last_plan } => {
@@ -206,8 +208,10 @@ async fn run_from_plan(
 
     // --- strictly sequential tool execution --------------------------------
     let session_blob = session.context_blob();
+    let execute_started = std::time::Instant::now();
     let results =
         execute_plan(&plan, registry, uploads, config, engine, prompt, &session_blob, sink).await?;
+    let execute_ms = execute_started.elapsed().as_millis();
 
     // A Stop pressed during the final tool: don't spend another minute
     // synthesising a report the user no longer wants.
@@ -233,6 +237,7 @@ async fn run_from_plan(
     // the user confirmed, never an automatic digest of some other conversation.
     let facility = PersistentMemory::load(&config.persistent_path());
 
+    let compile_started = std::time::Instant::now();
     let mut report = compiler::compile(
         engine,
         prompt,
@@ -242,6 +247,7 @@ async fn run_from_plan(
         sink,
     )
     .await;
+    let compile_ms = compile_started.elapsed().as_millis();
     report.degraded = report.degraded || !quality.passed;
     // Don't ask the user to confirm what they already confirmed.
     report.memory_proposals.retain(|p| !facility.has(p));
@@ -275,12 +281,25 @@ async fn run_from_plan(
         report: Some(report.clone()),
         ts: 0, // 0 = record_turn stamps the current time
     };
+    let record_started = std::time::Instant::now();
     if let Err(e) = session
         .record_turn(exchange, turn, engine, &config.session_path_for(session_id))
         .await
     {
         tracing::warn!(error = %e, "failed to record session turn");
     }
+
+    // One line to read the turn's shape from; per-call detail is in the
+    // `model call timing` lines (and `engine.timings()`).
+    let calls = engine.timings();
+    tracing::info!(
+        execute_ms,
+        compile_ms,
+        record_ms = record_started.elapsed().as_millis(),
+        model_calls = calls.len(),
+        model_wall_ms = calls.iter().map(|c| c.wall_ms).sum::<u128>(),
+        "turn phases"
+    );
 
     sink.emit(StepEvent::Done {
         report_json: serde_json::to_string(&report)?,

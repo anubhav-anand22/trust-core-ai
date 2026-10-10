@@ -1160,6 +1160,33 @@ README cost time:
 Measured on the 2-core i7-4600U with `-j 1`: ~26 min for `cargo test -p
 workbench-core` from cold, +20 min for the Tauri crate, ~15 s incremental.
 
+## Feature pass — part 15: measure CPU time before cutting it
+
+README *Known problems* #1 had one number — "~8 min a turn, ~200 s per analysis
+step" — and no way to reproduce or decompose it. Every proposed speed-up
+(merge the two analysis steps, stream, drop moondream) attacks a *different*
+cost, so picking one without the split would be guess-and-patch.
+
+Ollama already returned the split on every response (`load_duration`,
+`prompt_eval_count/_duration`, `eval_count/_duration`); the engine read
+`.response` and dropped the rest. Now:
+
+- `CallTiming` (`engine/ollama_engine.rs`) — one per model call, recorded in
+  `record_timing` right after each guarded call (structured roles, analysis,
+  vision, respond, warm-up, session summary; embeddings wall-time only). Logged
+  at `info`, kept on the engine (`engine.timings()`), one engine per turn.
+- `pipeline.rs` — `turn phase: planning done` and `turn phases` lines.
+- `examples/e2e.rs` — prints a timing table at the end, even on failure. This is
+  the benchmark; doc 09 *Measuring before you optimise* has the command.
+
+What reading the code already suggests (to be confirmed by the table):
+`summarize` and `compare_to_sop` get the same dependencies, each re-embeds the
+whole evidence via `select_relevant` (with `keep_alive = 0`, a model reload each
+time) and each prefills ~half of `num_ctx`. That is the next change.
+
+`cargo test -p workbench-core -j 1` → **45/45** (one new unit test for the ns→ms
+breakdown). A real-model run with the table has **not** been done yet.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

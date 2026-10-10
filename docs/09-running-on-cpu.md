@@ -163,5 +163,41 @@ or the **Open log folder** button in the audit sidebar):
 | `llm call (structured) … elapsed_ms=…` | how long each model call actually took |
 | `model call exceeded its time budget` | a call hit the 240 s timeout |
 | `run cancelled by user before this step` | Stop was pressed |
+| `model call timing … load_ms prefill_ms decode_ms` | *where* one call's time went (below) |
+| `turn phase: planning done … plan_ms` / `turn phases … execute_ms compile_ms record_ms` | the turn's shape at a glance |
 
 See also [07 · Build, test, run](07-build-test-run.md#reading-the-logs).
+
+## Measuring before you optimise
+
+Wall-clock says a step took 200 s; it does not say why. On a CPU it is one of
+three costs, and each has a different fix:
+
+| Field | What it is | Grows with | Fix that helps |
+|---|---|---|---|
+| `load_ms` | weights read off disk into RAM | model size, and every reload | keep the model resident; stop evicting it |
+| `prefill_ms` (`prompt_tokens`) | the model reading the prompt | evidence size | send less evidence, or send it fewer times |
+| `decode_ms` (`gen_tokens`) | the model writing the answer | output length | shorter output (`num_predict`); streaming only makes it *feel* faster |
+
+Ollama returns all of these on every response. `OllamaEngine` now keeps them as a
+`CallTiming` per call (`engine.timings()`) and logs each one at `info`. Embeddings
+report wall time only.
+
+**The benchmark** is the headless example, which ends with a table:
+
+```bash
+WB_LLM=qwen2.5:1.5b-instruct cargo run -p workbench-core --example e2e -j 1 -- \
+  "Assess corrosion risk on pump P-101 and check it against our SOPs." \
+  demo/fixtures/inspection.pdf demo/fixtures/valve.png
+```
+
+```text
+==== TIMING ====
+role               wall_s  load_ms    p_tok prefill_ms  gen_tok  decode_ms   tok/s
+intent_parser        ...
+...
+model calls: N  |  model wall …s  (load …s, prefill …s, decode …s)  |  turn wall …s
+```
+
+Compare only runs on the same machine, model, prompt and files, and discard the
+first run after an Ollama restart (it pays a cold load that later runs don't).

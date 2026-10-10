@@ -13,6 +13,7 @@
 //! Because the executor is strictly sequential, no two of these calls overlap.
 
 use ollama_rs::generation::completion::request::GenerationRequest;
+use ollama_rs::generation::completion::GenerationResponse;
 use ollama_rs::generation::parameters::{FormatType, JsonStructure, KeepAlive};
 use ollama_rs::models::ModelOptions;
 use ollama_rs::Ollama;
@@ -98,6 +99,54 @@ impl Default for ResourceLimits {
     }
 }
 
+/// Where one model call's time went.
+///
+/// Wall-clock alone can't say *why* a step is slow. On a CPU the answer is one
+/// of three very different costs, each with a different fix: reading the weights
+/// off disk (`load_ms`), reading the prompt (`prefill_ms` — grows with evidence
+/// size) or writing the answer (`decode_ms` — grows with output length). Ollama
+/// reports all three on every response; this keeps them instead of dropping them.
+/// The `Option`s are `None` when Ollama omits a field (and always for embeddings,
+/// whose response carries no breakdown).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CallTiming {
+    /// The `what` label of the call: `"task_planner"`, `"analysis"`, `"vision"`…
+    pub role: String,
+    pub model: String,
+    /// Measured here, around the whole request — includes HTTP and queueing.
+    pub wall_ms: u128,
+    pub load_ms: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub prefill_ms: Option<u64>,
+    pub gen_tokens: Option<u64>,
+    pub decode_ms: Option<u64>,
+}
+
+impl CallTiming {
+    fn new(role: &str, model: &str, wall: Duration, response: Option<&GenerationResponse>) -> Self {
+        // Ollama reports nanoseconds.
+        let ms = |ns: Option<u64>| ns.map(|n| n / 1_000_000);
+        Self {
+            role: role.to_string(),
+            model: model.to_string(),
+            wall_ms: wall.as_millis(),
+            load_ms: ms(response.and_then(|r| r.load_duration)),
+            prompt_tokens: response.and_then(|r| r.prompt_eval_count),
+            prefill_ms: ms(response.and_then(|r| r.prompt_eval_duration)),
+            gen_tokens: response.and_then(|r| r.eval_count),
+            decode_ms: ms(response.and_then(|r| r.eval_duration)),
+        }
+    }
+
+    /// Generation speed — the number to compare across machines and models.
+    pub fn decode_tok_per_s(&self) -> Option<f64> {
+        match (self.gen_tokens, self.decode_ms) {
+            (Some(n), Some(ms)) if ms > 0 => Some(n as f64 * 1000.0 / ms as f64),
+            _ => None,
+        }
+    }
+}
+
 /// Wraps the Ollama client and the three model names for one session.
 pub struct OllamaEngine {
     client: Ollama,
@@ -110,6 +159,9 @@ pub struct OllamaEngine {
     cancel: Option<CancelFlag>,
     /// Fast (retrieve then answer) vs Deep (map-reduce the whole document).
     mode: TurnMode,
+    /// Every model call made through this engine, in order. The host builds one
+    /// engine per turn, so this is one turn's breakdown. See [`CallTiming`].
+    timings: std::sync::Mutex<Vec<CallTiming>>,
 }
 
 impl OllamaEngine {
@@ -133,6 +185,7 @@ impl OllamaEngine {
             limits: ResourceLimits::default(),
             cancel: None,
             mode: TurnMode::Fast,
+            timings: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -160,6 +213,38 @@ impl OllamaEngine {
 
     pub fn mode(&self) -> TurnMode {
         self.mode
+    }
+
+    /// Snapshot of every model call made so far, in order.
+    pub fn timings(&self) -> Vec<CallTiming> {
+        self.timings.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// Log one call's breakdown at `info` (so it reaches the app log without
+    /// debug filtering) and keep it for [`Self::timings`].
+    fn record_timing(
+        &self,
+        role: &str,
+        model: &str,
+        started: std::time::Instant,
+        response: Option<&GenerationResponse>,
+    ) {
+        let t = CallTiming::new(role, model, started.elapsed(), response);
+        tracing::info!(
+            role = %t.role,
+            model = %t.model,
+            wall_ms = t.wall_ms,
+            load_ms = ?t.load_ms,
+            prompt_tokens = ?t.prompt_tokens,
+            prefill_ms = ?t.prefill_ms,
+            gen_tokens = ?t.gen_tokens,
+            decode_ms = ?t.decode_ms,
+            decode_tok_per_s = ?t.decode_tok_per_s().map(|v| (v * 10.0).round() / 10.0),
+            "model call timing"
+        );
+        if let Ok(mut all) = self.timings.lock() {
+            all.push(t);
+        }
     }
 
     /// `Err(CoreError::Cancelled)` if the current turn was cancelled. Cheap;
@@ -245,8 +330,14 @@ impl OllamaEngine {
         &self,
         request: ollama_rs::generation::embeddings::request::GenerateEmbeddingsRequest,
     ) -> Result<ollama_rs::generation::embeddings::GenerateEmbeddingsResponse> {
-        self.guarded("embeddings", self.client.generate_embeddings(request))
-            .await
+        let started = std::time::Instant::now();
+        let response = self
+            .guarded("embeddings", self.client.generate_embeddings(request))
+            .await?;
+        // Wall time only: the embeddings response carries no breakdown. Still
+        // worth recording — with `keep_alive = 0` every call reloads the model.
+        self.record_timing("embeddings", &self.embed_model, started, None);
+        Ok(response)
     }
 
     /// Issue one schema-constrained generation against the resident model and
@@ -273,6 +364,7 @@ impl OllamaEngine {
             .keep_alive(KeepAlive::Indefinitely);
 
         let response = self.guarded(role, self.client.generate(request)).await?;
+        self.record_timing(role, &self.llm_model, started, Some(&response));
 
         // Prompt size against the context window is the first thing to check when
         // a model claims it cannot find something that is in the document.
@@ -510,6 +602,7 @@ Return JSON only. No prose, no markdown, no code fences.",
 
         let started = std::time::Instant::now();
         let response = self.guarded("vision", self.client.generate(request)).await?;
+        self.record_timing("vision", &self.vision_model, started, Some(&response));
 
         tracing::debug!(
             model = %self.vision_model,
@@ -552,6 +645,7 @@ schedule — every domain is in scope. Rules:
 
         let started = std::time::Instant::now();
         let response = self.guarded("analysis", self.client.generate(request)).await?;
+        self.record_timing("analysis", &self.llm_model, started, Some(&response));
 
         tracing::debug!(
             model = %self.llm_model,
@@ -579,7 +673,9 @@ equipment or plant — none were provided.";
             .options(self.opts())
             .keep_alive(KeepAlive::Indefinitely);
 
+        let started = std::time::Instant::now();
         let response = self.guarded("respond", self.client.generate(request)).await?;
+        self.record_timing("respond", &self.llm_model, started, Some(&response));
         Ok(response.response.trim().to_string())
     }
 
@@ -596,7 +692,8 @@ equipment or plant — none were provided.";
             .keep_alive(KeepAlive::Indefinitely);
 
         let started = std::time::Instant::now();
-        self.guarded("warm-up", self.client.generate(request)).await?;
+        let response = self.guarded("warm-up", self.client.generate(request)).await?;
+        self.record_timing("warm-up", &self.llm_model, started, Some(&response));
 
         tracing::info!(
             model = %self.llm_model,
@@ -622,9 +719,11 @@ equipment or plant — none were provided.";
         .options(self.opts())
         .keep_alive(KeepAlive::Indefinitely);
 
+        let started = std::time::Instant::now();
         let response = self
             .guarded("session-summary", self.client.generate(request))
             .await?;
+        self.record_timing("session-summary", &self.llm_model, started, Some(&response));
         Ok(response.response.trim().to_string())
     }
 }
@@ -672,6 +771,36 @@ mod tests {
             split_base_url("http://localhost"),
             ("http://localhost".to_string(), 11434)
         );
+    }
+
+    #[test]
+    fn call_timing_keeps_ollamas_breakdown_in_ms() {
+        // Shape of a real non-streamed /api/generate reply; durations are ns.
+        let response: GenerationResponse = serde_json::from_value(serde_json::json!({
+            "model": "qwen2.5:1.5b-instruct",
+            "created_at": "2026-10-10T14:30:00Z",
+            "response": "ok",
+            "done": true,
+            "load_duration": 2_500_000_000u64,
+            "prompt_eval_count": 4000,
+            "prompt_eval_duration": 90_000_000_000u64,
+            "eval_count": 300,
+            "eval_duration": 30_000_000_000u64
+        }))
+        .unwrap();
+
+        let t = CallTiming::new("analysis", "qwen", Duration::from_millis(123_000), Some(&response));
+        assert_eq!(t.wall_ms, 123_000);
+        assert_eq!(t.load_ms, Some(2_500));
+        assert_eq!(t.prompt_tokens, Some(4000));
+        assert_eq!(t.prefill_ms, Some(90_000));
+        assert_eq!(t.gen_tokens, Some(300));
+        assert_eq!(t.decode_ms, Some(30_000));
+        assert_eq!(t.decode_tok_per_s(), Some(10.0));
+
+        // Embeddings (or an older Ollama) give no breakdown: wall time only.
+        let bare = CallTiming::new("embeddings", "nomic", Duration::from_millis(5), None);
+        assert_eq!((bare.wall_ms, bare.prefill_ms, bare.decode_tok_per_s()), (5, None, None));
     }
 
     #[test]
