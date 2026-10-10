@@ -150,6 +150,16 @@ function App() {
   const [exampleText, setExampleText] = useState("");
   const [exampleToken, setExampleToken] = useState(0);
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
+  // What the model is writing right now (streamed). Deliberately NOT part of
+  // `events`: the Stepper reads the last event as the current stage, and the
+  // activity list / audit timings are derived from `events` — ~3 updates a second
+  // would make all of them churn.
+  const [liveText, setLiveText] = useState<{
+    tool: string;
+    text: string;
+    /** Its step reported `tool_finished` — the text is complete, not in flight. */
+    finished: boolean;
+  } | null>(null);
   // Cross-chat memory: only facts the user explicitly confirmed. Shared by every
   // session, which is the point — and safe, because nothing lands here
   // automatically (the automatic digest fold is what used to leak between chats).
@@ -249,12 +259,34 @@ function App() {
     setWarnings([]);
     setLivePrompt("");
     setTurnCommitted(false);
+    setLiveText(null);
     liveReport.current = null;
   }
 
   // Fold a StepEvent stream into UI state. Shared by the initial turn and a resume.
   function onEvent(e: StepEvent) {
+    if (e.stage === "streaming") {
+      setLiveText({ tool: e.tool, text: e.text, finished: false });
+      return;
+    }
     setEvents((prev) => [...prev, e]);
+    // The step finished: keep its text on screen, labelled done. Deep-read
+    // labels look like "assess · deep read 2/5", hence startsWith.
+    if (e.stage === "tool_finished") {
+      setLiveText((lt) => (lt && lt.tool.startsWith(e.tool) ? { ...lt, finished: true } : lt));
+    }
+    // A new step or the end of the turn retires it. `synthesizing` deliberately
+    // does not: the report step is often the second-longest wait, and the
+    // finished analysis is the most useful thing to read meanwhile. A Stop does
+    // not either — what was written so far stays, marked partial.
+    if (
+      e.stage === "executing_tool" ||
+      e.stage === "done" ||
+      e.stage === "error" ||
+      e.stage === "awaiting_user"
+    ) {
+      setLiveText(null);
+    }
     if (e.stage === "done") {
       try {
         const parsed = JSON.parse(e.report_json) as FinalReport;
@@ -350,6 +382,7 @@ function App() {
     setFatal(null);
     setWarnings([]);
     setTurnCommitted(false);
+    setLiveText(null);
     liveReport.current = null;
     try {
       await resumeTurn(
@@ -536,6 +569,21 @@ function App() {
                         </li>
                       ))}
                     </ul>
+                  )}
+                  {!turnCommitted && liveText && liveText.text.trim() && (
+                    <div className="live-text" aria-live="polite">
+                      <div className="live-text-label">
+                        {liveText.tool} ·{" "}
+                        {liveText.finished
+                          ? busy
+                            ? "done — the report is being written from this"
+                            : "done"
+                          : busy
+                            ? "writing…"
+                            : "stopped — partial output"}
+                      </div>
+                      <pre>{liveText.text}</pre>
+                    </div>
                   )}
                   {warnings.length > 0 && (
                     <ul className="warnings" aria-label="Pipeline warnings">

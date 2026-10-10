@@ -416,7 +416,10 @@ Still open, and worth thinking about:
   `assess` call after validation (execution log part 16), saving one evidence
   embedding pass and one ~half-window prefill per turn. Not yet measured on a
   real turn.
-- Would streaming partial output make the wait *feel* acceptable?
+- Streaming: the prose steps (`assess` and the other analysis steps, follow-up
+  and direct answers) now show their text as it is written, in a box under
+  the activity list (execution log part 17). The final report (role C) still
+  arrives all at once: it is schema-constrained JSON, unreadable half-written.
 - `moondream` still costs ~48 s per photo on 4 cores and is pulled on every tier.
 
 ### 2. Long documents / tables (largely rewritten, still unverified end-to-end)

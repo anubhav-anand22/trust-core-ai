@@ -194,6 +194,10 @@ export function submitTurn(
 function logStepEvent(inner: (e: StepEvent) => void) {
   return (e: StepEvent) => {
     switch (e.stage) {
+      case "streaming":
+        // ~3 per second while a model writes, each carrying the full text so
+        // far. Not worth a log line each; the call's timing is logged when it ends.
+        break;
       case "error":
         log.error("pipeline event: error", { message: e.message });
         break;

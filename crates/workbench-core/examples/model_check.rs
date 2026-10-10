@@ -278,20 +278,13 @@ fn write_test_image(path: &std::path::Path) {
     img.save(path).expect("write test image");
 }
 
+/// Physical cores via `sysinfo` (a dev-dependency), the same count the app's
+/// hardware probe uses — so the benchmark runs on the thread budget users get,
+/// on every OS. Falls back to half the logical count, as the probe does.
 fn physical_cores() -> usize {
-    // No sysinfo in this crate; Linux exposes the physical count directly.
-    std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            let ids: std::collections::HashSet<_> = s
-                .lines()
-                .filter(|l| l.starts_with("physical id") || l.starts_with("core id"))
-                .collect::<Vec<_>>()
-                .chunks(2)
-                .map(|c| c.join("|"))
-                .collect();
-            (!ids.is_empty()).then_some(ids.len())
-        })
+    sysinfo::System::new()
+        .physical_core_count()
+        .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(2).max(1))
 }
 

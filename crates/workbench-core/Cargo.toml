@@ -14,6 +14,10 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ollama-rs.workspace = true
+# Streamed prose calls (engine::generate_prose) read Ollama's NDJSON directly:
+# ollama-rs's own stream drops any JSON line split across network chunks. Same
+# 0.12 + features ollama-rs already builds, so nothing new compiles.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 async-trait = "0.1"
 # JSON-Schema derive, used to constrain Ollama structured outputs. Kept on the
 # same major as ollama-rs's own schemars dep so the Schema type matches.
@@ -50,3 +54,6 @@ futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+# Physical core count for examples/, so a benchmark gets the same thread budget
+# the app does. Same version the Tauri host already builds.
+sysinfo = "0.33"

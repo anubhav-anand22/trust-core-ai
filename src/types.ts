@@ -114,7 +114,11 @@ export type StepEvent =
   | { stage: "quality_check"; passed: boolean }
   | { stage: "synthesizing" }
   | { stage: "done"; report_json: string }
-  | { stage: "error"; message: string };
+  | { stage: "error"; message: string }
+  /** Partial output of a prose model call. `text` is the FULL text so far (not a
+   *  delta), so a dropped or repeated message can't garble the display. Never
+   *  stored in the `events` list — see App.tsx `liveText`. */
+  | { stage: "streaming"; tool: string; text: string };
 
 export type StepStage = StepEvent["stage"];
 

@@ -8,6 +8,7 @@
 //! resident model.
 
 use crate::engine::schemas::{TaskStep, ToolResult};
+use crate::engine::ollama_engine::LiveOutput;
 use crate::tools::{Tool, ToolContext};
 use crate::Result;
 
@@ -37,7 +38,12 @@ impl Tool for AnswerFollowupTool {
                            guessing.";
         match ctx
             .engine
-            .analyze(instruction, ctx.session_blob, ctx.prompt)
+            .analyze(
+                instruction,
+                ctx.session_blob,
+                ctx.prompt,
+                Some(LiveOutput { sink: ctx.sink, tool: self.name() }),
+            )
             .await
         {
             Ok(text) => Ok(ToolResult {
@@ -72,7 +78,8 @@ impl Tool for AnswerDirectlyTool {
 
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         let started = std::time::Instant::now();
-        match ctx.engine.respond(ctx.prompt).await {
+        let live = LiveOutput { sink: ctx.sink, tool: self.name() };
+        match ctx.engine.respond(ctx.prompt, Some(live)).await {
             Ok(text) => Ok(ToolResult {
                 step_id: step.id.clone(),
                 task: self.name().into(),

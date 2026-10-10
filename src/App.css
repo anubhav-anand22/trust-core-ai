@@ -396,6 +396,11 @@ select:disabled, textarea:disabled, input:disabled {
 .reasons { margin: 4px 0 10px; padding-left: 18px; font-size: 12.5px; color: var(--muted); display: grid; gap: 3px; }
 .alternatives { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
 
+/* Streamed model output while a prose step runs. Capped height, scrolls itself. */
+.live-text { margin: 0 0 18px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.live-text-label { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+.live-text pre { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; font: inherit; font-size: 13px; }
+
 /* Cross-chat memory: proposals under a report, confirmed list in the audit rail. */
 .report-memory ul,
 .memory-list { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 6px; }

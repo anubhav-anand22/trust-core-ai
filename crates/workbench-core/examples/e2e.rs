@@ -25,6 +25,9 @@ impl ProgressSink for StdoutSink {
     fn emit(&self, event: StepEvent) {
         match &event {
             StepEvent::Done { .. } => println!("  * done"),
+            // The full answer-so-far, ~3x a second: noise here, and the final
+            // text is in the report anyway.
+            StepEvent::Streaming { .. } => {}
             other => println!("  * {}", serde_json::to_string(other).unwrap_or_default()),
         }
     }
@@ -37,6 +40,18 @@ async fn main() {
         "Assess corrosion risk on pump P-101 and check it against our SOPs.".to_string()
     });
     let file_args: Vec<String> = args.collect();
+
+    // Same thread budget as the app (physical cores - 1, see the Tauri host's
+    // `physical_worker_threads`). Without this the crate falls back to a
+    // logical/2 guess, which on a CPU without hyperthreading is far fewer
+    // threads than the app uses, and the timings stop being comparable.
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let physical = sysinfo::System::new()
+        .physical_core_count()
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| (logical / 2).max(1))
+        .min(logical);
+    workbench_core::init_thread_pools(physical.saturating_sub(1).max(1));
 
     let data_dir = env_path("WB_DATA_DIR", "target/e2e-data");
     let kb_dir = env_path("WB_KB_DIR", "crates/workbench-core/kb");
@@ -88,6 +103,10 @@ async fn main() {
     println!(
         "models : llm={} vision={} embed={}",
         config.llm_model, config.vision_model, config.embed_model
+    );
+    println!(
+        "threads: {} (physical cores {physical}, logical {logical})",
+        workbench_core::worker_threads()
     );
     println!("---- run ----");
 

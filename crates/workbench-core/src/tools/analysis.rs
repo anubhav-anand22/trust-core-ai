@@ -7,6 +7,7 @@
 //! step, rather than folding all analysis silently into the final compiler.
 
 use crate::engine::schemas::{TaskStep, ToolResult};
+use crate::engine::ollama_engine::LiveOutput;
 use crate::events::StepEvent;
 use crate::tools::{Tool, ToolContext};
 use crate::{CoreError, Result, TurnMode};
@@ -118,7 +119,8 @@ impl Tool for AnalysisTool {
         )
         .await;
 
-        match ctx.engine.analyze(self.instruction, &evidence, ctx.prompt).await {
+        let live = LiveOutput { sink: ctx.sink, tool: self.name() };
+        match ctx.engine.analyze(self.instruction, &evidence, ctx.prompt, Some(live)).await {
             Ok(text) => Ok(ToolResult {
                 step_id: step.id.clone(),
                 task: self.name().into(),
@@ -169,12 +171,15 @@ impl AnalysisTool {
         let mut partials: Vec<String> = Vec::with_capacity(n);
         for (i, w) in windows.iter().enumerate() {
             ctx.engine.cancel_check()?;
+            // One label for the stepper and the live text, so the two agree.
+            let label = format!("{} · deep read {}/{}", self.name(), i + 1, n);
             ctx.sink.emit(StepEvent::ExecutingTool {
-                tool: format!("{} · deep read {}/{}", self.name(), i + 1, n),
+                tool: label.clone(),
                 index: i,
                 total: n,
             });
-            match ctx.engine.analyze(self.instruction, w, ctx.prompt).await {
+            let live = LiveOutput { sink: ctx.sink, tool: &label };
+            match ctx.engine.analyze(self.instruction, w, ctx.prompt, Some(live)).await {
                 Ok(a) if !a.trim().is_empty() => partials.push(a),
                 Ok(_) => {}
                 Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
@@ -204,7 +209,9 @@ impl AnalysisTool {
                           Merge them into a single answer. Keep every specific figure, rate, \
                           percentage, equipment tag, date and source name exactly as written. \
                           Do not introduce anything that is not in a partial.";
-            match ctx.engine.analyze(reduce, &combined, ctx.prompt).await {
+            let label = format!("{} · deep read merge", self.name());
+            let live = LiveOutput { sink: ctx.sink, tool: &label };
+            match ctx.engine.analyze(reduce, &combined, ctx.prompt, Some(live)).await {
                 Ok(t) => t,
                 Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
                 Err(e) => {

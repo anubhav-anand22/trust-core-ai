@@ -37,6 +37,10 @@ function positionFor(stage: StepStage): number {
       // A warning is an aside, not a stage — the caller filters these out before
       // asking for a position, so this is only here for exhaustiveness.
       return 0;
+    case "streaming":
+      // Partial text from a tool that is already executing. App.tsx keeps these
+      // out of `events` entirely; here for exhaustiveness.
+      return 3;
   }
 }
 

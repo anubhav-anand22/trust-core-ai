@@ -24,6 +24,7 @@ use crate::engine::schemas::{FinalReport, InputFile, IntentResult, Plan, ToolRes
 use crate::planner::registry::registry_prompt_block;
 use std::time::Duration;
 
+use crate::events::{ProgressSink, StepEvent};
 use crate::{CancelFlag, CoreError, Result, TurnMode};
 
 /// Role A — turn the raw ask + attachment kinds into structured intent.
@@ -146,6 +147,21 @@ impl CallTiming {
     }
 }
 
+/// Where a prose call shows its text while it is still being written.
+///
+/// On a CPU a long answer takes minutes to decode; without this the UI sat on
+/// "Executing: assess" the whole time. `tool` labels the text in the UI and
+/// must match the step's `ExecutingTool` label so the two agree.
+#[derive(Clone, Copy)]
+pub struct LiveOutput<'a> {
+    pub sink: &'a dyn ProgressSink,
+    pub tool: &'a str,
+}
+
+/// Minimum gap between two [`StepEvent::Streaming`] events. Tokens arrive far
+/// faster than anyone reads; this keeps IPC and re-renders to ~3 per second.
+const STREAM_EMIT_EVERY: Duration = Duration::from_millis(300);
+
 /// Wraps the Ollama client and the three model names for one session.
 pub struct OllamaEngine {
     client: Ollama,
@@ -158,6 +174,8 @@ pub struct OllamaEngine {
     cancel: Option<CancelFlag>,
     /// Fast (retrieve then answer) vs Deep (map-reduce the whole document).
     mode: TurnMode,
+    /// For streamed prose calls; see [`Self::generate_prose`].
+    http: reqwest::Client,
     /// Every model call made through this engine, in order. The host builds one
     /// engine per turn, so this is one turn's breakdown. See [`CallTiming`].
     timings: std::sync::Mutex<Vec<CallTiming>>,
@@ -190,6 +208,7 @@ impl OllamaEngine {
             mode: TurnMode::Fast,
             timings: std::sync::Mutex::new(Vec::new()),
             persona: String::new(),
+            http: reqwest::Client::new(),
         }
     }
 
@@ -311,6 +330,94 @@ impl OllamaEngine {
                 }
             }
         }
+    }
+
+    /// A prose generation, streamed to `live` when there is one.
+    ///
+    /// The whole stream drain is the future handed to [`Self::guarded`], so the
+    /// timeout and Stop interrupt it mid-answer exactly as they did the
+    /// one-shot call. The text is identical either way — streaming only changes
+    /// when the UI sees it. Returns the final (`done`) chunk with the full text
+    /// in `response`: that chunk carries Ollama's load/prefill/decode figures,
+    /// so [`Self::record_timing`] sees the same numbers as before.
+    async fn generate_prose(
+        &self,
+        what: &str,
+        request: GenerationRequest<'_>,
+        live: Option<LiveOutput<'_>>,
+    ) -> Result<GenerationResponse> {
+        let Some(live) = live else {
+            return self.guarded(what, self.client.generate(request)).await;
+        };
+
+        let drain = async {
+            use futures::StreamExt;
+            use ollama_rs::error::OllamaError;
+
+            // Not `Ollama::generate_stream`: it parses each network chunk on its
+            // own and silently drops a JSON line split across two chunks — a lost
+            // token in the *answer*, not just the display. Buffer to newlines.
+            let mut body = serde_json::to_value(&request)?;
+            body["stream"] = serde_json::Value::Bool(true);
+            let res = self
+                .http
+                .post(format!("{}api/generate", self.client.url_str()))
+                .json(&body)
+                .send()
+                .await?;
+            if !res.status().is_success() {
+                let status = res.status();
+                let detail = res.text().await.unwrap_or_default();
+                return Err(OllamaError::Other(format!("{status}: {detail}")));
+            }
+
+            let mut bytes = res.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut text = String::new();
+            let mut last: Option<GenerationResponse> = None;
+            let mut emitted_at = std::time::Instant::now();
+            let mut emitted_len = 0;
+
+            while let Some(chunk) = bytes.next().await {
+                buf.extend_from_slice(&chunk?);
+                for line in take_lines(&mut buf) {
+                    if let Some(part) = parse_ndjson_line(&line)? {
+                        text.push_str(&part.response);
+                        last = Some(part);
+                    }
+                }
+                if text.len() > emitted_len && emitted_at.elapsed() >= STREAM_EMIT_EVERY {
+                    live.sink.emit(StepEvent::Streaming { tool: live.tool.to_string(), text: text.clone() });
+                    emitted_at = std::time::Instant::now();
+                    emitted_len = text.len();
+                }
+            }
+            // A last line without a trailing newline.
+            if let Some(part) = parse_ndjson_line(&buf)? {
+                text.push_str(&part.response);
+                last = Some(part);
+            }
+            // The tail always goes out, even inside the throttle window —
+            // otherwise the last ~300 ms of the answer never reaches the UI.
+            if text.len() > emitted_len {
+                live.sink.emit(StepEvent::Streaming { tool: live.tool.to_string(), text: text.clone() });
+            }
+
+            let mut done =
+                last.ok_or_else(|| OllamaError::Other("stream ended without a response".into()))?;
+            // No `done: true` line means the answer was cut off (Ollama crashed or
+            // ran out of memory, the connection dropped). Passing the half-answer
+            // on would let role C write a report from half a sentence, with no
+            // timing figures; fail the step instead, as the one-shot call would.
+            if !done.done {
+                return Err(OllamaError::Other(
+                    "stream ended before the model finished its answer".into(),
+                ));
+            }
+            done.response = text;
+            Ok(done)
+        };
+        self.guarded(what, drain).await
     }
 
     /// The options every request carries: bounded context, bounded threads,
@@ -643,13 +750,15 @@ Return JSON only. No prose, no markdown, no code fences.",
         Ok(response.response.trim().to_string())
     }
 
-    /// Analysis step (`summarize` / `compare_to_sop`) on the resident model:
-    /// `instruction` + accumulated `evidence` + the user's ask → prose.
+    /// Analysis step (`summarize` / `compare_to_sop` / `assess`) on the resident
+    /// model: `instruction` + accumulated `evidence` + the user's ask → prose,
+    /// streamed to `live` as it is written.
     pub async fn analyze(
         &self,
         instruction: &str,
         evidence: &str,
         user_prompt: &str,
+        live: Option<LiveOutput<'_>>,
     ) -> Result<String> {
         // A real system prompt: the fee/arithmetic instruction was previously a
         // tail sentence on the user message, competing with a wall of evidence
@@ -673,7 +782,7 @@ schedule — every domain is in scope. Rules:
         .keep_alive(KeepAlive::Indefinitely);
 
         let started = std::time::Instant::now();
-        let response = self.guarded("analysis", self.client.generate(request)).await?;
+        let response = self.generate_prose("analysis", request, live).await?;
         self.record_timing("analysis", &self.llm_model, started, Some(&response));
 
         tracing::debug!(
@@ -689,7 +798,7 @@ schedule — every domain is in scope. Rules:
     /// `answer_directly`: a request with no attachments, no knowledge-base need
     /// and no earlier conversation. [`Self::analyze`] can't serve it — its system
     /// prompt forbids answering beyond the evidence, and here there is none.
-    pub async fn respond(&self, user_prompt: &str) -> Result<String> {
+    pub async fn respond(&self, user_prompt: &str, live: Option<LiveOutput<'_>>) -> Result<String> {
         let system = "\
 You are TrustCore AI, an offline assistant for industrial and business documents
 (inspection reports, SOPs, invoices, rate cards, contracts). Answer briefly. If
@@ -703,7 +812,7 @@ equipment or plant — none were provided.";
             .keep_alive(KeepAlive::Indefinitely);
 
         let started = std::time::Instant::now();
-        let response = self.guarded("respond", self.client.generate(request)).await?;
+        let response = self.generate_prose("respond", request, live).await?;
         self.record_timing("respond", &self.llm_model, started, Some(&response));
         Ok(response.response.trim().to_string())
     }
@@ -755,6 +864,34 @@ equipment or plant — none were provided.";
         self.record_timing("session-summary", &self.llm_model, started, Some(&response));
         Ok(response.response.trim().to_string())
     }
+}
+
+/// Remove every complete (`\n`-terminated) line from `buf`; a partial last line
+/// stays in `buf` until the rest of it arrives.
+fn take_lines(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        lines.push(buf.drain(..=nl).collect());
+    }
+    lines
+}
+
+/// One line of Ollama's streamed reply. Blank → `None`. `{"error": …}` (Ollama
+/// reports mid-stream failures that way) and anything unparseable are errors,
+/// never silently skipped.
+fn parse_ndjson_line(
+    line: &[u8],
+) -> std::result::Result<Option<GenerationResponse>, ollama_rs::error::OllamaError> {
+    // (Not `trim_ascii`: that is Rust 1.80 and the workspace targets 1.77.
+    // serde_json skips surrounding whitespace itself.)
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_slice(line)?;
+    if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+        return Err(ollama_rs::error::OllamaError::Other(err.to_string()));
+    }
+    Ok(Some(serde_json::from_value(value)?))
 }
 
 /// Split `http://host:port` into the pieces `ollama-rs` expects.
@@ -830,6 +967,105 @@ mod tests {
         // Embeddings (or an older Ollama) give no breakdown: wall time only.
         let bare = CallTiming::new("embeddings", "nomic", Duration::from_millis(5), None);
         assert_eq!((bare.wall_ms, bare.prefill_ms, bare.decode_tok_per_s()), (5, None, None));
+    }
+
+    /// The reason `generate_prose` doesn't use `Ollama::generate_stream`: a JSON
+    /// line split across two network chunks must be kept, not dropped.
+    #[test]
+    fn ndjson_lines_survive_a_split_across_chunks() {
+        let mut buf = br#"{"model":"m","created_at":"t","response":"2.0"#.to_vec();
+        assert!(take_lines(&mut buf).is_empty(), "half a line is not a line yet");
+        buf.extend_from_slice(b"0%\",\"done\":false}\n{\"model\":\"m\"");
+        let lines = take_lines(&mut buf);
+        assert_eq!(lines.len(), 1);
+        let part = parse_ndjson_line(&lines[0]).unwrap().unwrap();
+        assert_eq!(part.response, "2.00%");
+        assert_eq!(buf, br#"{"model":"m""#, "the next partial line stays buffered");
+
+        assert!(parse_ndjson_line(b"  \n").unwrap().is_none());
+        let err = parse_ndjson_line(br#"{"error":"model not found"}"#).unwrap_err();
+        assert!(err.to_string().contains("model not found"), "{err}");
+    }
+
+    /// End to end against a fake Ollama: slow, split chunks in; the full text,
+    /// throttled `Streaming` events and the `done` chunk's timings out.
+    #[tokio::test]
+    async fn streamed_answer_is_complete_throttled_and_timed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 64 * 1024];
+            let _ = sock.read(&mut req).await.unwrap();
+            let line = |r: &str| {
+                format!(r#"{{"model":"m","created_at":"t","response":"{r}","done":false}}"#) + "\n"
+            };
+            let done = r#"{"model":"m","created_at":"t","response":"","done":true,"load_duration":1000000,"prompt_eval_count":12,"prompt_eval_duration":5000000,"eval_count":3,"eval_duration":3000000}"#;
+            let first = line("Fee is ");
+            let (a, b) = first.split_at(20); // split mid-JSON
+            let writes = [
+                ("HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n".to_string(), 0),
+                (a.to_string(), 0),
+                (b.to_string(), 50),
+                (line("2.00"), 400),
+                (line("%"), 400),
+                (format!("{done}\n"), 10),
+            ];
+            for (w, pause_ms) in writes {
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+                sock.write_all(w.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+
+        let engine = OllamaEngine::new(&format!("http://127.0.0.1:{port}"), "m", "v", "e");
+        let sink = crate::events::VecSink::new();
+        let live = LiveOutput { sink: &sink, tool: "assess" };
+        let text = engine.analyze("task", "evidence", "ask", Some(live)).await.unwrap();
+        assert_eq!(text, "Fee is 2.00%", "no token lost across the split");
+
+        let streamed: Vec<String> = sink
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                StepEvent::Streaming { tool, text } if tool == "assess" => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(!streamed.is_empty() && streamed.len() <= 3, "throttled: {streamed:?}");
+        assert!(streamed.windows(2).all(|w| w[1].starts_with(&w[0])), "full text, growing: {streamed:?}");
+        assert_eq!(streamed.last().unwrap(), "Fee is 2.00%", "the tail is always sent");
+
+        let t = &engine.timings()[0];
+        assert_eq!((t.role.as_str(), t.prompt_tokens, t.gen_tokens), ("analysis", Some(12), Some(3)));
+    }
+
+    /// Ollama dies mid-answer: the partial text must surface as an error, not
+    /// as a finished answer (found in review by the fix session).
+    #[tokio::test]
+    async fn a_stream_cut_off_before_done_is_an_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = vec![0u8; 64 * 1024];
+            let _ = sock.read(&mut req).await.unwrap();
+            let reply = "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n\
+                         {\"model\":\"m\",\"created_at\":\"t\",\"response\":\"The fee is\",\"done\":false}\n";
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            // ...and the socket closes: no `done: true` line ever arrives.
+        });
+
+        let engine = OllamaEngine::new(&format!("http://127.0.0.1:{port}"), "m", "v", "e");
+        let sink = crate::events::VecSink::new();
+        let live = LiveOutput { sink: &sink, tool: "assess" };
+        let err = engine.analyze("task", "evidence", "ask", Some(live)).await.unwrap_err();
+        assert!(err.to_string().contains("before the model finished"), "{err}");
+        assert!(engine.timings().is_empty(), "a cut-off call is not timed as a success");
     }
 
     #[test]

@@ -41,6 +41,12 @@ pub enum StepEvent {
         elapsed_ms: u128,
     },
 
+    /// A prose model call's answer so far, while it is still being written.
+    /// `text` is the **full** text to date, not a delta, so a dropped or
+    /// repeated event can't garble the display. Throttled to ~3/s. Not a
+    /// stage: the UI keeps it out of the stepper's event list.
+    Streaming { tool: String, text: String },
+
     /// A non-fatal problem the user should see: a skipped attachment, a step that
     /// timed out and left the report degraded, an oversized prompt. The run keeps
     /// going. `detail` is optional context for the log and a tooltip.

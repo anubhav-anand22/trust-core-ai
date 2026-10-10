@@ -1228,6 +1228,86 @@ in the no-evidence smoke test). **Not yet measured**: compare the `e2e` timing
 table on 2218be8 vs this. Watch `gen_tok` on the `analysis` row: sitting at
 640 means the cap is truncating.
 
+**Measured (2026-10-11, teammate's laptop, qwen2.5:1.5b, ~85 tok/s decode, so
+GPU-class, not the CPU target).** `103ddaf` vs `713c937`, same prompt and files:
+
+| | before (summarize + compare_to_sop) | after (assess) |
+|---|---|---|
+| analysis calls | 2 | 1 |
+| analysis wall | 7.7 + 7.2 = **14.9 s** | **5.2 s** |
+| prompt tokens read | 1842 + 1855 = 3697 | 1929 |
+| tokens generated | 582 + 484 = 1066 | 391 (cap 640: not truncated) |
+| role C prompt tokens | 3167 | 2487 |
+
+The evidence fitted the budget, so neither version re-embedded it: the
+embedding saving shows only on long documents. The two runs were made in the
+wrong order (after cold, before warm), so turn wall and `load_ms` are **not**
+comparable. The analysis rows are, since load ≈ 0 in both. **Open quality
+question:** one call wrote 391 tokens where the pair wrote 1066, and the report
+had 2 findings vs 5. One sample each and sampling noise is large, so this needs
+a few repeated warm runs per version before calling it a regression or not.
+
+**Repeated warm runs (3 per version, alternating, after one warm-up).** They
+answered the quality question and raised a bigger one.
+- *M's quality: not a regression.* Only one of the six runs drew the plan with
+  both analysis steps (after-2). Its `assess` wrote 380 tokens in 4.7 s, and
+  the report had 6 findings and the only non-empty `citations` of the six. The
+  earlier "2 findings vs 5" was sampling noise. "briefly" stays.
+- *The planner dominates everything.* Six runs, five different plans: the
+  photo was skipped in 3/6, the SOP search in 3/6, analysis in 2/6. One run
+  planned the PDF alone, with no analysis. Turn time ranged 6–25 s purely on
+  plan shape, and the 6 s runs gave the worst answers. The validator only
+  checks that a plan is *runnable*, not that it does what was asked: an
+  attachment no step reads is only a warning. Logged as B5.
+- `citations` empty in 5/6 (B3). Memory-proposal junk in 4/6 ("Not
+  Provided", "safety_note_1", "Unit-2 Pump P-101"); every one of those would
+  be dropped by the B4 screen.
+
+## Feature pass — part 17: watch the answer being written
+
+On a CPU an analysis step decodes for minutes while the UI shows "Executing:
+assess". Nothing is wrong, but it looks hung. Streaming changes when the user
+sees the text, not how long it takes: same request, same tokens.
+
+- **Backend (FEATURE).** `StepEvent::Streaming { tool, text }` carries the
+  *full* text so far, not a delta, so a dropped or repeated event can't garble
+  it. It is throttled to one event per ~300 ms, and the tail is always sent.
+  `OllamaEngine::generate_prose` serves `analyze()` and `respond()`. The whole
+  stream drain runs inside `guarded()`, so timeout and Stop still interrupt
+  mid-answer. The returned value is the `done` chunk with the full text, so the
+  part-15 timings are unchanged. The tool label matches the stepper's,
+  including `· deep read i/n`.
+- **Frontend (FIX).** `liveText` is kept *out of* `events`. In `events` it would
+  become the stepper's "current stage" and churn the activity list and audit
+  sidebar. The logger skips streaming events (otherwise one `ui_log` per chunk).
+  After a Stop the box stays, labelled as partial output.
+- **The trap.** `ollama-rs`'s `generate_stream` parses each network chunk on
+  its own and `filter_map(Result::ok)`s the result. A JSON line split across
+  two chunks is silently dropped: a missing token *in the answer*, possibly a
+  digit of a fee. The final chunk is the largest (it carries the `context`
+  array), so it is the likeliest to split, and losing it would also lose the
+  timings. So `generate_prose` reads the NDJSON itself with `reqwest` (the 0.12
+  `ollama-rs` already builds) and buffers to newlines. A `{"error":…}` line or
+  unparseable JSON is an error, never a skip. A test drives a fake Ollama on
+  localhost with a line split mid-JSON and slow chunks.
+- **Caught in review (FIX):** a stream that ends *without* a `done: true` line
+  (Ollama crashed or ran out of memory, the connection dropped) was returned
+  as a finished answer: half a sentence into role C, and no timings. Now it is
+  an error, like the one-shot call; a fake-server test closes the socket
+  mid-answer.
+- **Not streamed:** roles A/B/C. Their output is schema-constrained JSON.
+  Role C's liveness is a possible follow-up (e.g. a token counter).
+- **B1b (with this change):** `examples/e2e.rs` now calls `init_thread_pools`
+  with physical cores − 1 (via `sysinfo` as a dev-dependency, same 0.33 as the
+  host) and prints it. After B1 it would otherwise use a logical/2 guess, which
+  on a non-SMT CPU is far fewer threads than the app. e2e also stops printing
+  streaming events.
+
+`cargo test -p workbench-core -j 1` → **54/54** (split-line parsing, the
+fake-server tests for full text, throttle, tail, timings and a cut-off
+stream); FIX re-ran tauri-app 41/41 against the new signatures. The live
+streaming in the app is **untested** until a real turn runs.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass
