@@ -37,10 +37,19 @@ pub const LLM_FLOOR: LlmSpec = LlmSpec {
 
 | Tier | Condition (no GPU) | Model | Why |
 |---|---|---|---|
-| standard | ≥6 physical cores **and** ≥10 GB RAM free | `qwen2.5:3b-instruct` | enough cores to keep 3B responsive |
-| **floor** | ≥4 physical cores **and** ≥5 GB free | `qwen2.5:1.5b-instruct` | the target machine; slow-ish but always usable |
-| minimal | ≥2 physical cores **and** ≥3 GB free | `qwen2.5:0.5b-instruct` | rough answers, but it runs |
+| standard | ≥6 physical cores **and** ≥14 GiB total RAM | `qwen2.5:3b-instruct` | enough cores to keep 3B responsive |
+| **floor** | ≥4 physical cores **and** ≥7 GiB total | `qwen2.5:1.5b-instruct` | the target machine; slow-ish but always usable |
+| minimal | ≥2 physical cores **and** ≥3.5 GiB total | `qwen2.5:0.5b-instruct` | rough answers, but it runs |
 | unusable | anything less | (minimal, with a refusal in the tier label) | be honest |
+
+**Total RAM, not free RAM (changed 2026-10-10).** The ladder used to read
+*available* RAM, so the tier changed between launches — open a browser, lose a
+tier. The tier is a property of the machine; thresholds sit just under what
+"16 / 8 / 4 GB" laptops actually report. Free RAM is still checked, but by
+`assess_llm` as a live warning: *blocked* only when the model can't fit in total
+RAM, *caution* ("close other apps first") when it fits but not beside what is
+open. That second case matters on a CPU: weights swapped out mid-generation is
+exactly what a desktop freeze feels like.
 
 GPU machines take a separate branch keyed on VRAM, but it *also* checks system RAM
 now — a big VRAM card in an 8 GB box was previously handed a 7B it could not host.
@@ -90,6 +99,16 @@ model is warmed (the per-model *runner* is a lazily-spawned child process, so th
 first call misses it). Inference stays exactly as fast — below-normal only yields
 a core when something else genuinely needs it — but the desktop can no longer be
 starved.
+
+**On Linux this was silently a no-op until 2026-10-10.** The official
+`install.sh` runs Ollama as a systemd service under its own `ollama` system user,
+and an unprivileged process can only `renice` processes it owns — so the call
+failed with "Operation not permitted" and the error was swallowed. That is how a
+2-core laptop still froze for minutes despite this section existing. Linux now
+installs a **per-user** Ollama and the app starts `ollama serve` itself, so the
+server is yours and the priority drop applies. Check it with
+`ps -eo user,ni,args | grep "ollama serve"` — your username, and `5` in the `NI`
+column once a model has been warmed. (Execution log part 10.)
 
 ## When a turn takes too long
 

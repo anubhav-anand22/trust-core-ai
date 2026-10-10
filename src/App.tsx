@@ -11,9 +11,11 @@ import { ReportView } from "./components/ReportView";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { Stepper } from "./components/Stepper";
 import {
+  confirmMemory,
   deleteSession,
-  endSession,
   fileToUpload,
+  forgetMemory,
+  getMemory,
   listSessions,
   loadSession,
   renameSession,
@@ -25,6 +27,7 @@ import { installGlobalErrorLogging, log } from "./lib/log";
 import type {
   Exchange,
   FinalReport,
+  MemoryFact,
   ModelPlan,
   SessionMeta,
   StepEvent,
@@ -98,6 +101,10 @@ function App() {
   const [exampleText, setExampleText] = useState("");
   const [exampleToken, setExampleToken] = useState(0);
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
+  // Cross-chat memory: only facts the user explicitly confirmed. Shared by every
+  // session, which is the point — and safe, because nothing lands here
+  // automatically (the automatic digest fold is what used to leak between chats).
+  const [memory, setMemory] = useState<MemoryFact[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<{ message: string; detail?: string | null }[]>([]);
 
@@ -149,18 +156,25 @@ function App() {
     loadSession(sessionId)
       .then((s) => setTranscript(s.exchanges ?? []))
       .catch(() => setTranscript([])); // brand-new session: nothing on disk yet
+    getMemory()
+      .then(setMemory)
+      .catch((e) => log.error("get_memory failed", { error: String(e) }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist long-term memory when the window is closing/reloading.
-  useEffect(() => {
-    const onUnload = () => {
-      log.info("window closing; persisting long-term memory");
-      endSession(sessionId).catch(() => {});
-    };
-    window.addEventListener("beforeunload", onUnload);
-    return () => window.removeEventListener("beforeunload", onUnload);
-  }, [sessionId]);
+  function remember(fact: MemoryFact) {
+    log.info("user confirmed a memory fact", { key: fact.key });
+    confirmMemory(fact)
+      .then(setMemory)
+      .catch((e) => log.error("confirm_memory failed", { error: String(e) }));
+  }
+
+  function forget(key: string) {
+    log.info("user forgot a memory fact", { key });
+    forgetMemory(key)
+      .then(setMemory)
+      .catch((e) => log.error("forget_memory failed", { error: String(e) }));
+  }
 
   useEffect(() => {
     const el = transcriptRef.current;
@@ -301,7 +315,6 @@ function App() {
 
   async function switchTo(id: string) {
     if (busy || id === sessionId) return;
-    await endSession(sessionId).catch(() => {});
     setSessionId(id);
     persistId(id);
     clearLive();
@@ -316,7 +329,6 @@ function App() {
 
   async function newChat() {
     if (busy) return;
-    await endSession(sessionId).catch(() => {});
     const id = newSessionId();
     setSessionId(id);
     persistId(id);
@@ -430,7 +442,9 @@ function App() {
                       </div>
                     )}
                   </div>
-                  {x.report && <ReportView report={x.report} />}
+                  {x.report && (
+                    <ReportView report={x.report} remembered={memory} onRemember={remember} />
+                  )}
                 </div>
               ))}
 
@@ -462,7 +476,9 @@ function App() {
                     </ul>
                   )}
                   {fatal && <div className="fatal">Error: {fatal}</div>}
-                  {report && <ReportView report={report} />}
+                  {report && (
+                    <ReportView report={report} remembered={memory} onRemember={remember} />
+                  )}
                 </div>
               )}
             </div>
@@ -476,7 +492,7 @@ function App() {
             />
           </section>
 
-          <AuditSidebar events={events} plan={plan} />
+          <AuditSidebar events={events} plan={plan} memory={memory} onForget={forget} />
         </main>
       </div>
 

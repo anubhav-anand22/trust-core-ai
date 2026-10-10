@@ -8,8 +8,25 @@
 | VS 2022 Build Tools (C++ workload) | the linker; whisper.cpp | `winget install Microsoft.VisualStudio.2022.BuildTools` + "Desktop development with C++" |
 | CMake | builds whisper.cpp | `winget install Kitware.CMake` |
 | LLVM | `libclang` for `whisper-rs`'s bindgen step | `winget install LLVM.LLVM` |
+| protoc | `lance-encoding`'s build script compiles protobuf schemas | `winget install Google.Protobuf` |
 | Node 20+ | the frontend | `winget install OpenJS.NodeJS` |
 | Ollama | runs the LLMs | `winget install Ollama.Ollama` |
+
+### Linux (Ubuntu 26.04, set up from nothing on 2026-10-10)
+
+```bash
+sudo apt install build-essential curl wget file cmake clang libclang-dev pkg-config \
+  libwebkit2gtk-4.1-dev libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev \
+  zstd protobuf-compiler
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+curl -fsSL https://fnm.vercel.app/install | bash && fnm install 22
+export LIBCLANG_PATH=/usr/lib/llvm-21/lib       # whichever llvm-* is installed
+```
+
+No Ollama install is needed. The app installs a per-user copy on first launch
+(README walkthrough step 1). If you launch from **snap-packaged VS Code** and the
+app dies with `symbol lookup error: /snap/core20/...`, see the README gotcha:
+the snap exports GTK variables that point at its own older glibc.
 
 ## Environment (every shell before `cargo`)
 

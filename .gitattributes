@@ -1,0 +1,17 @@
+# Normalise line endings in the repo; the team works across Windows and Linux.
+# Existing files are NOT renormalised here (that would be one huge diff) —
+# they pick up LF the next time each one is edited and committed.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF or cmd.exe misparses them.
+*.bat text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.wav binary
+*.rten binary
+*.bin binary

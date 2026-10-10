@@ -952,12 +952,221 @@ for two minutes needs the *app*, not the README, to keep explaining itself. The
 right home for that is whatever panel is already permanent, not whichever one
 happens to be easiest to add text to.
 
+## Hackathon fix pass — part 10: no admin password, and why renice never ran on Linux
+
+Two reports from the first Linux machine, which looked unrelated: installing
+"never asked for the admin password, it just sat there," and a first turn that
+**froze the whole desktop** for ~10 minutes on a 2-core i7-4600U.
+
+### One root cause
+
+On Linux, `ensure_ollama_installed` ran `curl -fsSL https://ollama.com/install.sh | sh`.
+That script installs system-wide and elevates itself with `sudo` — binary in
+`/usr/local/bin`, a dedicated **`ollama` system user**, a systemd service running
+as that user. Both symptoms fall out of that one fact:
+
+1. **The password prompt had nowhere to go.** `sudo` needs a terminal (or an
+   askpass helper). The app spawns the script as a plain child of a desktop
+   process with neither, so the elevation request didn't fail loudly — it just
+   never surfaced.
+2. **The anti-freeze guard silently did nothing.** `lower_ollama_priority()`
+   `renice`s every `ollama*` process so the window manager always wins a
+   contested core (problem 5). `renice` only works on processes **you own**; the
+   systemd-managed server belongs to `ollama`, so it failed with "Operation not
+   permitted" — swallowed by `.ok()`, logged at debug. On the standard Linux
+   install the one protection against a freeze never applied.
+
+Windows never showed either: `OllamaSetup.exe` installs per-user with no UAC
+prompt, and the server runs as you.
+
+### The fix (Linux only — Windows/macOS untouched)
+
+`ensure_ollama_installed_linux`: download the official release asset into
+`~/.local/share/trustcore-ai/ollama` and run `ollama serve` as the app's own
+detached child. No root anywhere, and since the process is yours, `renice` works.
+With no systemd unit to auto-start it, `is_ollama_installed` (which the bootstrap
+screen calls first on every launch) now restarts the server whenever it finds the
+binary but no listener — otherwise a reboot would leave "installed" reported
+while every model call failed. `is_ollama_installed` became `async` for that;
+the JS call site is unchanged because `invoke()` is always a promise.
+
+### The guess that was wrong
+
+The first draft downloaded `ollama.com/download/ollama-linux-amd64.tgz`. **404.**
+The GitHub releases API showed current releases ship `ollama-linux-amd64.tar.zst`
+— zstd, not gzip — so the URL became
+`github.com/ollama/ollama/releases/latest/download/ollama-linux-{arch}.tar.zst`
+and extraction `tar --zstd`. It was caught only because the download was actually
+run before anyone called it fixed.
+
+### Verified on the real machine
+
+Download (200, 1.4 GB, no sudo) → `tar --zstd` (layout `bin/ollama` +
+`lib/ollama/*.so`, including `libggml-cpu-haswell.so` for this CPU) → `ollama
+serve` bound `127.0.0.1:11434` in ~1 s → `ps` showed the server owned by the user
+→ `renice -n 5` succeeded (0→5) → idle 15 s at 0.3% CPU. Then through the real
+app: the bootstrap screen started the server itself in ~0.5 s.
+
+### Takeaway
+
+Two symptoms with one cause are common when the cause is "who owns this
+process." Before patching each, ask what both have in common. And a
+best-effort call whose error is swallowed (`renice … || .ok()`) can be a no-op
+in production for months — log *why* it did nothing, not just that it did.
+
+## Hackathon fix pass — part 11: "hi" parks the turn, and every timestamp is 0
+
+Two small bugs found by reading code, not by a report.
+
+### An empty fallback plan
+
+Part 4 added a deterministic fallback so an exhausted planner could never
+dead-end. `fallback_plan` builds one extraction step per attachment, plus a KB
+search if needed, plus analysis on top. For a message with **no attachments, no
+KB need and no history** — "hi" on a fresh chat — every branch was skipped and it
+returned `Plan { steps: [] }`. `validate_plan`'s very first rule rejects empty
+plans, so the fallback failed and the turn parked in the HITL modal: the one
+input a 0.5B model is most likely to fumble was the one the safety net didn't
+catch.
+
+There was no task that *could* answer it: `answer_followup` refuses an empty
+transcript, and analysis steps need evidence before them. The fix is a new
+`answer_directly` task — stage **Retrieve**, not Analyze, because the stage rules
+require every Analyze step to follow an evidence step and this one has none. It
+gets its own engine call (`OllamaEngine::respond`) because `analyze`'s system
+prompt forbids answering beyond the evidence, which with no evidence would have
+produced "the evidence does not say."
+
+An existing test, `truly_empty_fallback_still_parks`, **asserted** the park as the
+one legitimate dead end. It was written when no task could answer such a message,
+and it encoded exactly the behaviour being fixed — so it was rewritten, not
+deleted, and a new test keeps the park path covered for the case that genuinely
+can't run (an attachment missing from disk).
+
+A side effect worth stating plainly: that empty-plan case was the only practical
+way to reach the HITL modal from the GUI. See README problem 11.
+
+### `"ts": 0` on every saved turn
+
+`pipeline.rs` built each `Exchange` with `ts: 0, // filled in by record_turn
+from the clock`. `record_turn` used `exchange.ts` only to compute `updated_at`
+(`0.max(now)` — so the sidebar's sort looked right) and then pushed the exchange
+unchanged. Every turn ever saved had `"ts": 0`. Invisible because the UI never
+renders it, but visible to anyone opening the session file. Now `ts == 0` means
+"stamp it here."
+
+### Takeaway
+
+A comment that says code does something is a claim, not a fact — check it. And
+when a test fails after a fix, read what it *asserts* before "fixing" the test or
+the code: sometimes the test is the bug's specification.
+
+## Hackathon fix pass — part 12: memory, rebuilt as propose → you confirm
+
+Part 8 found the cross-session leak and switched cross-chat memory off. This is
+the real fix it pointed at.
+
+### What actually leaked
+
+Not "a shared file" — sharing across chats is what facility memory is *for* (the
+plant name and equipment tags you shouldn't have to repeat). The leak was the
+**automatic** copy: `persist_long_term` folded each chat's prose summary into the
+shared store after every turn, and every other chat read it as background.
+
+### The shape it became
+
+Only facts the user explicitly confirms ever cross a chat boundary.
+
+- **Proposing costs nothing extra.** `FinalReport` gained `memory_proposals:
+  Vec<MemoryFact>` (`#[serde(default)]`), and role C's prompt asks for at most
+  three facility facts *stated in the request or evidence* — on the report call
+  that already happens. No extra model call on a CPU where every call is minutes.
+- **Storing needs a click.** `confirm_memory` / `forget_memory` Tauri commands
+  write `facility_metadata` through the existing AES-GCM `persist`. The report
+  shows *Remember / Dismiss*; the audit sidebar lists what's remembered with ×.
+- **Deleted:** `GLOBAL_MEMORY_ENABLED`, `persist_long_term`, the `end_session`
+  command and its three frontend call sites (window close, new chat, switch).
+- **Old files migrate themselves.** `history_digest` stayed on the struct as
+  `#[serde(default, skip_serializing)]`: an old file still decrypts, the digest
+  is never read into a prompt and never written back, so the first confirm
+  cleans it. No migration code.
+- **No nagging.** Before `Done`, proposals already stored are dropped; in the UI,
+  a proposal matching a remembered fact is hidden, and Dismiss is per-view.
+
+### Risk
+
+A 0.5B model under structured output now has one more (optional) array to fill.
+If its JSON gets worse, the existing plain-text fallback catches it; the signal
+in the log is `compiler returned bad JSON`.
+
+### Takeaway
+
+When a stopgap disables a feature, write down what was actually wrong *with* it —
+here, "automatic," not "shared." That one word is the difference between a
+redesign and a one-line gate.
+
+## Hackathon fix pass — part 13: the bootstrap screen, tiers and installed models
+
+### Tier from total RAM, not available RAM
+
+`recommend_models` gated the CPU ladder on *available* RAM. That moved with
+whatever else was open, so the tier changed between launches — open a browser,
+lose a tier, and a judge relaunching sees a different model. The tier is a
+property of the machine; whether the model fits *right now* is a separate, live
+question. Now: tier from **total** RAM (thresholds 14 / 7 / 3.5 GiB, just under
+what "16 / 8 / 4 GB" laptops report), and `assess_llm` answers the live question
+— *blocked* only when the model can't fit in total RAM, *caution* ("close other
+apps") when it fits but not beside what's open.
+
+Why not total RAM for everything: the weights must stay resident during
+generation. "Fits on paper" with the rest swapped out means every token pages,
+and that is what a freeze feels like. The live caution keeps that visible
+without making the tier jumpy. On the dev laptop it changes nothing: 2 physical
+cores keep it on 0.5B however much RAM it has — a test now says so.
+
+### Installed models
+
+`ensure_models` already skipped models that were present. What was wrong was
+everything the user *saw*: a fixed dropdown with no installed marker, a download
+figure that counted all three models even when installed, and no sign of other
+local models. Now `probe_system` lists local tags; the figure counts only
+`missing_models`; the dropdown marks *(installed)* and appends local non-catalogue
+models as *(installed, untested)*; the button says **Start** when nothing will
+download. "Is it installed?" has one definition, `model_present`, used by the
+screen and the pull loop alike, so the two can't disagree. The frontend gets tags
+with `:latest` stripped and does exact matching only.
+
+Linux wrinkle from part 10: a per-user server can't read models an old
+system-wide install left under `/usr/share/ollama`. Reading them needs sudo — the
+thing part 10 removed — so the screen just explains why they'll re-download.
+
+## Hackathon fix pass — part 14: a Linux build machine from nothing
+
+The first Linux build machine had no compiler at all. Three things not in the
+README cost time:
+
+- **`protoc`.** `lance-encoding`'s build script compiles protobuf schemas and
+  fails with *Could not find `protoc`* after ~14 minutes of compiling everything
+  before it. Not optional; now in the prerequisites table.
+- **VS Code from the snap store.** The binary built fine and crashed on launch:
+  `symbol lookup error: /snap/core20/.../libpthread.so.0`. Snap VS Code exports
+  `GTK_PATH`, `GIO_MODULE_DIR`, `LOCPATH`… into every terminal it opens, so GTK
+  loaded modules linked against the snap's older glibc. Not our code — but it
+  looks exactly like ours is broken. The README gotcha has the `env -u …` line.
+- **`npm install` rewrites `package-lock.json`** on a different npm version
+  (dropped `libc` fields). Restored with `git checkout` rather than committed —
+  lockfile churn from tooling versions is merge noise for everyone else.
+
+Measured on the 2-core i7-4600U with `-j 1`: ~26 min for `cargo test -p
+workbench-core` from cold, +20 min for the Tauri crate, ~15 s incremental.
+
 ## Where it ended
 
-Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`
-and `cargo test -p tauri-app -j 1 --lib` green; `tsc` clean;
-`cargo check --workspace` clean. Not yet verified end-to-end against a running
-model. `feature/sovereign-workbench`.
+Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass
+(parts 10–14). `cargo test -p workbench-core -j 1` → **44/44**;
+`cargo test -p tauri-app -j 1` → **20/20**; `tsc` clean. The Linux bootstrap path
+(per-user Ollama, tier, probe) was exercised in the running app; a full model
+turn on the new code has **not** been run yet. `feature/sovereign-workbench`.
 
 ### Takeaways for an aspiring engineer
 

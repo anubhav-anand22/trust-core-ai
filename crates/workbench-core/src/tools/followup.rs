@@ -58,3 +58,37 @@ impl Tool for AnswerFollowupTool {
         }
     }
 }
+
+/// `answer_directly` — a request with nothing to read: no files, no knowledge
+/// base, no earlier turn. The sibling of [`AnswerFollowupTool`] for a fresh chat;
+/// without it a plain "hi" had no valid plan at all.
+pub struct AnswerDirectlyTool;
+
+#[async_trait::async_trait]
+impl Tool for AnswerDirectlyTool {
+    fn name(&self) -> &'static str {
+        "answer_directly"
+    }
+
+    async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+        let started = std::time::Instant::now();
+        match ctx.engine.respond(ctx.prompt).await {
+            Ok(text) => Ok(ToolResult {
+                step_id: step.id.clone(),
+                task: self.name().into(),
+                ok: true,
+                data: serde_json::json!({ "text": text, "source": "direct" }),
+                error: None,
+                warning: None,
+                elapsed_ms: started.elapsed().as_millis(),
+            }),
+            Err(crate::CoreError::Cancelled) => Err(crate::CoreError::Cancelled),
+            Err(e) => Ok(ToolResult::failure(
+                &step.id,
+                self.name(),
+                e.to_string(),
+                started.elapsed().as_millis(),
+            )),
+        }
+    }
+}

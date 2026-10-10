@@ -132,6 +132,7 @@ pub fn default_registry() -> ToolRegistry {
         .register(Box::new(vision::VisionTool))
         .register(Box::new(rag::RagTool))
         .register(Box::new(followup::AnswerFollowupTool))
+        .register(Box::new(followup::AnswerDirectlyTool))
         .register(Box::new(analysis::AnalysisTool::summarize()))
         .register(Box::new(analysis::AnalysisTool::compare_to_sop()));
     registry

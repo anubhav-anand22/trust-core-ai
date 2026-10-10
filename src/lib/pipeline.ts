@@ -6,6 +6,7 @@ import { log, timed, type Fields } from "./log";
 import type {
   AuditPaths,
   LlmAssessment,
+  MemoryFact,
   ModelPlan,
   ModelProgress,
   SessionContext,
@@ -87,10 +88,20 @@ export const cancelTurn = () => {
   );
 };
 
-/** Fold the session's context into encrypted long-term memory. */
-export const endSession = (sessionId: string) =>
-  timed("end_session", { sessionId }, () =>
-    invoke<void>("end_session", { sessionId }),
+/** Facts the user has confirmed for cross-chat memory (encrypted on disk). */
+export const getMemory = () =>
+  timed("get_memory", undefined, () => invoke<MemoryFact[]>("get_memory"));
+
+/** Confirm a proposed fact. Returns the updated list. */
+export const confirmMemory = (fact: MemoryFact) =>
+  timed("confirm_memory", { key: fact.key }, () =>
+    invoke<MemoryFact[]>("confirm_memory", { key: fact.key, value: fact.value }),
+  );
+
+/** Forget a remembered fact. Returns the updated list. */
+export const forgetMemory = (key: string) =>
+  timed("forget_memory", { key }, () =>
+    invoke<MemoryFact[]>("forget_memory", { key }),
   );
 
 /** Past chat sessions, newest first, for the sidebar. */
@@ -105,7 +116,7 @@ export const loadSession = (sessionId: string) =>
     invoke<SessionContext>("load_session", { sessionId }),
   );
 
-/** Delete a session file (the long-term digest is kept). */
+/** Delete a session file. Confirmed cross-chat facts are separate and kept. */
 export const deleteSession = (sessionId: string) =>
   timed("delete_session", { sessionId }, () =>
     invoke<void>("delete_session", { sessionId }),

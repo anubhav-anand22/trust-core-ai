@@ -23,17 +23,15 @@ use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
 use bootstrap::hardware::detect_hardware;
-use bootstrap::models::{assess_llm, ensure_models, probe_system, LlmAssessment, ModelPlan};
+use bootstrap::models::{assess_model, ensure_models, probe_system, ModelPlan};
 use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed, lower_ollama_priority};
 use base64::Engine as _;
 use events::ChannelSink;
 use workbench_core::engine::OllamaEngine;
-use workbench_core::memory::{SessionContext, SessionMeta};
-use workbench_core::schemas::{FileKind, InputFile};
+use workbench_core::memory::{PersistentMemory, SessionContext, SessionMeta};
+use workbench_core::schemas::{FileKind, InputFile, MemoryFact};
 use workbench_core::tools::default_registry;
-use workbench_core::{
-    persist_long_term, CancelFlag, PipelineConfig, ProgressSink, StepEvent, TurnMode,
-};
+use workbench_core::{CancelFlag, PipelineConfig, ProgressSink, StepEvent, TurnMode};
 
 /// Where the local Ollama server listens. Fixed — this is an offline desktop app.
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -80,31 +78,47 @@ fn set_model_plan(plan: ModelPlan, state: State<'_, AppState>) {
     *state.model_plan.lock().expect("model_plan mutex poisoned") = Some(plan);
 }
 
-/// Judge a resident-model choice against this host, for the bootstrap override
-/// warning. Re-probes the hardware so the RAM figure reflects the machine's state
-/// right now, not whatever it was at first launch.
+/// Cross-chat memory: the facts the user has confirmed. Nothing reaches this
+/// store automatically — that automatic per-turn digest fold is what leaked one
+/// chat's context into another — so every entry here passed through
+/// [`confirm_memory`].
 #[tauri::command]
-fn assess_model(model: String) -> LlmAssessment {
-    let hw = detect_hardware();
-    let assessment = assess_llm(&model, &hw);
-    tracing::info!(
-        model = %model,
-        severity = %assessment.severity,
-        approx_ram_gb = assessment.approx_ram_gb,
-        warnings = assessment.warnings.len(),
-        "model assessment for override"
-    );
-    assessment
+fn get_memory(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Vec<MemoryFact>, String> {
+    let config = pipeline_config(&app, &state.plan())?;
+    Ok(PersistentMemory::load(&config.persistent_path()).facts())
 }
 
-/// Finalise a session: fold its rolling context into encrypted long-term memory.
-/// Safe to call at any time (e.g. window close, "new session" button).
+/// Store one proposed fact the user clicked "Remember" on. Returns the updated list.
 #[tauri::command]
-fn end_session(app: tauri::AppHandle, state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+fn confirm_memory(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<Vec<MemoryFact>, String> {
     let config = pipeline_config(&app, &state.plan())?;
-    let session = SessionContext::load_or_new(&config.session_path_for(&session_id), &session_id);
-    persist_long_term(&config, &session);
-    Ok(())
+    let path = config.persistent_path();
+    let mut memory = PersistentMemory::load(&path);
+    memory.confirm(&key, &value);
+    memory.persist(&path).map_err(|e| e.to_string())?;
+    tracing::info!(%key, "memory fact confirmed by user");
+    Ok(memory.facts())
+}
+
+/// Remove a remembered fact. Returns the updated list.
+#[tauri::command]
+fn forget_memory(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<Vec<MemoryFact>, String> {
+    let config = pipeline_config(&app, &state.plan())?;
+    let path = config.persistent_path();
+    let mut memory = PersistentMemory::load(&path);
+    memory.forget(&key);
+    memory.persist(&path).map_err(|e| e.to_string())?;
+    tracing::info!(%key, "memory fact forgotten by user");
+    Ok(memory.facts())
 }
 
 /// Move a pre-Stage-4 single `session_context.json` into `sessions/<id>.json`
@@ -149,7 +163,8 @@ fn load_session(
         .ok_or_else(|| format!("no session `{session_id}`"))
 }
 
-/// Delete a session file. `end_session`'s long-term digest is left intact.
+/// Delete a session file. Confirmed cross-chat facts live in a separate store
+/// and are left intact.
 #[tauri::command]
 fn delete_session(
     app: tauri::AppHandle,
@@ -607,7 +622,9 @@ pub fn run() {
             audit_paths,
             submit_turn,
             resume_turn,
-            end_session,
+            get_memory,
+            confirm_memory,
+            forget_memory,
             list_sessions,
             load_session,
             delete_session,

@@ -381,3 +381,10 @@ select:disabled, textarea:disabled, input:disabled {
 .hitl-editor { width: 100%; min-height: 220px; font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: 12px; }
 .hitl-json-error { color: var(--err); font-size: 12px; }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+
+/* Cross-chat memory: proposals under a report, confirmed list in the audit rail. */
+.report-memory ul,
+.memory-list { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 6px; }
+.memory-proposal { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.memory-proposal span { flex: 1; min-width: 12ch; }
+.memory-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 4px 8px; }

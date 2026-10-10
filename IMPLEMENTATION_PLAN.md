@@ -17,7 +17,7 @@
 | 4 | React UI: bootstrap gate, stepper, HITL modal, report, audit sidebar | ✅ done, tsc clean |
 | 5 | PyInstaller-free packaging + air-gap doc | ⏳ not started (stretch) |
 
-`cargo test -p workbench-core` → **20/20**. `cargo check --workspace --all-targets` → clean, no warnings.
+`cargo test -p workbench-core -j 1` → **44/44** and `cargo test -p tauri-app -j 1` → **20/20** (2026-10-10, after the hackathon fix pass). `tsc` clean, no warnings.
 
 ---
 
@@ -29,14 +29,14 @@ Tauri app  (one binary)
 │   BootstrapGate ── invoke() ───────────►  bootstrap/ollama.rs   is/ensure_ollama_installed (unchanged from scaffold)
 │   PromptPanel (file drop → base64)        bootstrap/hardware.rs  detect_hardware (sysinfo RAM + nvidia-smi/CIM GPU)
 │   Stepper / HitlModal / ReportView        bootstrap/models.rs    recommend_models tier table + ensure_models(list)
-│   AuditSidebar                            lib.rs   submit_turn / probe_system / warm_model / end_session / audit_paths
+│   AuditSidebar                            lib.rs   submit_turn / probe_system / warm_model / *_memory / audit_paths
 │        │  invoke + Channel<StepEvent>     events.rs  ChannelSink: StepEvent → Tauri Channel
 │        ▼
 └─ crates/workbench-core/   (Tauri-free, unit-testable)
      engine/schemas.rs     IntentResult · TaskStep · Plan · ToolResult · QualityReport · FinalReport  (serde)
      engine/ollama_engine  ONE resident model; roles A/B/C = system-prompt swap; keep_alive:-1.
                            analyze_image / embeddings call specialists with keep_alive:0.
-     planner/registry.rs   TASK_REGISTRY (7 tasks) + validate_plan() — pure-Rust DAG + file-existence checks
+     planner/registry.rs   TASK_REGISTRY (9 tasks) + validate_plan() — pure-Rust DAG + file-existence checks
      planner/planner.rs    parse_intent → build_plan → validate; MAX_PLAN_ATTEMPTS = 3 → HITL park
      executor/executor.rs  strict sequential loop; per-step StepEvent; a failing tool degrades, never aborts
      executor/quality.rs   rule-based assertions (all steps reported, no failures, RAG non-empty, report non-empty)
@@ -50,7 +50,7 @@ Tauri app  (one binary)
      tools/analysis.rs     summarize / compare_to_sop — resident model over accumulated evidence
      memory/session.rs     session_context.json — append + rolling compression via the resident model
      memory/persistent.rs  persistent_memory.json — AES-256-GCM, PBKDF2-HMAC-SHA256 over machine-uid
-     pipeline.rs           run_turn: the full sequence + persist_long_term every turn
+     pipeline.rs           run_turn: the full sequence (memory written only on a user confirm)
      kb/                   two seed SOPs (SOP-COR-014 corrosion, SOP-ROT-007 pump condition)
 ```
 
@@ -107,18 +107,26 @@ The window opens on `BootstrapGate`: it checks Ollama, probes RAM/GPU, shows the
 3. Watch the stepper: `Parsing → Validating → parse_pdf → analyze_image → search_knowledge → summarize/compare_to_sop → Synthesizing → Done`.
 4. Report panel shows findings + SOP citations (SOP-COR-014 / SOP-ROT-007) + a `degraded` badge if audio/OCR models are absent.
 5. Expand the audit sidebar: per-step timings, active model context, resolved local paths.
-6. HITL demo: a prompt that yields an unschedulable plan → exactly 2 silent retries → modal with the validator's complaints + editable plan → fix the plan and **Re-run with this plan** (or **Run anyway** to bypass the validator) → the turn resumes from `execute_plan`.
-7. Restart the app → persistent memory (`persistent_memory.json`, ciphertext on disk) reloads the facility digest.
+6. ~~HITL demo~~ — **not demonstrable as of 2026-10-10.** Its only practical trigger was the empty-fallback bug (README problems 4 and 11). Show the deterministic validator on the audit sidebar's "How it works" list instead, or add a deliberate "review plan" entry point first.
+7. Click **Remember** on a proposed fact under the report → it appears in the sidebar's *Remembered facts* → open a **new chat** and ask about it: it's known there, but chat 1's conversation is not → restart the app: the fact reloads (`persistent_memory.json`, ciphertext on disk).
 
 ---
 
 ## Open items
 
-1. **Phase 5 packaging** — `cargo tauri build` installer; pre-cache Ollama models + whisper/ocrs weights for the air-gapped machine; tighten `tauri.conf.json` CSP.
-2. **`.gitattributes`** — repo is CRLF-noisy on this Windows box; harmless, worth a one-liner.
-3. **LanceDB ANN index** — the table currently does a flat (exact) scan; `table.create_index(Index::Auto)` would add an approximate index if the KB ever grows past ~10⁴ chunks.
+1. **Phase 5 packaging** — `cargo tauri build` installer; bundle Ollama as a sidecar and pre-cache the models + whisper/ocrs weights for the air-gapped machine; tighten `tauri.conf.json` CSP.
+2. **LanceDB ANN index** — the table currently does a flat (exact) scan; `table.create_index(Index::Auto)` would add an approximate index if the KB ever grows past ~10⁴ chunks.
+3. **HITL entry point** — the modal works but nothing reaches it from the GUI any more (README problem 11).
 
 ### Done since Phase 4
 - **RAG on embedded LanceDB** — `tools/rag.rs`, verified end-to-end (SOP retrieved + cited).
 - **`resume_turn`** — the HITL modal's *Re-run with this plan* / *Run anyway* buttons resume a parked turn from the user-edited plan (`workbench_core::resume_turn` → shared `run_from_plan` tail; `resume_turn` Tauri command; `resumeTurn` UI wrapper).
 - **Planner robustness** — task names are tolerated with a trailing ` [Stage]` label / quotes (`normalize_task_name`), and the registry prompt block quotes just the name.
+
+### Hackathon fix pass (2026-10-10) — execution log parts 10–14
+- **Linux Ollama without sudo** — per-user install, app-managed `ollama serve`; `renice` now actually applies (it never did against the systemd `ollama` user).
+- **`answer_directly`** — closes the empty-fallback hole that parked a bare "hi"; registry task #9.
+- **`Exchange.ts`** — was saved as 0 on every turn; now stamped.
+- **Cross-chat memory** — propose → you confirm; `GLOBAL_MEMORY_ENABLED`, `persist_long_term` and `end_session` deleted.
+- **Bootstrap** — tier from total RAM (free RAM only warns); installed models marked and never counted as downloads.
+- **`.gitattributes`** — LF by default, `.bat` CRLF, binaries marked; no renormalisation.

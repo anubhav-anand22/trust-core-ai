@@ -151,6 +151,44 @@ pub fn lookup_llm(name: &str) -> Option<LlmSpec> {
     LLM_CATALOG.iter().copied().find(|m| m.name == name)
 }
 
+/// Is `name` among the locally installed tags? Ollama lists an untagged pull as
+/// `name:latest`, so `moondream` matches `moondream:latest`.
+///
+/// The single definition of "installed" — the bootstrap screen's labels, the
+/// download estimate and the pull loop in [`ensure_models`] all go through it,
+/// so the screen can never claim a model is present that the pull then fetches.
+pub fn model_present(installed: &[String], name: &str) -> bool {
+    let target = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("{name}:latest")
+    };
+    installed.iter().any(|m| *m == target || m == name)
+}
+
+/// Every model tag Ollama has locally, or empty (with a warning) if the server
+/// can't be asked — a failed listing must not block the bootstrap screen, it
+/// just means nothing is marked installed.
+async fn installed_models(state: &AppState) -> Vec<String> {
+    match state.ollama.list_local_models().await {
+        Ok(list) => list.into_iter().map(|m| m.name).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list local models; treating none as installed");
+            Vec::new()
+        }
+    }
+}
+
+/// Models a pre-existing **system-wide** Linux Ollama would have pulled. That
+/// install keeps them under the `ollama` system user's home, which the
+/// per-user server (see `bootstrap::ollama`) cannot read without sudo — so they
+/// look missing and would be downloaded again. Detected only to tell the user
+/// why, not to read them.
+fn legacy_system_models_present() -> bool {
+    cfg!(target_os = "linux")
+        && std::path::Path::new("/usr/share/ollama/.ollama/models").is_dir()
+}
+
 /// Choose a resident LLM the host can actually run.
 ///
 /// **Input:** the hardware probe. **Output:** a [`ModelPlan`].
@@ -159,10 +197,15 @@ pub fn lookup_llm(name: &str) -> Option<LlmSpec> {
 /// comfortable. Without it every token is computed on the CPU, and **model size is
 /// the latency**: RAM only decides whether the weights fit, not how fast they run.
 /// So the CPU ladder is gated on *physical* cores (hyperthreads share execution
-/// units and add little throughput) and on *available* rather than total RAM.
+/// units and add little throughput) and on **total** RAM.
+///
+/// Total, not available: available RAM moves with whatever else is open, so the
+/// tier jumped between launches (open a browser, lose a tier). The tier is a
+/// property of the machine; whether it fits *right now* is a separate, live
+/// question that [`assess_llm`] answers with a warning instead.
 pub fn recommend_models(hw: &HardwareInfo) -> ModelPlan {
     let cores = hw.physical_cores;
-    let free = hw.available_ram_gb;
+    let ram = hw.total_ram_gb;
 
     let (llm, tier) = if hw.has_usable_gpu() {
         let vram = hw.vram_gb.unwrap_or(0.0);
@@ -173,14 +216,16 @@ pub fn recommend_models(hw: &HardwareInfo) -> ModelPlan {
         } else {
             (LLM_FLOOR, "1.5B tier — GPU offload, <6 GB VRAM")
         }
-    } else if cores >= 6 && free >= 10.0 {
+    // Thresholds sit just under the marketed sizes because the OS reports usable
+    // GiB: a "16 GB" laptop shows ~15.5, an "8 GB" ~7.7, a "4 GB" ~3.7.
+    } else if cores >= 6 && ram >= 14.0 {
         (LLM_STANDARD, "3B tier — CPU-only, ≥6 physical cores")
-    } else if cores >= 4 && free >= 5.0 {
+    } else if cores >= 4 && ram >= 7.0 {
         (
             LLM_FLOOR,
             "1.5B tier — CPU-only (small model keeps turns responsive)",
         )
-    } else if cores >= 2 && free >= 3.0 {
+    } else if cores >= 2 && ram >= 3.5 {
         (
             LLM_MINIMAL,
             "0.5B tier — CPU-only, minimal host (answers will be rough)",
@@ -206,8 +251,12 @@ pub fn recommend_models(hw: &HardwareInfo) -> ModelPlan {
 pub struct LlmAssessment {
     pub model: String,
     pub approx_ram_gb: f32,
-    /// Total download for the resident model plus both specialists.
+    /// Download still needed for the resident model plus both specialists —
+    /// models already installed count as zero.
     pub approx_download_gb: f32,
+    /// Which of (resident, vision, embed) are not installed yet. Empty means
+    /// "Start" needs no download at all.
+    pub missing_models: Vec<String>,
     /// `"ok"` · `"caution"` · `"blocked"`.
     pub severity: String,
     /// Plain-language reasons, shown verbatim to the user.
@@ -219,14 +268,14 @@ pub struct LlmAssessment {
 /// Exists so that overriding the recommendation is an *informed* choice. Previously
 /// an override produced only a log line the user never saw, and picking a large
 /// model on a small host was the documented cause of unusable turn times.
-pub fn assess_llm(model: &str, hw: &HardwareInfo) -> LlmAssessment {
+pub fn assess_llm(model: &str, hw: &HardwareInfo, installed: &[String]) -> LlmAssessment {
     let recommended = recommend_models(hw);
     let spec = lookup_llm(model);
     let mut warnings = Vec::new();
     let mut severity = "ok";
 
-    let (ram_gb, download_gb) = match spec {
-        Some(m) => (m.ram_gb, m.download_gb),
+    let ram_gb = match spec {
+        Some(m) => m.ram_gb,
         None => {
             severity = "caution";
             warnings.push(format!(
@@ -235,19 +284,30 @@ pub fn assess_llm(model: &str, hw: &HardwareInfo) -> LlmAssessment {
                  \"thinking\" model) return an empty result under this app's \
                  structured-output mode."
             ));
-            (0.0, 0.0)
+            0.0
         }
     };
 
-    // Does it fit beside the OS, the webview and Ollama itself?
+    // Two different questions. Can this machine hold the model at all (total
+    // RAM)? Blocked if not — no amount of closing apps fixes that. Does it fit
+    // beside what is open *right now* (available RAM)? Only a caution: the user
+    // can close a browser, but if they don't, the resident weights get swapped
+    // out mid-generation, which is exactly what a desktop freeze feels like.
     if ram_gb > 0.0 {
         let needed = ram_gb + HOST_HEADROOM_GB;
-        if needed > hw.available_ram_gb {
+        if needed > hw.total_ram_gb {
             severity = "blocked";
             warnings.push(format!(
-                "Needs about {needed:.1} GB free but only {:.1} GB is available. Expect \
-                 heavy swapping or an out-of-memory failure mid-turn. Close other \
-                 applications, or choose a smaller model.",
+                "Needs about {needed:.1} GB of RAM but this machine only has {:.1} GB in \
+                 total. Choose a smaller model.",
+                hw.total_ram_gb
+            ));
+        } else if needed > hw.available_ram_gb {
+            severity = "caution";
+            warnings.push(format!(
+                "Needs about {needed:.1} GB free but only {:.1} GB is available right now. \
+                 Close other applications before starting a turn, or the model will be \
+                 swapped out mid-answer and the desktop will stall.",
                 hw.available_ram_gb
             ));
         }
@@ -269,10 +329,17 @@ pub fn assess_llm(model: &str, hw: &HardwareInfo) -> LlmAssessment {
         }
     }
 
+    let missing_models: Vec<String> = [model, VISION.name, EMBED.name]
+        .into_iter()
+        .filter(|m| !model_present(installed, m))
+        .map(str::to_string)
+        .collect();
+
     LlmAssessment {
         model: model.to_string(),
         approx_ram_gb: ram_gb,
-        approx_download_gb: download_gb + VISION.download_gb + EMBED.download_gb,
+        approx_download_gb: download_estimate_gb(&missing_models),
+        missing_models,
         severity: severity.into(),
         warnings,
     }
@@ -283,28 +350,62 @@ pub fn assess_llm(model: &str, hw: &HardwareInfo) -> LlmAssessment {
 pub struct SystemProbe {
     pub hardware: HardwareInfo,
     pub recommended: ModelPlan,
-    /// The recommendation judged against this host. Always `"ok"` for the
-    /// recommended model itself, but the field is here so the bootstrap screen
-    /// gets the download size without a second call.
+    /// The recommendation judged against this host. The field is here so the
+    /// bootstrap screen gets the download size without a second call.
     pub assessment: LlmAssessment,
+    /// Locally installed tags, with Ollama's implicit `:latest` stripped so they
+    /// compare directly against catalogue names (`phi4-mini:latest` →
+    /// `phi4-mini`). The front-end does exact matching only; all tag rules live
+    /// in [`model_present`].
+    pub installed_models: Vec<String>,
+    /// A system-wide Linux Ollama's model store exists, and its models are
+    /// invisible to this app's per-user server. See
+    /// [`legacy_system_models_present`].
+    pub legacy_system_models: bool,
 }
 
 #[tauri::command]
-pub fn probe_system() -> SystemProbe {
+pub async fn probe_system(state: State<'_, AppState>) -> Result<SystemProbe, String> {
     let hardware = detect_hardware();
     let recommended = recommend_models(&hardware);
-    let assessment = assess_llm(&recommended.llm, &hardware);
+    let installed = installed_models(&state).await;
+    let assessment = assess_llm(&recommended.llm, &hardware, &installed);
     tracing::info!(
         recommended = %recommended.llm,
         tier = %recommended.tier_label,
+        installed = ?installed,
         approx_download_gb = assessment.approx_download_gb,
         "system probe -> recommendation"
     );
-    SystemProbe {
+    Ok(SystemProbe {
         hardware,
         recommended,
         assessment,
-    }
+        installed_models: installed
+            .iter()
+            .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
+            .collect(),
+        legacy_system_models: legacy_system_models_present(),
+    })
+}
+
+/// Judge a resident-model choice against this host, for the bootstrap override
+/// warning. Re-probes the hardware so the RAM figure reflects the machine's state
+/// right now, and re-lists local models so the download figure is current.
+#[tauri::command]
+pub async fn assess_model(model: String, state: State<'_, AppState>) -> Result<LlmAssessment, String> {
+    let hw = detect_hardware();
+    let installed = installed_models(&state).await;
+    let assessment = assess_llm(&model, &hw, &installed);
+    tracing::info!(
+        model = %model,
+        severity = %assessment.severity,
+        approx_ram_gb = assessment.approx_ram_gb,
+        missing = ?assessment.missing_models,
+        warnings = assessment.warnings.len(),
+        "model assessment for override"
+    );
+    Ok(assessment)
 }
 
 /// Progress line for one model pull, streamed to the bootstrap screen.
@@ -369,19 +470,15 @@ pub async fn ensure_models(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // --- what is actually missing -----------------------------------------
-    let local = state
+    let local: Vec<String> = state
         .ollama
         .list_local_models()
         .await
-        .map_err(|e| e.to_string())?;
-    let is_present = |name: &str| {
-        let target = if name.contains(':') {
-            name.to_string()
-        } else {
-            format!("{name}:latest")
-        };
-        local.iter().any(|m| m.name == target || m.name == name)
-    };
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    let is_present = |name: &str| model_present(&local, name);
     let missing: Vec<String> = models.iter().filter(|m| !is_present(m)).cloned().collect();
 
     // --- disk pre-flight -------------------------------------------------
@@ -494,7 +591,7 @@ mod tests {
         let plan = recommend_models(&hw(4, 5.5, None, false));
         assert_eq!(plan.llm, LLM_FLOOR.name, "got {}", plan.tier_label);
         assert_eq!(
-            assess_llm(&plan.llm, &hw(4, 5.5, None, false)).severity,
+            assess_llm(&plan.llm, &hw(4, 5.5, None, false), &[]).severity,
             "ok",
             "the recommendation must never warn about itself"
         );
@@ -529,12 +626,39 @@ mod tests {
         assert_eq!(recommend_models(&hw(8, 16.0, None, false)).llm, LLM_STANDARD.name);
     }
 
-    /// A machine under real memory pressure must drop a tier even with the cores for
-    /// a bigger model — available RAM, not total, is what decides.
+    /// Explicit total / available, for the cases where the two must differ.
+    fn hw_ram(physical: usize, total: f32, available: f32) -> HardwareInfo {
+        HardwareInfo {
+            total_ram_gb: total,
+            available_ram_gb: available,
+            ..hw(physical, available, None, false)
+        }
+    }
+
+    /// The tier is a property of the machine: opening a browser (less available
+    /// RAM) must not drop a tier between launches. That jumpiness is why the
+    /// recommendation moved from available to total RAM.
     #[test]
-    fn memory_pressure_drops_a_tier() {
-        assert_eq!(recommend_models(&hw(8, 6.0, None, false)).llm, LLM_FLOOR.name);
-        assert_eq!(recommend_models(&hw(8, 3.5, None, false)).llm, LLM_MINIMAL.name);
+    fn available_ram_does_not_move_the_tier() {
+        let idle = recommend_models(&hw_ram(8, 15.5, 12.0));
+        let busy = recommend_models(&hw_ram(8, 15.5, 3.0));
+        assert_eq!(idle.llm, busy.llm, "tier changed with available RAM");
+        assert_eq!(idle.llm, LLM_STANDARD.name);
+    }
+
+    /// A machine that is genuinely small in total still drops a tier, using the
+    /// usable-GiB figures the OS actually reports for 8 GB and 4 GB laptops.
+    #[test]
+    fn small_total_ram_drops_a_tier() {
+        assert_eq!(recommend_models(&hw_ram(8, 7.7, 5.0)).llm, LLM_FLOOR.name);
+        assert_eq!(recommend_models(&hw_ram(8, 3.7, 2.5)).llm, LLM_MINIMAL.name);
+    }
+
+    /// The author's own laptop: i7-4600U, 2 physical cores, ~15 GiB. Cores, not
+    /// RAM, are what keep it on the smallest model.
+    #[test]
+    fn two_cores_stay_minimal_however_much_ram() {
+        assert_eq!(recommend_models(&hw_ram(2, 15.4, 10.0)).llm, LLM_MINIMAL.name);
     }
 
     #[test]
@@ -555,15 +679,28 @@ mod tests {
 
     // --- assessment -------------------------------------------------------
 
-    /// The override warning that did not exist: a model too big for free RAM must be
-    /// blocked, with the numbers in the message.
+    /// A model bigger than the machine's total RAM can never run: blocked, with
+    /// the real numbers in the message.
     #[test]
     fn a_model_that_cannot_fit_is_blocked() {
-        let a = assess_llm(LLM_LARGE.name, &hw(4, 4.0, None, false));
+        let a = assess_llm(LLM_LARGE.name, &hw_ram(4, 6.0, 4.0), &[]);
         assert_eq!(a.severity, "blocked", "{:?}", a.warnings);
         assert!(
-            a.warnings.iter().any(|w| w.contains("4.0 GB is available")),
+            a.warnings.iter().any(|w| w.contains("6.0 GB in total")),
             "the warning should quote the real numbers: {:?}",
+            a.warnings
+        );
+    }
+
+    /// Fits the machine, but not beside what is open right now: a caution telling
+    /// the user to close apps — not a block, because closing apps fixes it.
+    #[test]
+    fn fits_in_total_but_not_now_is_a_caution() {
+        let a = assess_llm(LLM_FLOOR.name, &hw_ram(4, 7.7, 2.0), &[]);
+        assert_eq!(a.severity, "caution", "{:?}", a.warnings);
+        assert!(
+            a.warnings.iter().any(|w| w.contains("available right now")),
+            "{:?}",
             a.warnings
         );
     }
@@ -571,7 +708,7 @@ mod tests {
     /// Fits in RAM, but far bigger than this host should run: caution, not silence.
     #[test]
     fn an_oversized_but_fitting_model_warns() {
-        let a = assess_llm(LLM_STANDARD.name, &hw(4, 12.0, None, false));
+        let a = assess_llm(LLM_STANDARD.name, &hw(4, 12.0, None, false), &[]);
         assert_eq!(a.severity, "caution", "{:?}", a.warnings);
         assert!(a.warnings.iter().any(|w| w.contains("slower")));
     }
@@ -579,15 +716,40 @@ mod tests {
     /// An unknown tag cannot be sized, and thinking models are the trap worth naming.
     #[test]
     fn an_unknown_model_is_flagged() {
-        let a = assess_llm("qwen3:4b", &hw(8, 16.0, None, false));
+        let a = assess_llm("qwen3:4b", &hw(8, 16.0, None, false), &[]);
         assert_eq!(a.severity, "caution");
         assert!(a.warnings.iter().any(|w| w.contains("thinking")));
+    }
+
+    /// Models already pulled cost nothing: the screen must not claim a download
+    /// that the pull loop then skips.
+    #[test]
+    fn installed_models_are_not_counted_as_downloads() {
+        let installed = vec![
+            LLM_FLOOR.name.to_string(),
+            "moondream:latest".to_string(),
+            "nomic-embed-text:latest".to_string(),
+        ];
+        let a = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false), &installed);
+        assert!(a.missing_models.is_empty(), "{:?}", a.missing_models);
+        assert!(a.approx_download_gb.abs() < 0.01, "got {}", a.approx_download_gb);
+
+        let partial = vec!["moondream:latest".to_string()];
+        let b = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false), &partial);
+        assert_eq!(b.missing_models, vec![LLM_FLOOR.name, "nomic-embed-text"]);
+    }
+
+    #[test]
+    fn untagged_names_match_latest() {
+        let installed = vec!["phi4-mini:latest".to_string()];
+        assert!(model_present(&installed, "phi4-mini"));
+        assert!(!model_present(&installed, "phi4"));
     }
 
     /// The download figure must cover the specialists too, or the disk check lies.
     #[test]
     fn download_size_includes_the_specialists() {
-        let a = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false));
+        let a = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false), &[]);
         assert!(
             (a.approx_download_gb - (LLM_FLOOR.download_gb + 1.7 + 0.3)).abs() < 0.01,
             "got {}",

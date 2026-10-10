@@ -90,6 +90,30 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
     return { ...probe.recommended, llm };
   }, [probe, llm]);
 
+  // The catalogue, plus any chat model already on this machine that isn't in it
+  // — someone's existing pull should be pickable without a download. Specialist
+  // models (vision, embeddings) are not resident-LLM candidates.
+  const installed = useMemo(() => new Set(probe?.installed_models ?? []), [probe]);
+  const choices = useMemo(() => {
+    const extra = [...installed].filter(
+      (m) =>
+        !LLM_CHOICES.includes(m) &&
+        !m.startsWith("moondream") &&
+        !m.includes("embed"),
+    );
+    return [...LLM_CHOICES, ...extra];
+  }, [installed]);
+
+  function choiceLabel(m: string): string {
+    const tags: string[] = [];
+    if (probe && m === probe.recommended.llm) tags.push("recommended");
+    if (installed.has(m)) tags.push(LLM_CHOICES.includes(m) ? "installed" : "installed, untested");
+    return tags.length ? `${m}  (${tags.join(", ")})` : m;
+  }
+
+  // Nothing to pull: say "Start", not "Download & start".
+  const needsDownload = (assessment?.missing_models.length ?? 1) > 0;
+
   // Ask the backend how risky the current pick is on this machine.
   useEffect(() => {
     if (!probe || !llm) return;
@@ -220,10 +244,9 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
               disabled={phase !== "choose"}
               onChange={(e) => setLlm(e.currentTarget.value)}
             >
-              {LLM_CHOICES.map((m) => (
+              {choices.map((m) => (
                 <option key={m} value={m}>
-                  {m}
-                  {m === probe.recommended.llm ? "  (recommended)" : ""}
+                  {choiceLabel(m)}
                 </option>
               ))}
             </select>
@@ -231,9 +254,18 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
           <p className="muted small">
             vision: {probe.recommended.vision} · embeddings: {probe.recommended.embed}
             {assessment != null
-              ? ` · ~${assessment.approx_download_gb.toFixed(1)} GB download`
+              ? needsDownload
+                ? ` · ~${assessment.approx_download_gb.toFixed(1)} GB to download (${assessment.missing_models.join(", ")})`
+                : " · all models already installed — nothing to download"
               : ""}
           </p>
+          {probe.legacy_system_models && needsDownload && (
+            <p className="muted small">
+              Models from an earlier system-wide Ollama install were found, but this
+              app runs its own per-user Ollama (no admin password) and cannot read
+              them, so the ones listed above will be downloaded again.
+            </p>
+          )}
 
           {assessment != null && assessment.warnings.length > 0 && (
             <ul
@@ -257,7 +289,11 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
                   : undefined
               }
             >
-              {blocked ? "Model too large for this machine" : "Download & start"}
+              {blocked
+                ? "Model too large for this machine"
+                : needsDownload
+                  ? "Download & start"
+                  : "Start"}
             </button>
           )}
 

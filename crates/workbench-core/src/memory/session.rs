@@ -185,13 +185,19 @@ impl SessionContext {
     /// then persist.
     pub async fn record_turn(
         &mut self,
-        exchange: Exchange,
+        mut exchange: Exchange,
         turn: TurnSummary,
         engine: &OllamaEngine,
         path: &Path,
     ) -> Result<()> {
         if self.title.is_empty() {
             self.title = title_from_prompt(&exchange.prompt);
+        }
+        // `ts == 0` means "stamp it now" — the pipeline passes 0 because the turn
+        // finishes here. This line used to be missing, so every real turn was
+        // saved with `"ts": 0` while `updated_at` (below) looked correct.
+        if exchange.ts == 0 {
+            exchange.ts = now_secs();
         }
         self.updated_at = exchange.ts.max(now_secs());
         self.exchanges.push(exchange);
@@ -360,6 +366,30 @@ mod tests {
         // `turns` is trimmed either way.
         assert_eq!(s.exchanges.len(), 10, "transcript is complete");
         assert!(s.turns.len() <= MAX_VERBATIM_TURNS + 1, "model context is bounded");
+    }
+
+    /// The pipeline records every turn with `ts: 0` ("stamp it when it lands").
+    /// That must reach disk as a real time, not 0.
+    #[tokio::test]
+    async fn a_zero_timestamp_is_stamped_on_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.json");
+        let mut s = SessionContext::load_or_new(&p, "s");
+        s.record_turn(
+            Exchange { prompt: "q".into(), attachments: vec![], report: None, ts: 0 },
+            TurnSummary {
+                user_prompt: "q".into(),
+                plan_summary: "x".into(),
+                tool_summary: "x".into(),
+                report_summary: "x".into(),
+            },
+            &engine(),
+            &p,
+        )
+        .await
+        .unwrap();
+        let reloaded = SessionContext::load(&p).unwrap();
+        assert!(reloaded.exchanges[0].ts > 0, "ts was saved as 0");
     }
 
     #[test]

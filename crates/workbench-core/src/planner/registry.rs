@@ -74,6 +74,15 @@ pub const TASK_REGISTRY: &[TaskSpec] = &[
                       Use as the ONLY step when the request builds on an earlier turn.",
     },
     TaskSpec {
+        name: "answer_directly",
+        // Retrieve, not Analyze: the stage rules require every Analyze step to
+        // follow an evidence step, and this one has none to follow.
+        stage: Stage::Retrieve,
+        requires_file: None,
+        description: "Answer a request that needs no files, no knowledge base and no earlier \
+                      conversation (a greeting, a general question). Use as the ONLY step.",
+    },
+    TaskSpec {
         name: "summarize",
         stage: Stage::Analyze,
         requires_file: None,

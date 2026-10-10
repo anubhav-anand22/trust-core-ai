@@ -4,7 +4,7 @@
 import { useEffect, useState } from "react";
 import { auditPaths, openLogDir } from "../lib/pipeline";
 import { log } from "../lib/log";
-import type { AuditPaths, ModelPlan, StepEvent } from "../types";
+import type { AuditPaths, MemoryFact, ModelPlan, StepEvent } from "../types";
 
 interface ToolTiming {
   tool: string;
@@ -49,9 +49,14 @@ const HOW_IT_WORKS: { label: string; tag?: string; detail: string }[] = [
 export function AuditSidebar({
   events,
   plan,
+  memory,
+  onForget,
 }: {
   events: StepEvent[];
   plan: ModelPlan | null;
+  /** Facts the user confirmed for cross-chat memory. */
+  memory: MemoryFact[];
+  onForget: (key: string) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [paths, setPaths] = useState<AuditPaths | null>(null);
@@ -106,6 +111,34 @@ export function AuditSidebar({
               </dl>
             ) : (
               <p className="muted">not selected</p>
+            )}
+          </section>
+
+          <section>
+            <h4>Remembered facts</h4>
+            {memory.length === 0 ? (
+              <p className="muted small">
+                Nothing yet. Facts you confirm under a report appear here and are
+                shared with every chat.
+              </p>
+            ) : (
+              <ul className="memory-list">
+                {memory.map((f) => (
+                  <li key={f.key}>
+                    <span>
+                      <b>{f.key}</b>: {f.value}
+                    </span>
+                    <button
+                      type="button"
+                      className="link-btn"
+                      title="Forget this fact"
+                      onClick={() => onForget(f.key)}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
           </section>
 

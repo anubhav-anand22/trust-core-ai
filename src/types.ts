@@ -21,6 +21,8 @@ export interface LlmAssessment {
   model: string;
   approx_ram_gb: number;
   approx_download_gb: number;
+  /** Which of (resident, vision, embed) still need pulling. Empty = no download. */
+  missing_models: string[];
   severity: "ok" | "caution" | "blocked";
   warnings: string[];
 }
@@ -38,6 +40,10 @@ export interface SystemProbe {
   hardware: HardwareInfo;
   recommended: ModelPlan;
   assessment: LlmAssessment;
+  /** Local tags with Ollama's implicit `:latest` stripped — compare with `===`. */
+  installed_models: string[];
+  /** Linux: an old system-wide Ollama's models exist but this app can't see them. */
+  legacy_system_models: boolean;
 }
 
 export interface ModelProgress {
@@ -104,12 +110,22 @@ export interface SessionMeta {
 }
 
 // workbench_core::engine::schemas::FinalReport
+// workbench_core::engine::schemas::MemoryFact — one confirmed (or proposed)
+// cross-chat fact, e.g. { key: "plant", value: "MRPL Phase-3" }.
+export interface MemoryFact {
+  key: string;
+  value: string;
+}
+
 export interface FinalReport {
   summary: string;
   findings: string[];
   citations: string[];
   safety_notes: string[];
   degraded: boolean;
+  /** Facts the model suggests remembering across chats. Absent on reports saved
+   *  before this field existed. Nothing is stored until the user confirms. */
+  memory_proposals?: MemoryFact[];
 }
 
 // workbench_core::engine::schemas::Plan (for the HITL editor)

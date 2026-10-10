@@ -229,6 +229,19 @@ pub(crate) fn fallback_plan(
         }
     }
 
+    // Nothing to extract, nothing to retrieve, no conversation to follow up on —
+    // a greeting or a general question on a fresh chat. Without this the plan
+    // came back empty, `validate_plan` rejected it ("plan contains no steps"),
+    // and the one case this safety net exists for parked in the HITL modal.
+    if steps.is_empty() {
+        steps.push(step(
+            "ans",
+            "answer_directly",
+            serde_json::Value::Object(Default::default()),
+            vec![],
+        ));
+    }
+
     Plan { steps }
 }
 
@@ -305,6 +318,18 @@ mod fallback_tests {
             let errs = validate_plan(&plan, &uploads);
             assert!(errs.is_empty(), "needs_knowledge={nk}: {errs:?}");
         }
+    }
+
+    /// The hole in the safety net: a first message with no files that needs no
+    /// knowledge base ("hi") used to fall back to an EMPTY plan, which
+    /// `validate_plan` rejects — so the turn parked instead of answering.
+    #[test]
+    fn fallback_never_returns_an_empty_plan_for_a_bare_first_message() {
+        let plan = fallback_plan(&intent(false), &[], false);
+        assert_eq!(plan.steps.len(), 1, "{:?}", plan.steps);
+        assert_eq!(plan.steps[0].task, "answer_directly");
+        let errs = validate_plan(&plan, &[]);
+        assert!(errs.is_empty(), "fallback must always validate: {errs:?}");
     }
 
     #[test]

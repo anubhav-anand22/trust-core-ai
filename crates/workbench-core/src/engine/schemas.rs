@@ -134,6 +134,17 @@ pub struct QualityReport {
     pub checks: Vec<QualityCheck>,
 }
 
+/// One fact for cross-chat memory, e.g. `{ key: "plant", value: "MRPL Phase-3" }`.
+///
+/// Role C *proposes* these; nothing is stored until the user confirms one in
+/// the UI. That confirm step is the whole fix for the old cross-session leak,
+/// where a chat's prose digest was copied into shared memory automatically.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryFact {
+    pub key: String,
+    pub value: String,
+}
+
 /// Output of **role C — Output Compiler**: what the user actually reads.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FinalReport {
@@ -148,4 +159,8 @@ pub struct FinalReport {
     /// Set when a tool failed or a quality check tripped.
     #[serde(default)]
     pub degraded: bool,
+    /// Facts the model suggests remembering across chats. Optional so a model
+    /// that omits it, and reports saved before it existed, still parse.
+    #[serde(default)]
+    pub memory_proposals: Vec<MemoryFact>,
 }

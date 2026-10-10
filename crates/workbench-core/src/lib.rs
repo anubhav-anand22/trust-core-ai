@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 pub use engine::schemas;
 pub use events::{ProgressSink, StepEvent};
-pub use pipeline::{persist_long_term, resume_turn, run_turn, TurnOutcome};
+pub use pipeline::{resume_turn, run_turn, TurnOutcome};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

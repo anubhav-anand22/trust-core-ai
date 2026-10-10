@@ -46,12 +46,17 @@ concern an inspection, an SOP, an invoice, a fee schedule or a contract — all
 are in scope; do not treat a non-inspection question as out of scope.
 You are given the user's request, the raw outputs of the tools that ran, a summary of
 earlier turns, and long-term facility memory. Synthesise them into STRICT JSON:
-{\"summary\":string,\"findings\":[string],\"citations\":[string],\"safety_notes\":[string],\"degraded\":boolean}
+{\"summary\":string,\"findings\":[string],\"citations\":[string],\"safety_notes\":[string],\"degraded\":boolean,\"memory_proposals\":[{\"key\":string,\"value\":string}]}
 - `summary`: 2-4 sentences answering the user directly.
 - `findings`: concrete observations, each traceable to a tool output.
 - `citations`: names of knowledge-base sources you actually used. Empty if none.
 - `safety_notes`: hazards or required precautions surfaced by the evidence. Empty if none.
 - `degraded`: true if any tool failed or evidence was missing.
+- `memory_proposals`: at most 3 durable facility facts worth remembering for
+  future chats — plant or unit name, equipment tag, governing standard — each
+  stated explicitly in the USER REQUEST or TOOL OUTPUTS. Short lowercase `key`
+  (\"plant\", \"unit\", \"equipment\"). Never a finding, a measurement or an answer.
+  Empty list if none. The user confirms each one before it is stored.
 When the evidence contains a rate, fee, percentage or amount the user asked about,
 quote it verbatim in `summary` and show the arithmetic for their figures.
 Never invent measurements, tag numbers, rates or clauses that are not in the tool outputs.
@@ -355,6 +360,9 @@ Rules:
 - If the request is a FOLLOW-UP to EARLIER IN THIS CONVERSATION and needs no new
   files or knowledge (e.g. \"and what about debit cards?\", \"show that as a
   table\"), the whole plan is a single `answer_followup` step with no `args`.
+- If there are NO attached files, no knowledge base is needed, and it is NOT a
+  follow-up (a greeting, a general question), the whole plan is a single
+  `answer_directly` step with no `args`.
 - Give each step a short unique `id`.
 Return STRICT JSON: {{\"steps\":[{{\"id\":string,\"task\":string,\"args\":object,\"depends_on\":[string]}}]}}
 Return JSON only. No prose, no markdown, no code fences.",
@@ -552,6 +560,26 @@ schedule — every domain is in scope. Rules:
             elapsed_ms = started.elapsed().as_millis(),
             "llm call (analysis)"
         );
+        Ok(response.response.trim().to_string())
+    }
+
+    /// `answer_directly`: a request with no attachments, no knowledge-base need
+    /// and no earlier conversation. [`Self::analyze`] can't serve it — its system
+    /// prompt forbids answering beyond the evidence, and here there is none.
+    pub async fn respond(&self, user_prompt: &str) -> Result<String> {
+        let system = "\
+You are TrustCore AI, an offline assistant for industrial and business documents
+(inspection reports, SOPs, invoices, rate cards, contracts). Answer briefly. If
+the user greets you or asks what you can do, say that they can attach a PDF,
+photo or voice note and ask about it. Do not invent facts about their documents,
+equipment or plant — none were provided.";
+
+        let request = GenerationRequest::new(self.llm_model.clone(), user_prompt.to_string())
+            .system(system.to_string())
+            .options(self.opts())
+            .keep_alive(KeepAlive::Indefinitely);
+
+        let response = self.guarded("respond", self.client.generate(request)).await?;
         Ok(response.response.trim().to_string())
     }
 

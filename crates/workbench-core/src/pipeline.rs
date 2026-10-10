@@ -15,28 +15,6 @@ use crate::memory::{Exchange, PersistentMemory, SessionContext, TurnSummary};
 use crate::planner::{plan_turn, validate_plan, PlanOutcome};
 use crate::{PipelineConfig, Result};
 
-/// **Temporarily disabled (2026-09-12).** `PersistentMemory` is ONE file shared by
-/// every session (`persistent_memory.json`, keyed by nothing but the machine) —
-/// not scoped per session the way `SessionContext` is. `persist_long_term` folded
-/// each session's digest into that single file, and every turn in every OTHER
-/// session then loaded the same file and fed its `history_digest` /
-/// `facility_metadata` into role C's prompt as "long-term facility memory" — one
-/// user's (or one chat's) context leaking into an unrelated conversation.
-///
-/// This flag is the single choke point for that cross-session store: `false`
-/// means a turn never reads it (role C gets `facility_memory: ""`, which the
-/// prompt already renders as "(none)") and never writes it (`persist_long_term`
-/// returns immediately). Per-session memory — `SessionContext`,
-/// `sessions/<id>.json`, `turns`, `rolling_summary` — is a **different type**
-/// entirely and is NOT touched by this flag; a follow-up question inside one chat
-/// still has full context.
-///
-/// Any `persistent_memory.json` already on disk from before this flag is simply
-/// never read while it is `false` — inert, not deleted. Flip back to `true` once
-/// `PersistentMemory` carries a session (or user) key instead of being global;
-/// see docs/02-execution-log.md, "the cross-session leak", for the real fix.
-const GLOBAL_MEMORY_ENABLED: bool = false;
-
 /// Terminal state of one turn.
 pub enum TurnOutcome {
     /// Pipeline ran to completion.
@@ -250,25 +228,23 @@ async fn run_from_plan(
     });
 
     // --- synthesise (role C) -------------------------------------------
-    // `session` was loaded before planning and handed in; only long-term memory
-    // is read here — gated by `GLOBAL_MEMORY_ENABLED` (see its doc comment: this
-    // is the cross-session store, disabled because it was leaking between chats).
-    let facility_context = if GLOBAL_MEMORY_ENABLED {
-        PersistentMemory::load(&config.persistent_path()).context_blob()
-    } else {
-        String::new()
-    };
+    // `session` was loaded before planning and handed in. Cross-chat memory is
+    // read here, and it is safe to share across chats now: it holds only facts
+    // the user confirmed, never an automatic digest of some other conversation.
+    let facility = PersistentMemory::load(&config.persistent_path());
 
     let mut report = compiler::compile(
         engine,
         prompt,
         &results,
         &session.context_blob(),
-        &facility_context,
+        &facility.context_blob(),
         sink,
     )
     .await;
     report.degraded = report.degraded || !quality.passed;
+    // Don't ask the user to confirm what they already confirmed.
+    report.memory_proposals.retain(|p| !facility.has(p));
     tracing::info!(
         degraded = report.degraded,
         findings = report.findings.len(),
@@ -297,7 +273,7 @@ async fn run_from_plan(
         prompt: prompt.to_string(),
         attachments: uploads.iter().map(|u| u.original_name.clone()).collect(),
         report: Some(report.clone()),
-        ts: 0, // filled in by record_turn from the clock
+        ts: 0, // 0 = record_turn stamps the current time
     };
     if let Err(e) = session
         .record_turn(exchange, turn, engine, &config.session_path_for(session_id))
@@ -306,51 +282,8 @@ async fn run_from_plan(
         tracing::warn!(error = %e, "failed to record session turn");
     }
 
-    // Fold the session digest into encrypted long-term memory every turn, so a
-    // crash between turns never loses history. `end_session` does the same on an
-    // orderly shutdown.
-    persist_long_term(config, &session);
-
     sink.emit(StepEvent::Done {
         report_json: serde_json::to_string(&report)?,
     });
     Ok(TurnOutcome::Completed(report))
-}
-
-/// Update `persistent_memory.json` (AES-256-GCM) from the current session's
-/// rolling context.
-///
-/// **Inputs:** pipeline config (for the file path) and the session to summarise.
-/// Best-effort: a write failure is logged, never propagated — losing long-term
-/// memory must not fail a turn or a shutdown.
-pub fn persist_long_term(config: &PipelineConfig, session: &SessionContext) {
-    // See `GLOBAL_MEMORY_ENABLED`: this is the write side of the disabled
-    // cross-session store. Covers both callers of this function (the mid-turn
-    // call below and `end_session` in the Tauri host) from one place, so neither
-    // can be re-enabled without the other by accident.
-    if !GLOBAL_MEMORY_ENABLED {
-        return;
-    }
-
-    let path = config.persistent_path();
-    let mut memory = PersistentMemory::load(&path);
-
-    let digest = if !session.rolling_summary.is_empty() {
-        session.rolling_summary.clone()
-    } else {
-        session
-            .turns
-            .iter()
-            .map(|t| t.report_summary.as_str())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
-    if !digest.is_empty() {
-        memory.history_digest = digest;
-    }
-
-    if let Err(e) = memory.persist(&path) {
-        tracing::warn!(error = %e, "failed to persist long-term memory");
-    }
 }

@@ -23,6 +23,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::engine::schemas::MemoryFact;
 use crate::{CoreError, Result};
 
 /// Namespacing salt: binds the derived key to (this app, this purpose) so it can't
@@ -31,19 +32,23 @@ const APP_SALT: &[u8] = b"sovereign-workbench/persistent-memory/v1";
 const PBKDF2_ROUNDS: u32 = 200_000;
 const NONCE_LEN: usize = 12;
 
-/// Long-term, user-level memory. Written on session end and app reset; read once
-/// at startup.
+/// Long-term, cross-chat memory: **only facts the user explicitly confirmed**.
+///
+/// It used to also hold an automatic per-turn digest of whichever chat ran
+/// last, which every other chat then read as background — one conversation
+/// leaking into another. Now nothing enters this store without a confirm click
+/// in the UI (`confirm_memory` in the Tauri host).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PersistentMemory {
-    /// Facility metadata accumulated across sessions (unit names, plant sections,
-    /// equipment registers…).
+    /// Confirmed facility facts (plant, unit, equipment tag…), key → value.
     #[serde(default)]
     pub facility_metadata: serde_json::Map<String, serde_json::Value>,
     /// Themes that recur across sessions, e.g. "pump-cavitation", "flange-leak".
     #[serde(default)]
     pub recurrent_tags: Vec<String>,
-    /// Compressed digest of historical context.
-    #[serde(default)]
+    /// The retired automatic digest. Still *read* so an old file decrypts, but
+    /// `skip_serializing` means it is never written back — the next save drops it.
+    #[serde(default, skip_serializing)]
     pub history_digest: String,
 }
 
@@ -110,23 +115,54 @@ impl PersistentMemory {
     }
 
     /// A short human-readable view for role C's "facility memory" prompt slot.
+    /// Confirmed facts only — the retired `history_digest` is deliberately left
+    /// out even if an old file still carries one.
     pub fn context_blob(&self) -> String {
         let mut out = String::new();
-        if !self.facility_metadata.is_empty() {
-            out.push_str("FACILITY METADATA: ");
-            out.push_str(&serde_json::to_string(&self.facility_metadata).unwrap_or_default());
-            out.push('\n');
+        for fact in self.facts() {
+            out.push_str(&format!("{}: {}\n", fact.key, fact.value));
         }
         if !self.recurrent_tags.is_empty() {
             out.push_str("RECURRENT THEMES: ");
             out.push_str(&self.recurrent_tags.join(", "));
             out.push('\n');
         }
-        if !self.history_digest.is_empty() {
-            out.push_str("HISTORY: ");
-            out.push_str(&self.history_digest);
-        }
         out
+    }
+
+    /// Confirmed facts, for the UI list and the prompt.
+    pub fn facts(&self) -> Vec<MemoryFact> {
+        self.facility_metadata
+            .iter()
+            .map(|(k, v)| MemoryFact {
+                key: k.clone(),
+                value: v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string()),
+            })
+            .collect()
+    }
+
+    /// Is this exact fact already stored? Used to stop re-proposing it.
+    pub fn has(&self, fact: &MemoryFact) -> bool {
+        self.facility_metadata
+            .get(&normalize_key(&fact.key))
+            .and_then(|v| v.as_str())
+            == Some(fact.value.trim())
+    }
+
+    /// Store a fact the user confirmed. Same key overwrites (the plant was
+    /// renamed). Empty key or value is ignored. Call [`Self::persist`] after.
+    pub fn confirm(&mut self, key: &str, value: &str) {
+        let (key, value) = (normalize_key(key), value.trim());
+        if key.is_empty() || value.is_empty() {
+            return;
+        }
+        self.facility_metadata
+            .insert(key, serde_json::Value::String(value.to_string()));
+    }
+
+    /// Remove a fact. Call [`Self::persist`] after.
+    pub fn forget(&mut self, key: &str) {
+        self.facility_metadata.remove(&normalize_key(key));
     }
 
     /// Derive the machine-bound AES-256-GCM cipher.
@@ -145,6 +181,11 @@ impl PersistentMemory {
         );
         Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes))
     }
+}
+
+/// Keys are compared case-insensitively ("Plant" and "plant" are one fact).
+fn normalize_key(key: &str) -> String {
+    key.trim().to_lowercase()
 }
 
 #[cfg(test)]
@@ -170,11 +211,36 @@ mod tests {
 
         let loaded = PersistentMemory::load(&path);
         assert_eq!(loaded.recurrent_tags, vec!["flange-leak".to_string()]);
-        assert_eq!(loaded.history_digest, mem.history_digest);
         assert_eq!(
             loaded.facility_metadata.get("plant").unwrap(),
             &serde_json::json!("MRPL Phase-3")
         );
+        // The retired automatic digest — the thing that leaked between chats —
+        // must not survive a save.
+        assert!(loaded.history_digest.is_empty(), "digest was written back");
+        assert!(!loaded.context_blob().contains("Unit-2"), "{}", loaded.context_blob());
+    }
+
+    #[test]
+    fn confirm_and_forget_roundtrip_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persistent_memory.json");
+
+        let mut mem = PersistentMemory::default();
+        mem.confirm("  Plant ", " MRPL Phase-3 ");
+        mem.confirm("equipment", "P-101");
+        mem.confirm("", "ignored");
+        mem.persist(&path).unwrap();
+
+        let mut loaded = PersistentMemory::load(&path);
+        assert_eq!(loaded.facts().len(), 2, "{:?}", loaded.facts());
+        assert!(loaded.has(&MemoryFact { key: "plant".into(), value: "MRPL Phase-3".into() }));
+        assert!(loaded.context_blob().contains("plant: MRPL Phase-3"));
+
+        loaded.forget("PLANT");
+        loaded.persist(&path).unwrap();
+        let after = PersistentMemory::load(&path);
+        assert_eq!(after.facts(), vec![MemoryFact { key: "equipment".into(), value: "P-101".into() }]);
     }
 
     #[test]

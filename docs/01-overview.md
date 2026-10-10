@@ -57,7 +57,7 @@ evaluations."*
 │  BootstrapGate   ── invoke() ──────────►  bootstrap/ollama.rs   install / detect    │
 │  PromptPanel      (files as base64)       bootstrap/hardware.rs  RAM + GPU probe     │
 │  Stepper                                  bootstrap/models.rs    tier pick + pulls   │
-│  HitlModal                                lib.rs   submit_turn, end_session, …       │
+│  HitlModal                                lib.rs   submit_turn, confirm_memory, …    │
 │  ReportView       ◄── Channel<StepEvent>  events.rs  StepEvent → Tauri Channel       │
 │  AuditSidebar                                    │                                   │
 │                                                 ▼                                   │

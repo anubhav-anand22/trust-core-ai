@@ -245,9 +245,10 @@ let quality  = assert_sane(&plan, &results, None);
 sink.emit(StepEvent::QualityCheck { passed: quality.passed });
 let mut report = compiler::compile(engine, prompt, &results, &session_blob, &facility_blob, sink).await;
 report.degraded = report.degraded || !quality.passed;
-session.append_turn(turn, engine, &config.session_path()).await?;   // best-effort
-persist_long_term(config, &session);                                // encrypt every turn
+report.memory_proposals.retain(|p| !facility.has(p));               // don't re-ask
+session.record_turn(exchange, turn, engine, &path).await?;          // best-effort; stamps ts
 sink.emit(StepEvent::Done { report_json: to_string(&report)? });
+// persistent_memory.json is written only by confirm_memory / forget_memory (docs/11)
 ```
 
 ### `examples/e2e.rs`
@@ -279,7 +280,8 @@ the GUI. Run it: see [doc 07](07-build-test-run.md).
 - **Commands** (`#[tauri::command]` — callable from JS via `invoke`):
   `generate_response` (debug), `is_ollama_installed`, `ensure_ollama_installed`,
   `detect_hardware`, `probe_system`, `ensure_models`, `set_model_plan`,
-  `warm_model`, `audit_paths`, `submit_turn`, `end_session`.
+  `warm_model`, `audit_paths`, `submit_turn`, `resume_turn`, `get_memory`,
+  `confirm_memory`, `forget_memory`, session list/load/rename/delete.
 - **`submit_turn`** — decodes the base64 file uploads, writes them under
   `uploads/<session>/`, builds the `PipelineConfig` + `OllamaEngine` +
   `default_registry()`, wraps the incoming `Channel<StepEvent>` in a
