@@ -162,6 +162,10 @@ pub struct OllamaEngine {
     /// Every model call made through this engine, in order. The host builds one
     /// engine per turn, so this is one turn's breakdown. See [`CallTiming`].
     timings: std::sync::Mutex<Vec<CallTiming>>,
+    /// One line about the user from their profile ("works in finance, mostly on
+    /// reports"). Prepended to the system prompts so a small model frames its
+    /// answers for the right domain. Empty = nothing added.
+    persona: String,
 }
 
 impl OllamaEngine {
@@ -186,6 +190,23 @@ impl OllamaEngine {
             cancel: None,
             mode: TurnMode::Fast,
             timings: std::sync::Mutex::new(Vec::new()),
+            persona: String::new(),
+        }
+    }
+
+    /// Set the user-context line (from the profile). Kept short by the caller:
+    /// every token is prompt prefill, which is real time on a CPU.
+    pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
+        self.persona = persona.into();
+        self
+    }
+
+    /// `base` with the persona line in front, or `base` unchanged.
+    fn system_prompt(&self, base: &str) -> String {
+        if self.persona.trim().is_empty() {
+            base.to_string()
+        } else {
+            format!("USER CONTEXT: {}\n\n{base}", self.persona.trim())
         }
     }
 
@@ -355,10 +376,11 @@ impl OllamaEngine {
         role: &'static str,
     ) -> Result<T> {
         let started = std::time::Instant::now();
+        let system = self.system_prompt(system);
         let prompt_chars = user.len() + system.len();
 
         let request = GenerationRequest::new(self.llm_model.clone(), user)
-            .system(system.to_string())
+            .system(system)
             .format(FormatType::StructuredJson(Box::new(JsonStructure::new::<T>())))
             .options(self.opts())
             .keep_alive(KeepAlive::Indefinitely);
@@ -595,10 +617,18 @@ Return JSON only. No prose, no markdown, no code fences.",
     /// instant it answers — it must never co-reside with the resident LLM.
     pub async fn analyze_image(&self, image_base64: &str, question: &str) -> Result<String> {
         use ollama_rs::generation::images::Image;
+        // A multimodal resident model doubles as the vision model. Unloading it
+        // after the photo would evict the resident and force a full reload on the
+        // very next call — keep it, exactly as the text roles do.
+        let keep = if self.vision_model == self.llm_model {
+            KeepAlive::Indefinitely
+        } else {
+            KeepAlive::UnloadOnCompletion
+        };
         let request = GenerationRequest::new(self.vision_model.clone(), question.to_string())
             .add_image(Image::from_base64(image_base64.to_string()))
             .options(self.opts())
-            .keep_alive(KeepAlive::UnloadOnCompletion);
+            .keep_alive(keep);
 
         let started = std::time::Instant::now();
         let response = self.guarded("vision", self.client.generate(request)).await?;
@@ -639,7 +669,7 @@ schedule — every domain is in scope. Rules:
             self.llm_model.clone(),
             format!("USER REQUEST:\n{user_prompt}\n\nTASK:\n{instruction}\n\nEVIDENCE:\n{evidence}"),
         )
-        .system(system.to_string())
+        .system(self.system_prompt(system))
         .options(self.opts())
         .keep_alive(KeepAlive::Indefinitely);
 
@@ -669,7 +699,7 @@ photo or voice note and ask about it. Do not invent facts about their documents,
 equipment or plant — none were provided.";
 
         let request = GenerationRequest::new(self.llm_model.clone(), user_prompt.to_string())
-            .system(system.to_string())
+            .system(self.system_prompt(system))
             .options(self.opts())
             .keep_alive(KeepAlive::Indefinitely);
 

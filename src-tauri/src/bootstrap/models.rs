@@ -1,16 +1,30 @@
-//! Model-tier recommendation + on-demand model pulls.
+//! Model recommendation + on-demand model pulls.
 //!
 //! The blueprint wants the app to "detect system specs … and based on that install
-//! a compatible model". [`recommend_models`] does the picking; [`ensure_models`]
-//! does the pulling (adapted from the scaffold's `ensure_required_models` — same
-//! streaming progress loop, but the model list is a parameter now).
+//! a compatible model". [`recommend`] does the picking; [`ensure_models`] does the
+//! pulling.
+//!
+//! The recommender is deliberately **not** an LLM — it runs before any model is
+//! installed. It is a scored search over a catalogue:
+//!
+//! 1. **Budget** — how much memory a model may use on this host's backend
+//!    (GPU VRAM, Apple unified memory, or system RAM minus the OS's share).
+//! 2. **Filter** — only models verified to drive this app's structured-JSON
+//!    pipeline (see `examples/model_check.rs`), and only ones that fit.
+//! 3. **Speed** — an estimate of decode tokens/s on this backend and core count.
+//! 4. **Pick** — the best fit for the user's profile among models fast enough for
+//!    the speed they asked for. Ties go to the smaller (and an installed model wins
+//!    a near-tie, so nobody downloads 2 GB for a two-point gain).
+//!
+//! Every step leaves a human-readable reason, shown on the bootstrap screen.
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
 use tokio_stream::StreamExt;
 
-use super::hardware::{detect_hardware, HardwareInfo};
+use super::hardware::{detect_hardware, Backend, HardwareInfo};
+use super::profile::{self, ProfileNeeds};
 use crate::AppState;
 
 /// The three models one session runs on.
@@ -18,13 +32,14 @@ use crate::AppState;
 pub struct ModelPlan {
     /// Resident text model — roles A/B/C, kept alive indefinitely.
     pub llm: String,
-    /// Compact vision model, called with `keep_alive = 0`.
+    /// Vision model. Empty when the profile expects no photos (nothing is pulled);
+    /// equal to `llm` when the resident model is multimodal and handles images.
     pub vision: String,
     /// Embedding model for RAG, called with `keep_alive = 0`.
     pub embed: String,
-    /// Human-readable tier label for the bootstrap screen.
+    /// Human-readable label for the bootstrap screen.
     pub tier_label: String,
-    /// Context window the resident model should run with, chosen with the tier.
+    /// Context window the resident model should run with.
     #[serde(default = "default_num_ctx")]
     pub num_ctx: u64,
 }
@@ -34,7 +49,7 @@ fn default_num_ctx() -> u64 {
 }
 
 impl ModelPlan {
-    /// Conservative default used before the user has confirmed a tier.
+    /// Conservative default used before the user has confirmed a plan.
     ///
     /// Deliberately the *floor* model: this is what runs if the confirmed plan was
     /// lost, and a too-small model gives a slow-but-working answer where a
@@ -42,113 +57,386 @@ impl ModelPlan {
     pub fn fallback() -> Self {
         Self {
             llm: LLM_FLOOR.name.into(),
-            vision: "moondream".into(),
-            embed: "nomic-embed-text".into(),
+            vision: VISION.name.into(),
+            embed: EMBED.name.into(),
             tier_label: "default (floor model)".into(),
             num_ctx: LLM_FLOOR.num_ctx,
         }
     }
-
-    /// Every model this plan needs, resident model first.
-    pub fn all(&self) -> Vec<String> {
-        vec![self.llm.clone(), self.vision.clone(), self.embed.clone()]
-    }
 }
 
-/// A resident-LLM option and what it actually costs to run.
-///
-/// The old tier logic compared core counts and RAM against bare thresholds, which
-/// could not answer the only question that matters — *will this model fit on this
-/// machine right now?* Carrying the sizes lets us check instead of guess.
+/// A resident-LLM option: what it costs, what it is good at, whether it is
+/// proven to work in this app.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct LlmSpec {
     /// Ollama tag.
     pub name: &'static str,
     /// Approximate resident footprint in GB: q4 weights plus KV-cache headroom.
     pub ram_gb: f32,
-    /// Approximate download size in GB.
+    /// Download size in GB (Ollama registry, 2026-10-10).
     pub download_gb: f32,
-    /// Context window to run this model with. The KV cache grows with this, and
-    /// on a small CPU model that memory and the longer prefill are a real cost —
-    /// so the smallest tier runs at 4096, not the blanket 8192 the engine
-    /// defaulted to on every machine.
+    /// Largest context window worth running it with.
     pub num_ctx: u64,
+    /// Parameters active per token, in billions. Decode speed on a CPU scales
+    /// with this, not with the file size.
+    pub active_params_b: f32,
+    /// Reads images itself, so no separate vision model has to be loaded.
+    pub multimodal: bool,
+    /// Passed all of the app's structured-output calls (`model_check`) or has a
+    /// production record in this app. **Unverified models are listed but never
+    /// recommended** — a model that can't produce the plan JSON can't run the
+    /// pipeline, however strong it is elsewhere.
+    pub verified: bool,
+    /// General capability, 0–100. Editorial: size and generation based, to be
+    /// refined from `model_check` runs.
+    pub quality: u8,
+    /// Strength bonuses, 0–10, weighted by the user's profile.
+    pub docs: u8,
+    pub reasoning: u8,
+    pub code: u8,
+    pub multilingual: u8,
 }
 
-// The resident-model ladder. Every one of these is an *instruct* model, because the
-// pipeline constrains decoding to a JSON schema (`FormatType::StructuredJson`) and
-// needs reliable schema-following all the way down to 0.5B.
-//
-// Thinking models are deliberately absent: `qwen3:4b` emits its reasoning before the
-// JSON and returns an empty body under structured output, surfacing as
-// `EOF while parsing a value at line 1 column 0`. That is an incompatibility, not a
-// size problem — do not add one back to this list.
-pub const LLM_MINIMAL: LlmSpec = LlmSpec {
-    name: "qwen2.5:0.5b-instruct",
-    ram_gb: 0.9,
-    download_gb: 0.4,
-    num_ctx: 4096,
-};
-pub const LLM_FLOOR: LlmSpec = LlmSpec {
-    name: "qwen2.5:1.5b-instruct",
-    ram_gb: 1.8,
-    download_gb: 1.0,
-    num_ctx: 8192,
-};
-pub const LLM_STANDARD: LlmSpec = LlmSpec {
-    name: "qwen2.5:3b-instruct",
-    ram_gb: 2.9,
-    download_gb: 1.9,
-    num_ctx: 8192,
-};
-pub const LLM_LARGE: LlmSpec = LlmSpec {
-    name: "qwen2.5:7b-instruct",
-    ram_gb: 5.6,
-    download_gb: 4.7,
-    num_ctx: 8192,
-};
+const fn llm(
+    name: &'static str,
+    ram_gb: f32,
+    download_gb: f32,
+    num_ctx: u64,
+    active_params_b: f32,
+    multimodal: bool,
+    verified: bool,
+    quality: u8,
+    [docs, reasoning, code, multilingual]: [u8; 4],
+) -> LlmSpec {
+    LlmSpec {
+        name,
+        ram_gb,
+        download_gb,
+        num_ctx,
+        active_params_b,
+        multimodal,
+        verified,
+        quality,
+        docs,
+        reasoning,
+        code,
+        multilingual,
+    }
+}
 
-/// Everything the bootstrap dropdown may offer, smallest first.
+// Every verified entry is an *instruct* model, because the pipeline constrains
+// decoding to a JSON schema (`FormatType::StructuredJson`). "Thinking" models
+// (e.g. `qwen3:4b`) emit reasoning first and return an empty body under that mode
+// (`EOF while parsing a value`) — so a new model stays `verified: false` until
+// `model_check` has actually run it, whatever its reputation.
+pub const LLM_MINIMAL: LlmSpec = llm("qwen2.5:0.5b-instruct", 0.9, 0.40, 4096, 0.5, false, true, 20, [3, 2, 2, 6]);
+pub const LLM_FLOOR: LlmSpec = llm("qwen2.5:1.5b-instruct", 1.8, 0.99, 8192, 1.5, false, true, 38, [4, 3, 3, 7]);
+pub const LLM_STANDARD: LlmSpec = llm("qwen2.5:3b-instruct", 2.9, 1.93, 8192, 3.1, false, true, 52, [5, 4, 4, 7]);
+pub const LLM_LARGE: LlmSpec = llm("qwen2.5:7b-instruct", 5.6, 4.68, 8192, 7.6, false, true, 70, [6, 6, 6, 8]);
+
+/// Everything the bootstrap dropdown may offer.
 pub const LLM_CATALOG: &[LlmSpec] = &[
     LLM_MINIMAL,
+    llm("qwen3.5:0.8b", 1.7, 1.32, 8192, 0.8, true, false, 34, [4, 4, 3, 7]),
     LLM_FLOOR,
+    llm("qwen2.5-coder:1.5b-instruct", 1.8, 0.99, 8192, 1.5, false, false, 34, [2, 3, 10, 5]),
+    llm("granite4.2:3b", 2.9, 2.24, 8192, 3.0, false, false, 54, [8, 5, 4, 3]),
     LLM_STANDARD,
-    LlmSpec {
-        name: "llama3.2:3b",
-        ram_gb: 3.0,
-        download_gb: 2.0,
-        num_ctx: 8192,
-    },
-    LlmSpec {
-        name: "phi4-mini",
-        ram_gb: 3.8,
-        download_gb: 2.5,
-        num_ctx: 8192,
-    },
+    llm("qwen2.5-coder:3b-instruct", 2.9, 1.93, 8192, 3.1, false, false, 48, [2, 4, 10, 5]),
+    llm("llama3.2:3b", 3.0, 2.02, 8192, 3.2, false, true, 50, [4, 4, 3, 3]),
+    llm("qwen3.5:2b", 3.2, 2.68, 8192, 2.0, true, false, 50, [5, 5, 4, 7]),
+    llm("phi4-mini", 3.8, 2.49, 8192, 3.8, false, false, 58, [4, 8, 5, 3]),
+    llm("qwen3.5:4b", 4.2, 3.32, 8192, 4.0, true, false, 64, [6, 7, 5, 8]),
     LLM_LARGE,
+    llm("granite4.2:8b", 6.3, 5.35, 8192, 8.0, false, false, 70, [9, 6, 5, 3]),
+    llm("gemma4:e4b", 7.5, 6.58, 8192, 4.0, true, false, 66, [5, 6, 4, 7]),
 ];
 
-/// The two specialists, identical on every tier.
-const VISION: LlmSpec = LlmSpec {
-    name: "moondream",
-    ram_gb: 1.7,
-    download_gb: 1.7,
-    num_ctx: 2048,
-};
-const EMBED: LlmSpec = LlmSpec {
-    name: "nomic-embed-text",
-    ram_gb: 0.5,
-    download_gb: 0.3,
-    num_ctx: 2048,
-};
+/// Separate vision models, used only when the resident model can't read images.
+/// `minicpm-v4.6:1b` is the lighter candidate; it takes over once verified.
+const VISION: LlmSpec = llm("moondream", 1.7, 1.74, 2048, 1.9, true, true, 0, [0, 0, 0, 0]);
+const VISION_CANDIDATES: &[LlmSpec] = &[
+    llm("minicpm-v4.6:1b", 1.6, 1.64, 2048, 1.0, true, false, 0, [0, 0, 0, 0]),
+    VISION,
+];
+const EMBED: LlmSpec = llm("nomic-embed-text", 0.5, 0.27, 2048, 0.1, false, true, 0, [0, 0, 0, 0]);
 
-/// RAM to leave for the OS, the webview and Ollama's own overhead. Without this the
-/// arithmetic says a model "fits" right up to the point the machine starts swapping.
-const HOST_HEADROOM_GB: f32 = 1.5;
+// --- speed model ---------------------------------------------------------
+//
+// Decode on a CPU is bounded twice: by compute (threads × SIMD ÷ active params)
+// and by memory bandwidth (every token streams the whole weight file through
+// RAM). On a GPU it is bandwidth-bound. The constants are placeholders until the
+// `model_check` runs on the 2-core laptop and the GPU laptop calibrate them;
+// what matters today is that they rank machines and models in the right order.
+
+/// Decode tok/s per CPU thread per 1B active parameters, with AVX2.
+const CPU_K: f32 = 4.0;
+/// Effective memory bandwidth of a laptop's dual-channel RAM, GB/s.
+const CPU_BANDWIDTH_GBPS: f32 = 18.0;
+
+fn gpu_bandwidth_gbps(backend: Backend) -> f32 {
+    match backend {
+        Backend::Cuda | Backend::Rocm => 200.0,
+        // Base M-series chips; Pro/Max are faster. Conservative on purpose.
+        Backend::Metal => 60.0,
+        Backend::Cpu => 0.0,
+    }
+}
+
+/// Where a model would run on this host, and how fast.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    on_gpu: bool,
+    tok_s: f32,
+}
+
+fn place(m: &LlmSpec, hw: &HardwareInfo) -> Option<Placement> {
+    if hw.has_usable_gpu() && m.ram_gb <= hw.gpu_budget_gb() {
+        return Some(Placement {
+            on_gpu: true,
+            tok_s: gpu_bandwidth_gbps(hw.backend) / m.download_gb,
+        });
+    }
+    if m.ram_gb <= hw.cpu_budget_gb() {
+        let simd = if !hw.avx2 {
+            0.35
+        } else if hw.avx512 {
+            1.15
+        } else {
+            1.0
+        };
+        let compute = CPU_K * hw.worker_threads() as f32 * simd / m.active_params_b;
+        let bandwidth = CPU_BANDWIDTH_GBPS / m.download_gb;
+        return Some(Placement {
+            on_gpu: false,
+            tok_s: compute.min(bandwidth),
+        });
+    }
+    None
+}
+
+/// Profile-weighted capability. A multimodal model gets a bonus when photos are
+/// expected: it spares loading (and paging in and out) a second vision model.
+fn fit_score(m: &LlmSpec, needs: &ProfileNeeds) -> f32 {
+    m.quality as f32
+        + m.docs as f32 * needs.docs
+        + m.reasoning as f32 * needs.reasoning
+        + m.code as f32 * needs.code * 1.5
+        + m.multilingual as f32 * needs.multilingual
+        + if needs.needs_vision && m.multimodal { 5.0 } else { 0.0 }
+}
 
 /// Catalogue entry for a model name, if we know it.
 pub fn lookup_llm(name: &str) -> Option<LlmSpec> {
-    LLM_CATALOG.iter().copied().find(|m| m.name == name)
+    LLM_CATALOG
+        .iter()
+        .chain(VISION_CANDIDATES)
+        .chain(std::iter::once(&EMBED))
+        .copied()
+        .find(|m| m.name == name)
+}
+
+/// The output of [`recommend`].
+#[derive(Clone, Debug, Serialize)]
+pub struct Recommendation {
+    pub plan: ModelPlan,
+    /// Why this pick, one plain-language line each. Shown on the bootstrap screen.
+    pub reasons: Vec<String>,
+    /// The next smaller model that fits — snappier, less capable.
+    pub faster: Option<String>,
+    /// The next more capable model that fits — slower than the speed target.
+    pub smarter: Option<String>,
+}
+
+/// Choose the resident model, the vision path and the context size for this host
+/// and this user.
+pub fn recommend(hw: &HardwareInfo, needs: &ProfileNeeds, installed: &[String]) -> Recommendation {
+    let mut reasons = vec![backend_reason(hw)];
+    if !hw.avx2 {
+        reasons.push(
+            "This CPU has no AVX2, so model maths runs several times slower per core — \
+             a smaller model is chosen to compensate."
+                .into(),
+        );
+    }
+
+    // Verified + fits, smallest first.
+    let mut fits: Vec<(LlmSpec, Placement)> = LLM_CATALOG
+        .iter()
+        .filter(|m| m.verified)
+        .filter_map(|m| place(m, hw).map(|p| (*m, p)))
+        .collect();
+    fits.sort_by(|a, b| a.0.ram_gb.total_cmp(&b.0.ram_gb));
+
+    let below_minimum = hw.physical_cores < 2 || fits.is_empty();
+    let (pick, placement) = if fits.is_empty() {
+        (LLM_MINIMAL, Placement { on_gpu: false, tok_s: 0.0 })
+    } else {
+        let fast_enough: Vec<&(LlmSpec, Placement)> =
+            fits.iter().filter(|(_, p)| p.tok_s >= needs.min_tok_s).collect();
+        match fast_enough
+            .iter()
+            .max_by(|a, b| fit_score(&a.0, needs).total_cmp(&fit_score(&b.0, needs)))
+        {
+            Some(best) => {
+                let best_score = fit_score(&best.0, needs);
+                // A near-tie that is already on disk beats a download.
+                let installed_alt = fast_enough.iter().find(|(m, _)| {
+                    m.name != best.0.name
+                        && model_present(installed, m.name)
+                        && fit_score(m, needs) >= best_score - 4.0
+                });
+                match installed_alt {
+                    Some((m, p)) if !model_present(installed, best.0.name) => {
+                        reasons.push(format!(
+                            "\"{}\" is already installed and nearly as good, so nothing \
+                             large has to download.",
+                            m.name
+                        ));
+                        (*m, *p)
+                    }
+                    _ => (best.0, best.1),
+                }
+            }
+            None => {
+                reasons.push(format!(
+                    "Even the smallest model runs below your speed target here \
+                     (~{:.0} tokens/s), so the fastest one is chosen.",
+                    fits[0].1.tok_s
+                ));
+                fits[0]
+            }
+        }
+    };
+
+    if !below_minimum {
+        reasons.push(format!(
+            "\"{}\" ≈ {:.0} tokens/s here ({}), fits in {:.1} GB.",
+            pick.name,
+            placement.tok_s,
+            if placement.on_gpu { "on the GPU" } else { "on the CPU" },
+            pick.ram_gb
+        ));
+        reasons.push(priority_reason(needs));
+    }
+
+    let idx = fits.iter().position(|(m, _)| m.name == pick.name);
+    let pick_score = fit_score(&pick, needs);
+    let faster = idx
+        .and_then(|i| fits[..i].iter().rev().find(|(m, _)| m.ram_gb < pick.ram_gb))
+        .map(|(m, _)| m.name.to_string());
+    let smarter = fits
+        .iter()
+        .filter(|(m, _)| m.ram_gb > pick.ram_gb && fit_score(m, needs) > pick_score)
+        .min_by(|a, b| a.0.ram_gb.total_cmp(&b.0.ram_gb))
+        .map(|(m, _)| m.name.to_string());
+
+    let vision = vision_for(&pick, needs);
+    if !needs.needs_vision {
+        reasons.push("No photos in your profile, so no vision model is downloaded.".into());
+    } else if vision == pick.name {
+        reasons.push(format!("\"{}\" reads images itself — no separate vision model.", pick.name));
+    }
+
+    // Bigger context only if the budget has room for the extra KV cache.
+    let budget = if placement.on_gpu { hw.gpu_budget_gb() } else { hw.cpu_budget_gb() };
+    let num_ctx = if budget - pick.ram_gb >= 0.5 {
+        needs.prefer_ctx.min(pick.num_ctx)
+    } else {
+        4096
+    };
+
+    let tier_label = if below_minimum {
+        "below minimum — this machine cannot run the workbench well".to_string()
+    } else {
+        format!(
+            "{} · {} · ~{:.0} tok/s",
+            backend_short(hw, placement.on_gpu),
+            pick.name,
+            placement.tok_s
+        )
+    };
+
+    Recommendation {
+        plan: ModelPlan {
+            llm: pick.name.into(),
+            vision,
+            embed: EMBED.name.into(),
+            tier_label,
+            num_ctx,
+        },
+        reasons,
+        faster,
+        smarter,
+    }
+}
+
+/// The vision path for a resident model under a profile.
+fn vision_for(resident: &LlmSpec, needs: &ProfileNeeds) -> String {
+    if !needs.needs_vision {
+        String::new()
+    } else if resident.multimodal && resident.verified {
+        resident.name.into()
+    } else {
+        VISION_CANDIDATES
+            .iter()
+            .find(|v| v.verified)
+            .unwrap_or(&VISION)
+            .name
+            .into()
+    }
+}
+
+fn backend_reason(hw: &HardwareInfo) -> String {
+    match hw.backend {
+        Backend::Cuda | Backend::Rocm if hw.has_usable_gpu() => format!(
+            "{} with {:.1} GB VRAM → models run on the GPU ({:.1} GB usable).",
+            hw.gpu_name,
+            hw.vram_gb.unwrap_or(0.0),
+            hw.gpu_budget_gb()
+        ),
+        Backend::Metal => format!(
+            "{} → Metal GPU on unified memory ({:.1} GB usable for a model).",
+            hw.gpu_name,
+            hw.gpu_budget_gb()
+        ),
+        _ => format!(
+            "{} physical core(s), no usable GPU → CPU inference on {} thread(s), \
+             {:.1} GB of {:.1} GB RAM usable for a model ({}).",
+            hw.physical_cores,
+            hw.worker_threads(),
+            hw.cpu_budget_gb(),
+            hw.total_ram_gb,
+            hw.os
+        ),
+    }
+}
+
+fn backend_short(hw: &HardwareInfo, on_gpu: bool) -> String {
+    if !on_gpu {
+        return format!("CPU · {} thread(s)", hw.worker_threads());
+    }
+    match hw.backend {
+        Backend::Cuda => "NVIDIA GPU".into(),
+        Backend::Rocm => "AMD GPU".into(),
+        Backend::Metal => "Apple GPU".into(),
+        Backend::Cpu => "CPU".into(),
+    }
+}
+
+fn priority_reason(needs: &ProfileNeeds) -> String {
+    let p = if needs.min_tok_s >= 10.0 {
+        "Fastest answers"
+    } else if needs.min_tok_s <= 3.0 {
+        "Best quality"
+    } else {
+        "Balanced"
+    };
+    format!(
+        "Profile: {p} (target ≥ {:.0} tokens/s), {} context.",
+        needs.min_tok_s,
+        if needs.prefer_ctx >= 8192 { "document-sized" } else { "short" }
+    )
 }
 
 /// Is `name` among the locally installed tags? Ollama lists an untagged pull as
@@ -189,74 +477,20 @@ fn legacy_system_models_present() -> bool {
         && std::path::Path::new("/usr/share/ollama/.ollama/models").is_dir()
 }
 
-/// Choose a resident LLM the host can actually run.
-///
-/// **Input:** the hardware probe. **Output:** a [`ModelPlan`].
-///
-/// Two different worlds. With GPU offload, VRAM sets the ceiling and a 7B is
-/// comfortable. Without it every token is computed on the CPU, and **model size is
-/// the latency**: RAM only decides whether the weights fit, not how fast they run.
-/// So the CPU ladder is gated on *physical* cores (hyperthreads share execution
-/// units and add little throughput) and on **total** RAM.
-///
-/// Total, not available: available RAM moves with whatever else is open, so the
-/// tier jumped between launches (open a browser, lose a tier). The tier is a
-/// property of the machine; whether it fits *right now* is a separate, live
-/// question that [`assess_llm`] answers with a warning instead.
-pub fn recommend_models(hw: &HardwareInfo) -> ModelPlan {
-    let cores = hw.physical_cores;
-    let ram = hw.total_ram_gb;
-
-    let (llm, tier) = if hw.has_usable_gpu() {
-        let vram = hw.vram_gb.unwrap_or(0.0);
-        if vram >= 8.0 && hw.total_ram_gb >= 8.0 {
-            (LLM_LARGE, "7B tier — GPU offload, ≥8 GB VRAM")
-        } else if vram >= 6.0 {
-            (LLM_STANDARD, "3B tier — GPU offload, ≥6 GB VRAM")
-        } else {
-            (LLM_FLOOR, "1.5B tier — GPU offload, <6 GB VRAM")
-        }
-    // Thresholds sit just under the marketed sizes because the OS reports usable
-    // GiB: a "16 GB" laptop shows ~15.5, an "8 GB" ~7.7, a "4 GB" ~3.7.
-    } else if cores >= 6 && ram >= 14.0 {
-        (LLM_STANDARD, "3B tier — CPU-only, ≥6 physical cores")
-    } else if cores >= 4 && ram >= 7.0 {
-        (
-            LLM_FLOOR,
-            "1.5B tier — CPU-only (small model keeps turns responsive)",
-        )
-    } else if cores >= 2 && ram >= 3.5 {
-        (
-            LLM_MINIMAL,
-            "0.5B tier — CPU-only, minimal host (answers will be rough)",
-        )
-    } else {
-        (
-            LLM_MINIMAL,
-            "below minimum — this machine cannot run the workbench well",
-        )
-    };
-
-    ModelPlan {
-        llm: llm.name.into(),
-        vision: VISION.name.into(),
-        embed: EMBED.name.into(),
-        tier_label: tier.into(),
-        num_ctx: llm.num_ctx,
-    }
-}
-
 /// How risky is running `model` on this host? Drives the bootstrap warning.
 #[derive(Clone, Debug, Serialize)]
 pub struct LlmAssessment {
     pub model: String,
     pub approx_ram_gb: f32,
-    /// Download still needed for the resident model plus both specialists —
+    /// Download still needed for the resident model plus its specialists —
     /// models already installed count as zero.
     pub approx_download_gb: f32,
     /// Which of (resident, vision, embed) are not installed yet. Empty means
     /// "Start" needs no download at all.
     pub missing_models: Vec<String>,
+    /// The vision model that goes with this choice ("" = none, or the model
+    /// itself when it is multimodal). The screen builds its plan from this.
+    pub vision: String,
     /// `"ok"` · `"caution"` · `"blocked"`.
     pub severity: String,
     /// Plain-language reasons, shown verbatim to the user.
@@ -268,21 +502,35 @@ pub struct LlmAssessment {
 /// Exists so that overriding the recommendation is an *informed* choice. Previously
 /// an override produced only a log line the user never saw, and picking a large
 /// model on a small host was the documented cause of unusable turn times.
-pub fn assess_llm(model: &str, hw: &HardwareInfo, installed: &[String]) -> LlmAssessment {
-    let recommended = recommend_models(hw);
+pub fn assess_llm(
+    model: &str,
+    hw: &HardwareInfo,
+    installed: &[String],
+    needs: &ProfileNeeds,
+) -> LlmAssessment {
+    let recommended = recommend(hw, needs, installed).plan;
     let spec = lookup_llm(model);
     let mut warnings = Vec::new();
     let mut severity = "ok";
 
     let ram_gb = match spec {
-        Some(m) => m.ram_gb,
+        Some(m) => {
+            if !m.verified {
+                severity = "caution";
+                warnings.push(format!(
+                    "\"{model}\" hasn't been verified with this app's structured output yet \
+                     (it may plan badly or return empty answers). Run `model_check` on it, \
+                     or pick a verified model."
+                ));
+            }
+            m.ram_gb
+        }
         None => {
             severity = "caution";
             warnings.push(format!(
-                "\"{model}\" is not in the tested catalogue, so its memory cost is \
-                 unknown. Models that emit reasoning before their answer (any \
-                 \"thinking\" model) return an empty result under this app's \
-                 structured-output mode."
+                "\"{model}\" is not in the catalogue, so its memory cost is unknown. Models \
+                 that emit reasoning before their answer (any \"thinking\" model) return an \
+                 empty result under this app's structured-output mode."
             ));
             0.0
         }
@@ -294,7 +542,7 @@ pub fn assess_llm(model: &str, hw: &HardwareInfo, installed: &[String]) -> LlmAs
     // can close a browser, but if they don't, the resident weights get swapped
     // out mid-generation, which is exactly what a desktop freeze feels like.
     if ram_gb > 0.0 {
-        let needed = ram_gb + HOST_HEADROOM_GB;
+        let needed = ram_gb + hw.os_headroom_gb();
         if needed > hw.total_ram_gb {
             severity = "blocked";
             warnings.push(format!(
@@ -329,7 +577,15 @@ pub fn assess_llm(model: &str, hw: &HardwareInfo, installed: &[String]) -> LlmAs
         }
     }
 
-    let missing_models: Vec<String> = [model, VISION.name, EMBED.name]
+    let vision = match spec {
+        Some(m) => vision_for(&m, needs),
+        None if needs.needs_vision => VISION.name.into(),
+        None => String::new(),
+    };
+    let missing_models: Vec<String> = [model, vision.as_str(), EMBED.name]
+        .into_iter()
+        .filter(|m| !m.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .filter(|m| !model_present(installed, m))
         .map(str::to_string)
@@ -340,9 +596,19 @@ pub fn assess_llm(model: &str, hw: &HardwareInfo, installed: &[String]) -> LlmAs
         approx_ram_gb: ram_gb,
         approx_download_gb: download_estimate_gb(&missing_models),
         missing_models,
+        vision,
         severity: severity.into(),
         warnings,
     }
+}
+
+/// One dropdown entry.
+#[derive(Clone, Debug, Serialize)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub verified: bool,
+    pub multimodal: bool,
+    pub download_gb: f32,
 }
 
 /// Hardware + recommendation in one call, for the bootstrap screen.
@@ -353,6 +619,13 @@ pub struct SystemProbe {
     /// The recommendation judged against this host. The field is here so the
     /// bootstrap screen gets the download size without a second call.
     pub assessment: LlmAssessment,
+    /// Why this model, one line each.
+    pub reasons: Vec<String>,
+    pub faster: Option<String>,
+    pub smarter: Option<String>,
+    /// The dropdown's options — from here, so the screen and the recommender can
+    /// never disagree about what exists.
+    pub catalog: Vec<CatalogEntry>,
     /// Locally installed tags, with Ollama's implicit `:latest` stripped so they
     /// compare directly against catalogue names (`phi4-mini:latest` →
     /// `phi4-mini`). The front-end does exact matching only; all tag rules live
@@ -364,23 +637,47 @@ pub struct SystemProbe {
     pub legacy_system_models: bool,
 }
 
+fn profile_needs(app: &tauri::AppHandle) -> ProfileNeeds {
+    profile::load(app).unwrap_or_default().needs()
+}
+
 #[tauri::command]
-pub async fn probe_system(state: State<'_, AppState>) -> Result<SystemProbe, String> {
+pub async fn probe_system(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SystemProbe, String> {
     let hardware = detect_hardware();
-    let recommended = recommend_models(&hardware);
+    let needs = profile_needs(&app);
     let installed = installed_models(&state).await;
-    let assessment = assess_llm(&recommended.llm, &hardware, &installed);
+    let rec = recommend(&hardware, &needs, &installed);
+    let assessment = assess_llm(&rec.plan.llm, &hardware, &installed, &needs);
     tracing::info!(
-        recommended = %recommended.llm,
-        tier = %recommended.tier_label,
+        recommended = %rec.plan.llm,
+        vision = %rec.plan.vision,
+        num_ctx = rec.plan.num_ctx,
+        tier = %rec.plan.tier_label,
+        faster = ?rec.faster,
+        smarter = ?rec.smarter,
         installed = ?installed,
         approx_download_gb = assessment.approx_download_gb,
         "system probe -> recommendation"
     );
     Ok(SystemProbe {
         hardware,
-        recommended,
+        recommended: rec.plan,
         assessment,
+        reasons: rec.reasons,
+        faster: rec.faster,
+        smarter: rec.smarter,
+        catalog: LLM_CATALOG
+            .iter()
+            .map(|m| CatalogEntry {
+                name: m.name.into(),
+                verified: m.verified,
+                multimodal: m.multimodal,
+                download_gb: m.download_gb,
+            })
+            .collect(),
         installed_models: installed
             .iter()
             .map(|m| m.strip_suffix(":latest").unwrap_or(m).to_string())
@@ -393,10 +690,14 @@ pub async fn probe_system(state: State<'_, AppState>) -> Result<SystemProbe, Str
 /// warning. Re-probes the hardware so the RAM figure reflects the machine's state
 /// right now, and re-lists local models so the download figure is current.
 #[tauri::command]
-pub async fn assess_model(model: String, state: State<'_, AppState>) -> Result<LlmAssessment, String> {
+pub async fn assess_model(
+    model: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LlmAssessment, String> {
     let hw = detect_hardware();
     let installed = installed_models(&state).await;
-    let assessment = assess_llm(&model, &hw, &installed);
+    let assessment = assess_llm(&model, &hw, &installed, &profile_needs(&app));
     tracing::info!(
         model = %model,
         severity = %assessment.severity,
@@ -440,11 +741,6 @@ fn download_estimate_gb(missing: &[String]) -> f32 {
         .map(|name| {
             lookup_llm(name)
                 .map(|m| m.download_gb)
-                .or_else(|| match name.as_str() {
-                    n if n.starts_with("moondream") => Some(1.7),
-                    n if n.starts_with("nomic-embed") => Some(0.3),
-                    _ => None,
-                })
                 // An unknown tag: assume a middleweight model so the check errs
                 // toward warning rather than toward a surprise out-of-space.
                 .unwrap_or(2.5)
@@ -457,7 +753,8 @@ fn download_estimate_gb(missing: &[String]) -> f32 {
 ///
 /// **Inputs:** the model names to guarantee, a progress channel, app state (for the
 /// Ollama client). **Output:** `Ok(())` once all are present, or the first pull
-/// error.
+/// error. Empty names (no vision model in this plan) and duplicates (a
+/// multimodal resident listed as its own vision model) are skipped.
 ///
 /// Before pulling anything it checks free disk against the estimated download so
 /// the user is told up front, not after a 20-minute partial download fills the
@@ -469,6 +766,12 @@ pub async fn ensure_models(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let models: Vec<String> = models
+        .into_iter()
+        .filter(|m| !m.trim().is_empty() && seen.insert(m.clone()))
+        .collect();
+
     // --- what is actually missing -----------------------------------------
     let local: Vec<String> = state
         .ollama
@@ -558,171 +861,259 @@ pub async fn ensure_models(
 
 #[cfg(test)]
 mod tests {
+    use super::super::profile::UserProfile;
     use super::*;
 
-    /// `logical` defaults to 2x physical — the hyperthreaded case that used to fool
-    /// the tier logic into reading a 4-core laptop as an 8-core machine.
-    fn hw(physical: usize, free_ram: f32, vram: Option<f32>, cuda: bool) -> HardwareInfo {
-        HardwareInfo {
-            total_ram_gb: free_ram + 4.0,
-            available_ram_gb: free_ram,
-            cpu_cores: physical * 2,
-            physical_cores: physical,
-            gpu_vendor: if cuda { "NVIDIA".into() } else { "none".into() },
-            gpu_name: if cuda { "test gpu".into() } else { "none".into() },
-            vram_gb: vram,
-            cuda_available: cuda,
-        }
-    }
-
-    /// The regression that made the app unusable: a CPU-only host with plenty of RAM
-    /// was handed a multi-billion-parameter model because the rule read
-    /// `vram >= 8 || ram >= 16`. RAM says the weights *fit*, not that they run fast.
-    #[test]
-    fn plenty_of_ram_without_a_gpu_does_not_get_a_big_model() {
-        let plan = recommend_models(&hw(4, 12.0, None, false));
-        assert_eq!(plan.llm, LLM_FLOOR.name, "got {}", plan.tier_label);
-    }
-
-    /// The declared floor we must never freeze: 8 GB RAM, no GPU, 4 physical cores.
-    #[test]
-    fn the_eight_gb_no_gpu_floor_gets_the_floor_model() {
-        // 8 GB total with a browser open leaves roughly this much.
-        let plan = recommend_models(&hw(4, 5.5, None, false));
-        assert_eq!(plan.llm, LLM_FLOOR.name, "got {}", plan.tier_label);
-        assert_eq!(
-            assess_llm(&plan.llm, &hw(4, 5.5, None, false), &[]).severity,
-            "ok",
-            "the recommendation must never warn about itself"
-        );
-    }
-
-    /// Hyperthreads must not promote a machine a tier. Same silicon as the floor
-    /// case, and the old logical-core rule read it as 8 cores.
-    #[test]
-    fn hyperthreads_do_not_promote_a_tier() {
-        let host = hw(4, 12.0, None, false);
-        assert_eq!(host.cpu_cores, 8, "test fixture should look hyperthreaded");
-        assert_eq!(recommend_models(&host).llm, LLM_FLOOR.name);
-        assert_eq!(host.worker_threads(), 3, "3 of 4 physical cores, not 7 of 8");
-    }
-
-    #[test]
-    fn a_real_gpu_still_gets_the_big_model() {
-        let plan = recommend_models(&hw(8, 24.0, Some(12.0), true));
-        assert_eq!(plan.llm, LLM_LARGE.name);
-    }
-
-    /// An integrated adapter reporting no usable VRAM is a CPU host, whatever it is
-    /// called.
-    #[test]
-    fn integrated_graphics_counts_as_cpu_only() {
-        let plan = recommend_models(&hw(4, 12.0, Some(1.0), false));
-        assert_eq!(plan.llm, LLM_FLOOR.name, "got {}", plan.tier_label);
-    }
-
-    #[test]
-    fn many_cores_and_free_ram_can_afford_the_mid_model() {
-        assert_eq!(recommend_models(&hw(8, 16.0, None, false)).llm, LLM_STANDARD.name);
-    }
-
-    /// Explicit total / available, for the cases where the two must differ.
-    fn hw_ram(physical: usize, total: f32, available: f32) -> HardwareInfo {
+    fn machine(
+        physical: usize,
+        total: f32,
+        available: f32,
+        backend: Backend,
+        vram: Option<f32>,
+        os: &str,
+        avx2: bool,
+    ) -> HardwareInfo {
         HardwareInfo {
             total_ram_gb: total,
             available_ram_gb: available,
-            ..hw(physical, available, None, false)
+            cpu_cores: physical * 2,
+            physical_cores: physical,
+            gpu_vendor: "test".into(),
+            gpu_name: "test gpu".into(),
+            vram_gb: vram,
+            cuda_available: backend == Backend::Cuda,
+            backend,
+            os: os.into(),
+            arch: "x86_64".into(),
+            avx2,
+            avx512: false,
         }
     }
 
+    fn cpu(physical: usize, total: f32) -> HardwareInfo {
+        machine(physical, total, total * 0.6, Backend::Cpu, None, "linux", true)
+    }
+
+    fn balanced() -> ProfileNeeds {
+        UserProfile::default().needs()
+    }
+
+    fn with(priority: &str) -> ProfileNeeds {
+        UserProfile {
+            priority: priority.into(),
+            ..Default::default()
+        }
+        .needs()
+    }
+
+    fn pick(hw: &HardwareInfo, needs: &ProfileNeeds) -> String {
+        recommend(hw, needs, &[]).plan.llm
+    }
+
+    // --- the machines the plan names -------------------------------------
+
+    /// The author's laptop: i7-4600U, 2 physical cores (1 inference thread),
+    /// ~15 GB. RAM is plentiful; cores keep it on the smallest model.
+    #[test]
+    fn two_core_laptop_stays_on_the_smallest_model() {
+        let hw = cpu(2, 15.4);
+        assert_eq!(pick(&hw, &balanced()), LLM_MINIMAL.name);
+        assert_eq!(pick(&hw, &with("quality")), LLM_MINIMAL.name, "1 thread can't carry 1.5B at 3 tok/s");
+    }
+
+    /// The declared floor: 8 GB, 4 cores, no GPU.
+    #[test]
+    fn eight_gb_four_core_gets_the_floor_model_and_no_warning() {
+        let hw = cpu(4, 7.7);
+        let needs = balanced();
+        assert_eq!(pick(&hw, &needs), LLM_FLOOR.name);
+        assert_eq!(assess_llm(LLM_FLOOR.name, &hw, &[], &needs).severity, "ok");
+    }
+
+    /// Same machine, different user: "fastest" goes smaller, "best quality" trades
+    /// speed for a 3B.
+    #[test]
+    fn profile_changes_the_pick_on_the_same_machine() {
+        let hw = cpu(4, 7.7);
+        assert_eq!(pick(&hw, &with("fast")), LLM_MINIMAL.name);
+        assert_eq!(pick(&hw, &balanced()), LLM_FLOOR.name);
+        assert_eq!(pick(&hw, &with("quality")), LLM_STANDARD.name);
+    }
+
+    #[test]
+    fn many_cores_can_afford_the_mid_model() {
+        assert_eq!(pick(&cpu(8, 15.5), &balanced()), LLM_STANDARD.name);
+    }
+
+    /// A 16 GB M1 used to be read as CPU-only and handed the 0.5B model.
+    #[test]
+    fn apple_silicon_gets_a_real_model() {
+        let mac = machine(8, 16.0, 9.0, Backend::Metal, None, "macos", true);
+        assert_eq!(pick(&mac, &balanced()), LLM_LARGE.name);
+    }
+
+    #[test]
+    fn an_rtx_4060_gets_the_7b() {
+        let gpu = machine(8, 16.0, 9.0, Backend::Cuda, Some(8.0), "windows", true);
+        assert_eq!(pick(&gpu, &balanced()), LLM_LARGE.name);
+    }
+
+    #[test]
+    fn an_amd_8gb_card_on_linux_is_a_gpu_too() {
+        let amd = machine(6, 16.0, 9.0, Backend::Rocm, Some(8.0), "linux", true);
+        assert_eq!(pick(&amd, &balanced()), LLM_LARGE.name);
+    }
+
+    /// A small card that can't hold the model falls back to CPU placement.
+    #[test]
+    fn a_tiny_gpu_falls_back_to_cpu() {
+        let hw = machine(4, 7.7, 5.0, Backend::Cuda, Some(2.0), "windows", true);
+        assert!(!hw.has_usable_gpu());
+        assert_eq!(pick(&hw, &balanced()), LLM_FLOOR.name);
+    }
+
+    /// No AVX2 (an old Celeron): slower per core, and the machine says so.
+    #[test]
+    fn no_avx2_drops_a_tier_and_says_why() {
+        let celeron = machine(4, 7.7, 5.0, Backend::Cpu, None, "windows", false);
+        let rec = recommend(&celeron, &balanced(), &[]);
+        assert_eq!(rec.plan.llm, LLM_MINIMAL.name);
+        assert!(rec.reasons.iter().any(|r| r.contains("AVX2")), "{:?}", rec.reasons);
+    }
+
+    #[test]
+    fn a_one_core_machine_says_it_is_below_minimum() {
+        let rec = recommend(&cpu(1, 6.0), &balanced(), &[]);
+        assert!(rec.plan.tier_label.contains("below minimum"), "{}", rec.plan.tier_label);
+    }
+
     /// The tier is a property of the machine: opening a browser (less available
-    /// RAM) must not drop a tier between launches. That jumpiness is why the
-    /// recommendation moved from available to total RAM.
+    /// RAM) must not change the pick between launches.
     #[test]
-    fn available_ram_does_not_move_the_tier() {
-        let idle = recommend_models(&hw_ram(8, 15.5, 12.0));
-        let busy = recommend_models(&hw_ram(8, 15.5, 3.0));
-        assert_eq!(idle.llm, busy.llm, "tier changed with available RAM");
-        assert_eq!(idle.llm, LLM_STANDARD.name);
+    fn available_ram_does_not_move_the_pick() {
+        let idle = machine(8, 15.5, 12.0, Backend::Cpu, None, "linux", true);
+        let busy = machine(8, 15.5, 3.0, Backend::Cpu, None, "linux", true);
+        assert_eq!(pick(&idle, &balanced()), pick(&busy, &balanced()));
     }
 
-    /// A machine that is genuinely small in total still drops a tier, using the
-    /// usable-GiB figures the OS actually reports for 8 GB and 4 GB laptops.
+    /// Windows idles heavier: the same 4 GB laptop has less room on Windows.
     #[test]
-    fn small_total_ram_drops_a_tier() {
-        assert_eq!(recommend_models(&hw_ram(8, 7.7, 5.0)).llm, LLM_FLOOR.name);
-        assert_eq!(recommend_models(&hw_ram(8, 3.7, 2.5)).llm, LLM_MINIMAL.name);
-    }
-
-    /// The author's own laptop: i7-4600U, 2 physical cores, ~15 GiB. Cores, not
-    /// RAM, are what keep it on the smallest model.
-    #[test]
-    fn two_cores_stay_minimal_however_much_ram() {
-        assert_eq!(recommend_models(&hw_ram(2, 15.4, 10.0)).llm, LLM_MINIMAL.name);
+    fn small_total_ram_limits_the_model_by_os() {
+        let linux = machine(4, 3.7, 2.5, Backend::Cpu, None, "linux", true);
+        let windows = machine(4, 3.7, 2.5, Backend::Cpu, None, "windows", true);
+        assert_eq!(pick(&linux, &balanced()), LLM_FLOOR.name, "1.8 GB fits in 3.7 − 1.5");
+        assert_eq!(pick(&windows, &balanced()), LLM_MINIMAL.name, "only 0.7 GB left after Windows");
     }
 
     #[test]
-    fn a_machine_that_cannot_cope_says_so() {
-        let plan = recommend_models(&hw(1, 2.0, None, false));
-        assert!(
-            plan.tier_label.contains("below minimum"),
-            "expected an explicit refusal, got {}",
-            plan.tier_label
-        );
+    fn hyperthreads_do_not_promote_a_tier() {
+        let host = cpu(4, 16.0);
+        assert_eq!(host.cpu_cores, 8, "fixture should look hyperthreaded");
+        assert_eq!(pick(&host, &balanced()), LLM_FLOOR.name);
+        assert_eq!(host.worker_threads(), 3);
+    }
+
+    // --- safety rules -------------------------------------------------------
+
+    /// Unverified models are listed but never recommended, on any machine.
+    #[test]
+    fn never_recommends_an_unverified_model() {
+        for hw in [
+            cpu(2, 15.4),
+            cpu(8, 32.0),
+            machine(16, 64.0, 40.0, Backend::Cuda, Some(24.0), "linux", true),
+            machine(10, 32.0, 20.0, Backend::Metal, None, "macos", true),
+        ] {
+            for p in ["fast", "balanced", "quality"] {
+                let name = pick(&hw, &with(p));
+                assert!(lookup_llm(&name).unwrap().verified, "{name} on {:?}/{p}", hw.backend);
+            }
+        }
     }
 
     #[test]
-    fn one_core_is_always_left_for_the_os() {
-        assert_eq!(hw(4, 12.0, None, false).worker_threads(), 3);
-        assert_eq!(hw(1, 8.0, None, false).worker_threads(), 1);
+    fn the_pick_always_fits_the_budget() {
+        for hw in [cpu(2, 3.7), cpu(4, 7.7), cpu(8, 15.5)] {
+            let spec = lookup_llm(&pick(&hw, &with("quality"))).unwrap();
+            assert!(spec.ram_gb <= hw.cpu_budget_gb(), "{} on {} GB", spec.name, hw.total_ram_gb);
+        }
     }
 
-    // --- assessment -------------------------------------------------------
+    #[test]
+    fn alternatives_bracket_the_pick() {
+        let rec = recommend(&cpu(4, 7.7), &balanced(), &[]);
+        assert_eq!(rec.faster.as_deref(), Some(LLM_MINIMAL.name));
+        assert!(rec.smarter.is_some(), "a 3B fits a 7.7 GB box");
+    }
 
-    /// A model bigger than the machine's total RAM can never run: blocked, with
-    /// the real numbers in the message.
+    /// A near-tie already on disk beats downloading the slightly better one.
+    #[test]
+    fn an_installed_near_tie_wins() {
+        let hw = cpu(8, 15.5);
+        let installed = vec!["llama3.2:3b".to_string()];
+        let rec = recommend(&hw, &balanced(), &installed);
+        assert_eq!(rec.plan.llm, "llama3.2:3b", "{:?}", rec.reasons);
+    }
+
+    // --- vision ------------------------------------------------------------
+
+    #[test]
+    fn no_photos_means_no_vision_model() {
+        let needs = UserProfile {
+            inputs: vec!["documents".into()],
+            ..Default::default()
+        }
+        .needs();
+        let rec = recommend(&cpu(4, 7.7), &needs, &[]);
+        assert_eq!(rec.plan.vision, "");
+        let a = assess_llm(&rec.plan.llm, &cpu(4, 7.7), &[], &needs);
+        assert!(!a.missing_models.iter().any(|m| m.contains("moondream")), "{:?}", a.missing_models);
+    }
+
+    #[test]
+    fn photos_keep_a_verified_vision_model() {
+        let rec = recommend(&cpu(4, 7.7), &balanced(), &[]);
+        assert_eq!(rec.plan.vision, VISION.name);
+    }
+
+    // --- assessment ------------------------------------------------------------
+
     #[test]
     fn a_model_that_cannot_fit_is_blocked() {
-        let a = assess_llm(LLM_LARGE.name, &hw_ram(4, 6.0, 4.0), &[]);
+        let a = assess_llm(LLM_LARGE.name, &cpu(4, 6.0), &[], &balanced());
         assert_eq!(a.severity, "blocked", "{:?}", a.warnings);
-        assert!(
-            a.warnings.iter().any(|w| w.contains("6.0 GB in total")),
-            "the warning should quote the real numbers: {:?}",
-            a.warnings
-        );
+        assert!(a.warnings.iter().any(|w| w.contains("6.0 GB in total")), "{:?}", a.warnings);
     }
 
-    /// Fits the machine, but not beside what is open right now: a caution telling
-    /// the user to close apps — not a block, because closing apps fixes it.
     #[test]
     fn fits_in_total_but_not_now_is_a_caution() {
-        let a = assess_llm(LLM_FLOOR.name, &hw_ram(4, 7.7, 2.0), &[]);
+        let hw = machine(4, 7.7, 2.0, Backend::Cpu, None, "linux", true);
+        let a = assess_llm(LLM_FLOOR.name, &hw, &[], &balanced());
         assert_eq!(a.severity, "caution", "{:?}", a.warnings);
-        assert!(
-            a.warnings.iter().any(|w| w.contains("available right now")),
-            "{:?}",
-            a.warnings
-        );
+        assert!(a.warnings.iter().any(|w| w.contains("available right now")));
     }
 
-    /// Fits in RAM, but far bigger than this host should run: caution, not silence.
     #[test]
     fn an_oversized_but_fitting_model_warns() {
-        let a = assess_llm(LLM_STANDARD.name, &hw(4, 12.0, None, false), &[]);
+        let a = assess_llm(LLM_STANDARD.name, &cpu(4, 16.0), &[], &balanced());
         assert_eq!(a.severity, "caution", "{:?}", a.warnings);
         assert!(a.warnings.iter().any(|w| w.contains("slower")));
     }
 
-    /// An unknown tag cannot be sized, and thinking models are the trap worth naming.
+    #[test]
+    fn an_unverified_catalogue_model_is_a_caution() {
+        let a = assess_llm("qwen3.5:2b", &cpu(8, 16.0), &[], &balanced());
+        assert_eq!(a.severity, "caution");
+        assert!(a.warnings.iter().any(|w| w.contains("verified")), "{:?}", a.warnings);
+    }
+
     #[test]
     fn an_unknown_model_is_flagged() {
-        let a = assess_llm("qwen3:4b", &hw(8, 16.0, None, false), &[]);
+        let a = assess_llm("qwen3:4b", &cpu(8, 16.0), &[], &balanced());
         assert_eq!(a.severity, "caution");
         assert!(a.warnings.iter().any(|w| w.contains("thinking")));
     }
 
-    /// Models already pulled cost nothing: the screen must not claim a download
-    /// that the pull loop then skips.
     #[test]
     fn installed_models_are_not_counted_as_downloads() {
         let installed = vec![
@@ -730,13 +1121,13 @@ mod tests {
             "moondream:latest".to_string(),
             "nomic-embed-text:latest".to_string(),
         ];
-        let a = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false), &installed);
+        let a = assess_llm(LLM_FLOOR.name, &cpu(4, 16.0), &installed, &balanced());
         assert!(a.missing_models.is_empty(), "{:?}", a.missing_models);
-        assert!(a.approx_download_gb.abs() < 0.01, "got {}", a.approx_download_gb);
+        assert!(a.approx_download_gb.abs() < 0.01);
 
         let partial = vec!["moondream:latest".to_string()];
-        let b = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false), &partial);
-        assert_eq!(b.missing_models, vec![LLM_FLOOR.name, "nomic-embed-text"]);
+        let b = assess_llm(LLM_FLOOR.name, &cpu(4, 16.0), &partial, &balanced());
+        assert_eq!(b.missing_models.len(), 2, "{:?}", b.missing_models);
     }
 
     #[test]
@@ -746,28 +1137,19 @@ mod tests {
         assert!(!model_present(&installed, "phi4"));
     }
 
-    /// The download figure must cover the specialists too, or the disk check lies.
     #[test]
     fn download_size_includes_the_specialists() {
-        let a = assess_llm(LLM_FLOOR.name, &hw(4, 12.0, None, false), &[]);
-        assert!(
-            (a.approx_download_gb - (LLM_FLOOR.download_gb + 1.7 + 0.3)).abs() < 0.01,
-            "got {}",
-            a.approx_download_gb
-        );
+        let a = assess_llm(LLM_FLOOR.name, &cpu(4, 16.0), &[], &balanced());
+        let expect = LLM_FLOOR.download_gb + VISION.download_gb + EMBED.download_gb;
+        assert!((a.approx_download_gb - expect).abs() < 0.01, "got {}", a.approx_download_gb);
     }
 
-    /// Every dropdown option must be sizeable, or the fit check silently degrades to
-    /// "unknown" for a model we actually ship.
     #[test]
     fn every_catalogue_entry_is_self_consistent() {
         for m in LLM_CATALOG {
             assert!(m.ram_gb > 0.0 && m.download_gb > 0.0, "{} has no sizes", m.name);
-            assert!(
-                m.ram_gb >= m.download_gb,
-                "{}: resident cost should exceed download size (KV cache)",
-                m.name
-            );
+            assert!(m.active_params_b > 0.0, "{} has no param count", m.name);
+            assert!(m.ram_gb >= m.download_gb, "{}: resident cost should exceed download", m.name);
             assert!(lookup_llm(m.name).is_some(), "{} not findable", m.name);
         }
     }

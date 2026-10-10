@@ -15,9 +15,29 @@
 | 2 | Five tool modules + analysis + executor + quality gate + compiler | ✅ done, 4 smoke tests |
 | 3 | Session memory (rolling compression) + AES-256-GCM persistent memory | ✅ done, 3 tests |
 | 4 | React UI: bootstrap gate, stepper, HITL modal, report, audit sidebar | ✅ done, tsc clean |
+| 4.1 | Profile-aware, OS-aware model recommendation + merged analysis call (see below) | 🚧 in progress (2026-10-10) |
 | 5 | PyInstaller-free packaging + air-gap doc | ⏳ not started (stretch) |
 
-`cargo test -p workbench-core -j 1` → **44/44** and `cargo test -p tauri-app -j 1` → **20/20** (2026-10-10, after the hackathon fix pass). `tsc` clean, no warnings.
+`cargo test -p workbench-core -j 1` → **45/45** and `cargo test -p tauri-app -j 1` → **20/20** (2026-10-10, after the hackathon fix pass and the timing instrumentation). `tsc` clean, no warnings.
+
+---
+
+## Phase 4.1: profile-aware, OS-aware model recommendation (in progress)
+
+**Goal:** an ordinary consumer machine should run a model that is both smooth and as smart as the hardware allows. Today the recommender is a 4-step ladder on cores and RAM. It knows nothing about the user's work, it reads every non-NVIDIA machine (Apple Silicon, AMD) as CPU-only, and its catalogue predates newer small models on Ollama: qwen3.5 0.8b/2b/4b with built-in vision, gemma4 e2b/e4b, granite4.2 3b/8b, and minicpm-v4.6 1b for vision.
+
+**Design rule:** the recommender is deterministic code and tables, never an LLM. It runs before any model exists, and this way it can explain itself and be unit-tested.
+
+| Item | What | Owner | State |
+|---|---|---|---|
+| E0 | `examples/model_check.rs`: runs a model through the app's real JSON schemas (intent, plan, report, plus vision if multimodal) and reports pass/fail and load/prefill/decode speed. Curated shortlist checked on the 2-core laptop and the GPU laptop; a model that fails a schema is never recommended. | fix | ⏳ |
+| R1 | OS/backend-aware detection: Apple Silicon (Metal, unified memory), AMD VRAM on Linux (sysfs) and Windows (registry, real 64-bit VRAM), CPU AVX2/AVX-512 (no AVX2 → one tier down), per-OS RAM headroom (Win/mac 3 GB, Linux 1.5 GB). | fix | ⏳ |
+| E1 | Profile page before hardware detection: industry, kind of work, inputs (docs/photos/voice/code), speed-vs-quality priority, language. Saved as `profile.json` and asked once. Maps deterministically to use-case weights, vision/audio needs, speed target, context size, a short persona line and example prompts. | fix | ⏳ |
+| R2 | Scored recommender: memory budget per backend → filter by verified + fits → estimated tok/s vs the profile's speed target → best profile-fit quality. Returns reasons plus faster/smarter alternatives. Skips the vision model when no photos are expected; uses a verified multimodal resident model instead of a second vision model when possible. | fix | ⏳ |
+| E2 | Profile at runtime: a one-line persona in the system prompts, and industry-specific example prompts. | fix | ⏳ |
+| M | **Merge `summarize` + `compare_to_sop` into one `assess` call.** Both currently get the same inputs, and each re-embeds the evidence (an embedding-model reload) and prefills about half the context. New registry task `assess` (Analyze stage); a deterministic post-validation rewrite in `planner/` folds the pair into one step (union of dependencies, dependents repointed, also applied to resumed plans); `fallback_plan` emits `assess` when knowledge is needed; the single tasks stay valid. Measured before/after with the `e2e` timing table. | feature | ⏳ |
+
+Phase 5 (packaging) stays reserved for the installer / Ollama sidecar / offline bundle and is still deferred.
 
 ---
 

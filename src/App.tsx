@@ -6,6 +6,7 @@ import "./App.css";
 import { AuditSidebar } from "./components/AuditSidebar";
 import { BootstrapGate } from "./components/BootstrapGate";
 import { HitlModal } from "./components/HitlModal";
+import { ProfileGate } from "./components/ProfileGate";
 import { PromptPanel } from "./components/PromptPanel";
 import { ReportView } from "./components/ReportView";
 import { SessionSidebar } from "./components/SessionSidebar";
@@ -16,6 +17,7 @@ import {
   fileToUpload,
   forgetMemory,
   getMemory,
+  getProfile,
   listSessions,
   loadSession,
   renameSession,
@@ -32,6 +34,7 @@ import type {
   SessionMeta,
   StepEvent,
   UploadedFile,
+  UserProfile,
 } from "./types";
 
 const SESSION_KEY = "wb.sessionId";
@@ -52,6 +55,49 @@ const EXAMPLES: { prompt: string; files: string[] }[] = [
     files: ["fee_card.pdf"],
   },
 ];
+
+// One extra card for the industry chosen on the profile screen, shown first.
+// These use the user's own files (no fixture ships for them), so the card says
+// "your …"; the two fixture-backed examples above stay for everyone.
+const INDUSTRY_EXAMPLES: Record<string, { prompt: string; files: string[] }> = {
+  finance: {
+    prompt: "Summarise this invoice and flag any charge above ₹50,000.",
+    files: ["your invoice.pdf"],
+  },
+  construction: {
+    prompt: "List the safety requirements in this method statement and flag anything missing.",
+    files: ["your method statement.pdf"],
+  },
+  legal: {
+    prompt: "Summarise the obligations, deadlines and penalties in this contract.",
+    files: ["your contract.pdf"],
+  },
+  healthcare: {
+    prompt: "Summarise this report in plain language and list the follow-up actions.",
+    files: ["your report.pdf"],
+  },
+  logistics: {
+    prompt: "Which shipments in this manifest are late, and what is the likely cause?",
+    files: ["your manifest.pdf"],
+  },
+  it: {
+    prompt: "Summarise this incident report: root cause, impact and fixes.",
+    files: ["your incident report.pdf"],
+  },
+  government: {
+    prompt: "Summarise this circular and list who must act, and by when.",
+    files: ["your circular.pdf"],
+  },
+  education: {
+    prompt: "Turn this chapter into five key points and three quiz questions.",
+    files: ["your chapter.pdf"],
+  },
+};
+
+function examplesFor(industry: string | undefined) {
+  const extra = industry ? INDUSTRY_EXAMPLES[industry] : undefined;
+  return extra ? [extra, ...EXAMPLES] : EXAMPLES;
+}
 
 function newSessionId(): string {
   return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -76,6 +122,9 @@ function initialSessionId(): string {
 
 function App() {
   const [plan, setPlan] = useState<ModelPlan | null>(null);
+  // undefined = still reading profile.json; null = first launch (ask).
+  const [profile, setProfile] = useState<UserProfile | null | undefined>(undefined);
+  const [editingProfile, setEditingProfile] = useState(false);
 
   // --- session / transcript -------------------------------------------
   const [sessionId, setSessionId] = useState<string>(initialSessionId);
@@ -159,6 +208,9 @@ function App() {
     getMemory()
       .then(setMemory)
       .catch((e) => log.error("get_memory failed", { error: String(e) }));
+    getProfile()
+      .then((p) => setProfile(p ?? null))
+      .catch(() => setProfile(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -353,7 +405,29 @@ function App() {
     else refreshSessions();
   }
 
-  if (!plan) return <BootstrapGate onReady={setPlan} />;
+  // Profile → hardware/model → workbench. The profile is asked once and stored;
+  // "Change profile" on the hardware screen brings it back.
+  if (profile === undefined) return <div className="bootstrap" />;
+  if (profile === null || editingProfile) {
+    return (
+      <ProfileGate
+        initial={profile}
+        onDone={(p) => {
+          setProfile(p);
+          setEditingProfile(false);
+        }}
+      />
+    );
+  }
+  if (!plan) {
+    return (
+      <BootstrapGate
+        profile={profile}
+        onChangeProfile={() => setEditingProfile(true)}
+        onReady={setPlan}
+      />
+    );
+  }
 
   // Warnings and a fatal error outlive the commit: they are not duplicated in the
   // transcript, so they stay on screen under the finished exchange.
@@ -401,7 +475,7 @@ function App() {
 
                   <div className="examples">
                     <p className="examples-label">Try one of these</p>
-                    {EXAMPLES.map((ex) => (
+                    {examplesFor(profile?.industry).map((ex) => (
                       <button
                         key={ex.prompt}
                         type="button"

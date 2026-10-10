@@ -14,6 +14,13 @@ export interface HardwareInfo {
   gpu_name: string;
   vram_gb: number | null;
   cuda_available: boolean;
+  /** The inference backend Ollama will use. `metal` = Apple Silicon unified memory. */
+  backend: "cpu" | "cuda" | "rocm" | "metal";
+  os: string;
+  arch: string;
+  /** Without AVX2, CPU inference is several times slower per core. */
+  avx2: boolean;
+  avx512: boolean;
 }
 
 // workbench_core::bootstrap::models::LlmAssessment — the override risk check.
@@ -23,8 +30,20 @@ export interface LlmAssessment {
   approx_download_gb: number;
   /** Which of (resident, vision, embed) still need pulling. Empty = no download. */
   missing_models: string[];
+  /** Vision model that goes with this choice: "" = none, or the model itself if multimodal. */
+  vision: string;
   severity: "ok" | "caution" | "blocked";
   warnings: string[];
+}
+
+// src-tauri bootstrap::profile::UserProfile — answers from the first screen.
+// Empty string / empty list = "Not sure".
+export interface UserProfile {
+  industry: string;
+  work: string[];
+  inputs: string[];
+  priority: string;
+  language: string;
 }
 
 export interface ModelPlan {
@@ -36,10 +55,25 @@ export interface ModelPlan {
   num_ctx: number;
 }
 
+export interface CatalogEntry {
+  name: string;
+  /** Proven to drive this app's structured-JSON pipeline. Unverified = pickable, never recommended. */
+  verified: boolean;
+  multimodal: boolean;
+  download_gb: number;
+}
+
 export interface SystemProbe {
   hardware: HardwareInfo;
   recommended: ModelPlan;
   assessment: LlmAssessment;
+  /** Why this model, one plain-language line each. */
+  reasons: string[];
+  /** Next smaller model that fits (snappier), and next more capable one (slower). */
+  faster: string | null;
+  smarter: string | null;
+  /** Dropdown options, straight from the backend catalogue. */
+  catalog: CatalogEntry[];
   /** Local tags with Ollama's implicit `:latest` stripped — compare with `===`. */
   installed_models: string[];
   /** Linux: an old system-wide Ollama's models exist but this app can't see them. */

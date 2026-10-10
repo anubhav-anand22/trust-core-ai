@@ -25,6 +25,7 @@ use tauri::{Manager, State};
 use bootstrap::hardware::detect_hardware;
 use bootstrap::models::{assess_model, ensure_models, probe_system, ModelPlan};
 use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed, lower_ollama_priority};
+use bootstrap::profile::{get_profile, save_profile};
 use base64::Engine as _;
 use events::ChannelSink;
 use workbench_core::engine::OllamaEngine;
@@ -378,7 +379,14 @@ fn turn_setup(
     )
     .with_limits(limits)
     .with_cancel(cancel.clone())
-    .with_mode(mode);
+    .with_mode(mode)
+    // One line from the user's profile (≤ ~40 tokens), framing every role's
+    // answers for their domain. Empty when there's no profile or it says nothing.
+    .with_persona(
+        bootstrap::profile::load(app)
+            .map(|p| p.needs().persona)
+            .unwrap_or_default(),
+    );
     Ok((config, uploads, engine, cancel))
 }
 
@@ -614,6 +622,8 @@ pub fn run() {
             ensure_ollama_installed,
             detect_hardware,
             probe_system,
+            get_profile,
+            save_profile,
             ensure_models,
             set_model_plan,
             assess_model,

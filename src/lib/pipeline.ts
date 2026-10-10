@@ -14,6 +14,7 @@ import type {
   StepEvent,
   SystemProbe,
   UploadedFile,
+  UserProfile,
 } from "../types";
 
 /** Is Ollama available (server responding, on PATH, or in a known location)? */
@@ -33,6 +34,18 @@ export function ensureOllamaInstalled(onLine: (line: string) => void) {
     invoke<boolean>("ensure_ollama_installed", { onProgress: channel }),
   );
 }
+
+/** The stored profile, or null on first launch (→ show the profile screen). */
+export const getProfile = () =>
+  timed("get_profile", undefined, () => invoke<UserProfile | null>("get_profile"));
+
+/** Store the profile from the first screen. */
+export const saveProfile = (profile: UserProfile) =>
+  timed(
+    "save_profile",
+    { industry: profile.industry, priority: profile.priority },
+    () => invoke<void>("save_profile", { profile }),
+  );
 
 /** Detected RAM/GPU/cores plus the recommended model tier. */
 export const probeSystem = () =>
