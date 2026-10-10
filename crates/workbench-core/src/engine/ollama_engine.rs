@@ -87,12 +87,11 @@ pub struct ResourceLimits {
 
 impl Default for ResourceLimits {
     fn default() -> Self {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
         Self {
             num_ctx: 8192,
-            num_thread: cores.saturating_sub(1).max(1) as u32,
+            // The same physical-core budget as whisper and OCR — see
+            // `crate::worker_threads`. (The host overrides this per turn anyway.)
+            num_thread: crate::worker_threads() as u32,
             num_predict: 640,
             call_timeout: Duration::from_secs(240),
         }

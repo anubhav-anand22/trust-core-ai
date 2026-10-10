@@ -180,6 +180,13 @@ fn read_cores() -> (usize, usize) {
     (logical, physical.min(logical))
 }
 
+/// Physical cores − 1 (min 1), without the GPU probe — cheap enough to call at
+/// startup to seed the pipeline crate's thread budget (whisper, OCR), so every
+/// compute pool in the app agrees with [`HardwareInfo::worker_threads`].
+pub fn physical_worker_threads() -> usize {
+    read_cores().1.saturating_sub(1).max(1)
+}
+
 /// `(avx2, avx512f)`. aarch64 has NEON, which serves the same role, so it counts
 /// as `avx2 = true` for the recommender's purposes.
 fn cpu_features() -> (bool, bool) {

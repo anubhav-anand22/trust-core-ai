@@ -97,30 +97,64 @@ impl CancelFlag {
     }
 }
 
-/// Threads a compute-heavy step may use: every core but one.
+/// The host's thread budget, set once by [`init_thread_pools`].
+static WORKER_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Threads a compute-heavy step may use: every **physical** core but one.
 ///
 /// This is a desktop app, and a turn must not make the machine unusable while it
 /// runs. whisper.cpp and the `rten` OCR runtime both default to grabbing every
 /// core, which on a small CPU-only host starves the window manager — frozen
 /// tray flyouts, stuttering video calls — for the whole step.
+///
+/// Physical, not logical: hyperthreads share one core's execution units, so a
+/// count of them oversubscribes the CPU. This crate has no `sysinfo`, so the
+/// host — which already probes physical cores for the model tier — hands the
+/// number in via [`init_thread_pools`]. Until it does (examples, tests), assume
+/// hyperthreading and halve the logical count: guessing low costs a little
+/// speed, guessing high is what freezes the desktop.
 pub fn worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .saturating_sub(1)
-        .max(1)
+    *WORKER_THREADS.get_or_init(|| {
+        fallback_worker_threads(
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4),
+        )
+    })
 }
 
-/// Bound the global `rayon` pool (used by `rten` under `ocrs`) to
-/// [`worker_threads`].
+fn fallback_worker_threads(logical: usize) -> usize {
+    (logical / 2).saturating_sub(1).max(1)
+}
+
+/// Fix the thread budget for whisper, OCR and the engine default to `threads`
+/// (the host passes physical cores − 1), and bound the global `rayon` pool used
+/// by `rten` under `ocrs` to it.
 ///
-/// Call once, before any tool runs. Safe to call repeatedly: after the first
-/// call the pool already exists and the builder returns an error we ignore.
-pub fn init_thread_pools() {
+/// Call once at startup, before any tool runs. Later calls keep the first
+/// value — the budget must not change under a running turn.
+pub fn init_thread_pools(threads: usize) {
+    let _ = WORKER_THREADS.set(threads.max(1));
     // `rayon` reads this when it lazily builds its global pool. Setting it is
     // enough and avoids taking a direct dependency on rayon here.
     if std::env::var_os("RAYON_NUM_THREADS").is_none() {
         std::env::set_var("RAYON_NUM_THREADS", worker_threads().to_string());
+    }
+}
+
+#[cfg(test)]
+mod thread_budget_tests {
+    use super::fallback_worker_threads;
+
+    /// The fallback assumes hyperthreading: a 2-core/4-thread laptop (the dev
+    /// machine) gets 1 thread, as the host's physical count would give it — not
+    /// the 3 that `available_parallelism() - 1` used to.
+    #[test]
+    fn fallback_halves_logical_cores_and_leaves_one_free() {
+        assert_eq!(fallback_worker_threads(4), 1);
+        assert_eq!(fallback_worker_threads(8), 3);
+        assert_eq!(fallback_worker_threads(1), 1);
+        assert_eq!(fallback_worker_threads(2), 1);
     }
 }
 

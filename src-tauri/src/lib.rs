@@ -590,9 +590,11 @@ struct LogGuard(#[allow(dead_code)] Mutex<tracing_appender::non_blocking::Worker
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Cap the OCR runtime's thread pool before anything can build it, so a turn
-    // never pins every core and locks up the desktop.
-    workbench_core::init_thread_pools();
+    // Cap whisper's and the OCR runtime's threads before anything can build a
+    // pool, so a turn never pins every core and locks up the desktop. Physical
+    // cores − 1, the same budget Ollama gets — the pipeline crate used to count
+    // hyperthreads here, which gave audio/OCR 3 threads on a 2-core laptop.
+    workbench_core::init_thread_pools(bootstrap::hardware::physical_worker_threads());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
