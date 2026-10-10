@@ -252,8 +252,23 @@ async fn run_from_plan(
     .await;
     let compile_ms = compile_started.elapsed().as_millis();
     report.degraded = report.degraded || !quality.passed;
-    // Don't ask the user to confirm what they already confirmed.
+    // The model only *suggests* cross-chat facts; code decides. Drop anything
+    // that isn't a short, grounded facility fact (a small model happily
+    // proposes findings and document titles), then anything already confirmed.
+    let proposed = report.memory_proposals.len();
+    report.memory_proposals = crate::memory::proposals::screen(
+        std::mem::take(&mut report.memory_proposals),
+        prompt,
+        &results,
+    );
     report.memory_proposals.retain(|p| !facility.has(p));
+    if proposed > 0 {
+        tracing::info!(
+            proposed,
+            kept = report.memory_proposals.len(),
+            "memory proposals screened"
+        );
+    }
     tracing::info!(
         degraded = report.degraded,
         findings = report.findings.len(),
