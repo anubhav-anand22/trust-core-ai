@@ -245,6 +245,90 @@ pub(crate) fn fallback_plan(
     Plan { steps }
 }
 
+/// Analysis tasks that read the same evidence and can share one model call.
+const FOLDABLE: [&str; 2] = ["summarize", "compare_to_sop"];
+
+/// Replace a plan's `summarize` + `compare_to_sop` steps with one `assess` step.
+///
+/// Both steps rank the same evidence (an embedding-model reload each) and
+/// prefill ~half the context window with it, so on a CPU the pair cost two
+/// near-identical minutes. One call does both jobs. Runs on the *validated*
+/// plan — `assess` is not in `TASK_REGISTRY`, so the planner prompt and the
+/// validator never see it.
+///
+/// Deterministic, and a no-op unless the plan has at least one of *each*. The
+/// merged step keeps the id of the last folded step, sits where that step sat,
+/// and depends on the union of the folded steps' dependencies — every one of
+/// which already appears before that position. A plan where some *other* step
+/// depends on a folded one is left untouched: repointing it could break the
+/// top-to-bottom order the executor relies on, and no real plan does it. So is
+/// a plan with duplicate ids (possible only on a force-resume, which skips
+/// validation). Skipping the fold just means two calls, as before.
+pub fn fold_analysis(plan: Plan) -> Plan {
+    let is_foldable = |s: &TaskStep| FOLDABLE.contains(&s.task.as_str());
+    let has = |task: &str| plan.steps.iter().any(|s| s.task == task);
+    if !FOLDABLE.iter().all(|t| has(t)) {
+        return plan;
+    }
+
+    let folded_ids: Vec<&str> = plan
+        .steps
+        .iter()
+        .filter(|s| is_foldable(s))
+        .map(|s| s.id.as_str())
+        .collect();
+    let depended_on_by_others = plan.steps.iter().any(|s| {
+        !is_foldable(s) && s.depends_on.iter().any(|d| folded_ids.contains(&d.as_str()))
+    });
+    // A force-resumed plan skips validation, so ids are not guaranteed unique
+    // there. Folding by id on such a plan could keep two `assess` steps.
+    let all_ids_unique = plan
+        .steps
+        .iter()
+        .enumerate()
+        .all(|(i, s)| plan.steps[..i].iter().all(|p| p.id != s.id));
+    if depended_on_by_others || !all_ids_unique {
+        tracing::info!(
+            ?folded_ids,
+            depended_on_by_others,
+            all_ids_unique,
+            "analysis fold skipped; running the steps separately"
+        );
+        return plan;
+    }
+
+    let mut depends_on: Vec<String> = Vec::new();
+    for s in plan.steps.iter().filter(|s| is_foldable(s)) {
+        for d in &s.depends_on {
+            if !folded_ids.contains(&d.as_str()) && !depends_on.contains(d) {
+                depends_on.push(d.clone());
+            }
+        }
+    }
+    let last_id = folded_ids.last().copied().unwrap_or_default().to_string();
+    tracing::info!(?folded_ids, into = %last_id, "folded analysis steps into one assess call");
+
+    let steps = plan
+        .steps
+        .into_iter()
+        .filter_map(|s| {
+            if !is_foldable(&s) {
+                Some(s)
+            } else if s.id == last_id {
+                Some(TaskStep {
+                    id: s.id,
+                    task: "assess".to_string(),
+                    args: serde_json::Value::Object(Default::default()),
+                    depends_on: depends_on.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    Plan { steps }
+}
+
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
@@ -343,5 +427,103 @@ mod fallback_tests {
             .steps
             .iter()
             .any(|s| s.task == "compare_to_sop"));
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn step(id: &str, task: &str, deps: &[&str]) -> TaskStep {
+        TaskStep {
+            id: id.into(),
+            task: task.into(),
+            args: serde_json::Value::Object(Default::default()),
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    fn tasks(plan: &Plan) -> Vec<&str> {
+        plan.steps.iter().map(|s| s.task.as_str()).collect()
+    }
+
+    /// The shape `fallback_plan` and most planners produce: one model call, not two.
+    #[test]
+    fn folds_the_pair_into_one_assess_with_the_union_of_dependencies() {
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", &[]),
+                step("x2", "analyze_image", &[]),
+                step("kb", "search_knowledge", &[]),
+                step("sum", "summarize", &["x1", "x2"]),
+                step("sop", "compare_to_sop", &["sum", "kb"]),
+            ],
+        };
+        let folded = fold_analysis(plan);
+        assert_eq!(tasks(&folded), ["parse_pdf", "analyze_image", "search_knowledge", "assess"]);
+        let assess = folded.steps.last().unwrap();
+        assert_eq!(assess.id, "sop", "keeps the last folded id");
+        // `sum` was folded away, so it must not linger as a dependency.
+        assert_eq!(assess.depends_on, ["x1", "x2", "kb"]);
+    }
+
+    #[test]
+    fn folded_plan_still_lists_every_dependency_first() {
+        let plan = fold_analysis(fallback_plan(
+            &IntentResult {
+                intents: vec!["check pump".into()],
+                file_kinds: vec![],
+                needs_knowledge: true,
+            },
+            &[InputFile {
+                path: "/uploads/a.pdf".into(),
+                kind: FileKind::Pdf,
+                original_name: "a.pdf".into(),
+            }],
+            false,
+        ));
+        assert_eq!(tasks(&plan).iter().filter(|t| **t == "assess").count(), 1, "{plan:?}");
+        for (i, s) in plan.steps.iter().enumerate() {
+            for d in &s.depends_on {
+                let at = plan.steps.iter().position(|p| &p.id == d);
+                assert!(at.is_some_and(|at| at < i), "{} depends on {d}, not listed before it", s.id);
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_a_plan_without_both_halves_alone() {
+        let plan = Plan {
+            steps: vec![step("x1", "parse_pdf", &[]), step("sum", "summarize", &["x1"])],
+        };
+        assert_eq!(tasks(&fold_analysis(plan)), ["parse_pdf", "summarize"]);
+    }
+
+    #[test]
+    fn leaves_a_force_resumed_plan_with_duplicate_ids_alone() {
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", &[]),
+                step("a", "summarize", &["x1"]),
+                step("a", "compare_to_sop", &["x1"]),
+            ],
+        };
+        assert_eq!(tasks(&fold_analysis(plan)), ["parse_pdf", "summarize", "compare_to_sop"]);
+    }
+
+    #[test]
+    fn leaves_the_plan_alone_when_another_step_depends_on_an_analysis_step() {
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", &[]),
+                step("sum", "summarize", &["x1"]),
+                step("kb", "search_knowledge", &["sum"]),
+                step("sop", "compare_to_sop", &["kb"]),
+            ],
+        };
+        assert_eq!(
+            tasks(&fold_analysis(plan)),
+            ["parse_pdf", "summarize", "search_knowledge", "compare_to_sop"]
+        );
     }
 }

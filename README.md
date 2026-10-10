@@ -412,8 +412,10 @@ does not change — every token is a CPU matrix multiply — but the milestone i
 
 Still open, and worth thinking about:
 - The improvement in wall-clock time is **not yet measured** against a baseline.
-- Are two analysis steps justified, or should `summarize` + `compare_to_sop`
-  collapse into one call?
+- ~~Are two analysis steps justified?~~ No: they are now folded into one
+  `assess` call after validation (execution log part 16), saving one evidence
+  embedding pass and one ~half-window prefill per turn. Not yet measured on a
+  real turn.
 - Would streaming partial output make the wait *feel* acceptable?
 - `moondream` still costs ~48 s per photo on 4 cores and is pulled on every tier.
 

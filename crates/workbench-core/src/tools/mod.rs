@@ -122,7 +122,9 @@ pub trait Tool: Send + Sync {
 
 /// The concrete tool set the pipeline runs. One entry per non-analysis task in
 /// [`TASK_REGISTRY`](crate::planner::registry::TASK_REGISTRY), plus the two
-/// analysis tasks served by [`analysis::AnalysisTool`].
+/// analysis tasks served by [`analysis::AnalysisTool`] and their merged form
+/// `assess`, which only `planner::fold_analysis` produces (it is deliberately
+/// not in `TASK_REGISTRY`, so the planner prompt never grows).
 pub fn default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry
@@ -134,7 +136,8 @@ pub fn default_registry() -> ToolRegistry {
         .register(Box::new(followup::AnswerFollowupTool))
         .register(Box::new(followup::AnswerDirectlyTool))
         .register(Box::new(analysis::AnalysisTool::summarize()))
-        .register(Box::new(analysis::AnalysisTool::compare_to_sop()));
+        .register(Box::new(analysis::AnalysisTool::compare_to_sop()))
+        .register(Box::new(analysis::AnalysisTool::assess()));
     registry
 }
 

@@ -1,4 +1,5 @@
-//! `summarize` and `compare_to_sop` — the analysis-stage steps.
+//! `summarize`, `compare_to_sop` and their merged form `assess` — the
+//! analysis-stage steps.
 //!
 //! These consume the evidence produced by earlier extraction/retrieval steps and
 //! run it through the *resident* model (no extra weights). They exist as explicit
@@ -42,6 +43,31 @@ impl AnalysisTool {
             instruction: "Compare the observed conditions against the SOP / procedure passages in \
                           the evidence. List each point as COMPLIANT or DEVIATION with a one-line \
                           reason and the SOP source name.",
+        }
+    }
+
+    /// `summarize` + `compare_to_sop` in one call. Never planned directly: the
+    /// planner still emits the pair, and `planner::fold_analysis` swaps it for
+    /// this after validation. Both steps read the same evidence, so running them
+    /// separately paid the evidence ranking (an embedding-model reload) and a
+    /// ~half-window prefill twice for no extra information.
+    ///
+    /// Same `num_predict` ceiling as either step alone — raising it would buy
+    /// back the decode time the merge saves — hence "briefly", and the SOP
+    /// check comes *first*: if the cap truncates anything it should be the
+    /// findings, which role C can still read straight off the raw extraction
+    /// outputs. The compliance verdicts exist nowhere else.
+    pub fn assess() -> Self {
+        Self {
+            task: "assess",
+            instruction: "Do two things, briefly, in this order.\n\
+                          1. SOP CHECK: compare the observed conditions against the SOP / procedure \
+                          passages in the evidence. One line per point, marked COMPLIANT or \
+                          DEVIATION, with a one-line reason and the SOP source name. If the \
+                          evidence contains no SOP passages, write only \"No SOP passages \
+                          retrieved.\" — never a COMPLIANT or DEVIATION line without one.\n\
+                          2. FINDINGS: the key findings from the evidence as a short list. Keep \
+                          equipment tags, measurements and dates exact.",
         }
     }
 }

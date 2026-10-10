@@ -204,6 +204,9 @@ async fn run_from_plan(
     mut session: SessionContext,
     sink: &dyn ProgressSink,
 ) -> Result<TurnOutcome> {
+    // One model call instead of two when both analysis steps were planned. Here,
+    // not in `plan_turn`, so fresh, resumed and force-resumed plans all get it.
+    let plan = crate::planner::fold_analysis(plan);
     warn_uncovered_files(&plan, uploads, sink);
 
     // --- strictly sequential tool execution --------------------------------

@@ -1187,6 +1187,47 @@ time) and each prefills ~half of `num_ctx`. That is the next change.
 `cargo test -p workbench-core -j 1` → **45/45** (one new unit test for the ns→ms
 breakdown). A real-model run with the table has **not** been done yet.
 
+## Feature pass — part 16: one analysis call instead of two
+
+`summarize` and `compare_to_sop` receive the same evidence. Each one ran
+`select_relevant` (embedding model loaded with `keep_alive = 0`, whole evidence
+embedded) and then prefilled ~half of `num_ctx` with the result. On a CPU that
+is two near-identical minutes, plus a second analysis text for role C to read.
+
+**The fold, not a new planner task.** `assess` (one call, both instructions) is
+registered as a tool but kept **out of `TASK_REGISTRY`**. The registry is
+printed into role B's prompt, so a new row costs prefill on *every* turn and
+gives a 0.5B planner one more name to misuse. Instead the planner keeps
+emitting the pair, and `planner::fold_analysis` rewrites it after validation.
+It is called once in `run_from_plan`, so fresh, resumed and force-resumed
+plans all go through it.
+
+Fold rules, checked by the FIX session in review before the code was final:
+- `assess` keeps the **later** step's id and slot. Every dependency of either
+  step sits before that slot; the earlier slot could precede the later step's
+  inputs.
+- Its `depends_on` is the union of both, minus the folded ids (planners often
+  write `compare_to_sop → summarize`; keeping that would be a dangling
+  self-reference).
+- Skipped entirely (two calls, as before) if some *other* step depends on an
+  analysis step, or if ids are duplicated (only possible on a force-resume,
+  which bypasses validation). Skipping just means two calls, as before, which
+  is safer than repointing.
+
+**Output budget.** One call now has the 640-token cap that each step used to
+have. Raising it would buy back the decode time the merge saves, so instead the
+instruction puts the **SOP check first**: if anything gets truncated, it is the
+findings, and role C can still read those off the raw extraction outputs. With
+no SOP passages it must say so rather than invent COMPLIANT/DEVIATION lines.
+
+User-visible: the stepper/audit list shows one `assess` step where it showed
+two, and saved `plan_summary`s read `… → assess`.
+
+`cargo test -p workbench-core -j 1` → **50/50** (five fold tests, plus `assess`
+in the no-evidence smoke test). **Not yet measured**: compare the `e2e` timing
+table on 2218be8 vs this. Watch `gen_tok` on the `analysis` row: sitting at
+640 means the cap is truncating.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

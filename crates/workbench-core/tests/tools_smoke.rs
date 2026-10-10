@@ -99,10 +99,14 @@ async fn analysis_tool_fails_cleanly_with_no_evidence() {
     };
 
     let registry = default_registry();
-    let tool = registry.get("summarize").unwrap();
-    let result = tool.run(&step("summarize"), &ctx).await.unwrap();
-    assert!(!result.ok);
-    assert!(result.error.as_deref().unwrap_or("").contains("evidence"));
+    // `assess` is outside TASK_REGISTRY (the fold produces it), so
+    // `registry_covers_every_task` does not cover it; this does.
+    for task in ["summarize", "compare_to_sop", "assess"] {
+        let tool = registry.get(task).unwrap_or_else(|| panic!("`{task}` not registered"));
+        let result = tool.run(&step(task), &ctx).await.unwrap();
+        assert!(!result.ok, "{task}");
+        assert!(result.error.as_deref().unwrap_or("").contains("evidence"), "{task}");
+    }
 }
 
 #[test]
