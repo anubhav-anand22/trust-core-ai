@@ -1351,6 +1351,37 @@ workbench-core -j 1` → **74/74**, 10 new tests built from the warm runs'
 plan shapes. Cost: an under-planned turn now takes as long as a full one
 (~25 s on the teammate's machine). **Not yet run against a live model.**
 
+## Feature pass — part 19: TinyFish web search (sponsor integration, isolated)
+
+The hackathon requires using the sponsor's API. It went in as a web-search
+sidebar that shares nothing with the offline pipeline: no Tauri command, no
+pipeline state, and nothing from a turn is sent to it. Files:
+`components/SearchSidebar.{tsx,css}` and `components/tinyfish.worker.ts`, plus
+one import and one `<SearchSidebar />` in `App.tsx`.
+
+- **The SDK runs in a Web Worker.** `@tiny-fish/sdk` always sends a
+  `User-Agent` header, and TinyFish's CORS allow-list doesn't include it
+  (OPTIONS preflight: 400 with `user-agent`, 204 without). The SDK calls the
+  global `fetch` with no way to pass another, so the header has to be stripped
+  by wrapping `fetch`. The first draft wrapped the *app's* `window.fetch` and
+  set a global `window.process`. A worker has its own globals, so the wrapper
+  touches nothing in TrustCore. The SDK also lands in its own bundle chunk.
+- Links open in the system browser via the opener plugin (`target="_blank"`
+  does nothing in a Tauri webview). The panel says it is online and separate
+  from the offline analysis, since the README pitches "no cloud calls".
+- Review (FIX): only `http(s)` result URLs are handed to the opener, since
+  they come from a third party. Below 1500 px wide the open rail floats as a
+  `position: fixed` drawer: at 1366 px, two open right-hand rails left the chat
+  ~530 px. It is `fixed` so no TrustCore container's CSS had to change.
+- The API key is kept in `localStorage`, unencrypted: fine for the demo.
+- Lockfile: added with npm 11. npm 10.9 also stripped every `libc` field (the
+  part-14 churn), so only the SDK, zod, p-retry and is-network-error appear.
+
+Verified: `tsc` clean, `vite build` ok (worker chunk 122 kB). The SDK with a
+fake key returns `AuthenticationError: Invalid or expired API key`, and the
+worker's header set gets a 401, not a CORS failure. **Not yet run in the app
+with a real key.**
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

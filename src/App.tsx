@@ -6,6 +6,7 @@ import "./App.css";
 import { AuditSidebar } from "./components/AuditSidebar";
 import { BootstrapGate } from "./components/BootstrapGate";
 import { HitlModal } from "./components/HitlModal";
+import { SearchSidebar } from "./components/SearchSidebar";
 import { ProfileGate } from "./components/ProfileGate";
 import { PromptPanel } from "./components/PromptPanel";
 import { ReportView } from "./components/ReportView";
@@ -615,6 +616,7 @@ function App() {
           </section>
 
           <AuditSidebar events={events} plan={plan} memory={memory} onForget={forget} />
+          <SearchSidebar />
         </main>
       </div>
 
