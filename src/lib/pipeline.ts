@@ -77,6 +77,17 @@ export function ensureModels(
   );
 }
 
+/** Download the OCR (always) and whisper (if the profile wants audio) model
+ *  files when missing. Never rejects for a failed download — that tool is just
+ *  left off, and the progress line says how to install it offline. */
+export function ensureToolModels(onProgress: (p: ModelProgress) => void) {
+  const channel = new Channel<ModelProgress>();
+  channel.onmessage = onProgress;
+  return timed("ensure_tool_models", undefined, () =>
+    invoke<void>("ensure_tool_models", { onProgress: channel }),
+  );
+}
+
 /** Persist the confirmed model plan on the backend. */
 export const setModelPlan = (plan: ModelPlan) =>
   timed("set_model_plan", { llm: plan.llm, tier: plan.tier_label }, () =>

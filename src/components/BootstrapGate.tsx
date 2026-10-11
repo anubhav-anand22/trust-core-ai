@@ -9,6 +9,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   assessModel,
   ensureModels,
+  ensureToolModels,
   ensureOllamaInstalled,
   isOllamaInstalled,
   probeSystem,
@@ -16,7 +17,7 @@ import {
   warmModel,
 } from "../lib/pipeline";
 import { log as logger } from "../lib/log";
-import type { LlmAssessment, ModelPlan, SystemProbe, UserProfile } from "../types";
+import type { LlmAssessment, ModelPlan, ModelProgress, SystemProbe, UserProfile } from "../types";
 
 type Phase =
   | "checking-ollama"
@@ -181,14 +182,17 @@ export function BootstrapGate({
       const needed = [...new Set([chosenPlan.llm, chosenPlan.vision, chosenPlan.embed])].filter(
         Boolean,
       );
-      await ensureModels(
-        needed,
-        (p) =>
-          setPullLines((prev) => ({
-            ...prev,
-            [p.model]:
-              p.percentage != null ? `${p.message} (${p.percentage}%)` : p.message,
-          })),
+      const onPull = (p: ModelProgress) =>
+        setPullLines((prev) => ({
+          ...prev,
+          [p.model]: p.percentage != null ? `${p.message} (${p.percentage}%)` : p.message,
+        }));
+      await ensureModels(needed, onPull);
+      // OCR / speech-to-text weights aren't Ollama models. Without them an
+      // attached invoice photo went unread on a fresh machine. A failure here
+      // only disables that tool, so it must never block startup.
+      await ensureToolModels(onPull).catch((e) =>
+        logger.warn("bootstrap: tool models not installed", { error: String(e) }),
       );
       setPhase("warming");
       await warmModel();

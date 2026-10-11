@@ -378,6 +378,8 @@ pub fn wants_knowledge(intent: &IntentResult, prompt: &str) -> bool {
 pub struct Available {
     /// A vision model is configured (the profile can switch photos off).
     pub vision: bool,
+    /// Both OCR model files are on disk.
+    pub ocr: bool,
     /// The whisper model file is on disk.
     pub audio: bool,
 }
@@ -401,9 +403,12 @@ pub struct Available {
 /// covered and analysed alongside the answer step, but no KB search is added.
 /// The result is re-validated; if that ever fails the original is returned.
 ///
-/// Returns the plan and a short label per added step, for the log.
+/// With no vision model but OCR installed, `analyze_image` steps are rerouted
+/// to `ocr_image` first: they could only fail otherwise.
+///
+/// Returns the plan and a short label per added or rerouted step, for the log.
 pub fn complete_plan(
-    plan: Plan,
+    mut plan: Plan,
     uploads: &[InputFile],
     prompt: &str,
     wants_kb: bool,
@@ -436,10 +441,26 @@ pub fn complete_plan(
     let mut front: Vec<TaskStep> = Vec::new();
     let mut added: Vec<String> = Vec::new();
 
+    // No vision model (a profile without photos) but OCR installed: an
+    // `analyze_image` step can only fail ("image analysis is off"), and both the
+    // model and `fallback_plan` emit it for every image. Read the image with OCR
+    // instead. This is how an attached invoice came back "missing image analysis".
+    if !available.vision && available.ocr {
+        for s in plan.steps.iter_mut().filter(|s| s.task == "analyze_image") {
+            s.task = "ocr_image".into();
+            let file = s.args.get("file").and_then(|f| f.as_str()).unwrap_or("image");
+            added.push(format!("analyze_image→ocr_image({file})"));
+        }
+    }
+
     for f in uploads.iter().filter(|f| !is_covered(&plan, uploads, f)) {
         let task = match f.kind {
             FileKind::Pdf => "parse_pdf",
             FileKind::Image if available.vision => "analyze_image",
+            // No vision model (a profile without photos) but OCR is installed:
+            // an image is still read. Without this, an attached invoice photo
+            // went unread and the report said "no data".
+            FileKind::Image if available.ocr => "ocr_image",
             FileKind::Audio if available.audio => "transcribe_audio",
             // Tool switched off, or unsupported: leave it uncovered and let
             // `warn_uncovered_files` say so.
@@ -722,7 +743,7 @@ mod fold_tests {
 mod completion_tests {
     use super::*;
 
-    const ON: Available = Available { vision: true, audio: true };
+    const ON: Available = Available { vision: true, ocr: true, audio: true };
 
     fn step(id: &str, task: &str, file: Option<&str>, deps: &[&str]) -> TaskStep {
         TaskStep {
@@ -814,9 +835,41 @@ mod completion_tests {
                 step("sum", "summarize", None, &["x1"]),
             ],
         };
-        let (done, added) = complete_plan(plan, &up, "assess", false, Available { vision: false, audio: true });
+        let off = Available { vision: false, ocr: false, audio: true };
+        let (done, added) = complete_plan(plan, &up, "assess", false, off);
         assert!(added.is_empty());
         assert!(!is_covered(&done, &up, &up[1]), "left for warn_uncovered_files to report");
+    }
+
+    /// The teammate's second report: the planner failed, the fallback plan sent
+    /// the invoice to `analyze_image`, and with no vision model that step can
+    /// only fail. OCR reads it instead.
+    #[test]
+    fn without_vision_the_fallback_plans_image_step_is_rerouted_to_ocr() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let intent = IntentResult { intents: vec!["describe this invoice".into()], file_kinds: vec![], needs_knowledge: false };
+        let fb = fallback_plan(&intent, &up[1..], false);
+        assert!(tasks(&fb).contains(&"analyze_image"));
+
+        let ocr_only = Available { vision: false, ocr: true, audio: false };
+        let (done, added) = complete_plan(fb, &up[1..], "describe this invoice", false, ocr_only);
+        assert_eq!(added, ["analyze_image→ocr_image(valve.png)"]);
+        assert!(tasks(&done).contains(&"ocr_image") && !tasks(&done).contains(&"analyze_image"));
+        assert!(validate_plan(&done, &up[1..]).is_empty());
+    }
+
+    /// The teammate's bug: a profile without photos has no vision model, and
+    /// an attached invoice image went unread. OCR reads it instead.
+    #[test]
+    fn without_vision_an_image_is_read_by_ocr() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan { steps: vec![step("kb", "search_knowledge", None, &[])] };
+        let ocr_only = Available { vision: false, ocr: true, audio: false };
+        let (done, added) = complete_plan(plan, &up, "what is the cost of labour for 10 hours", false, ocr_only);
+        assert_eq!(added, ["parse_pdf(inspection.pdf)", "ocr_image(valve.png)", "summarize", "compare_to_sop"]);
+        assert!(validate_plan(&done, &up).is_empty());
     }
 
     #[test]

@@ -26,6 +26,7 @@ use bootstrap::hardware::detect_hardware;
 use bootstrap::models::{assess_model, ensure_models, probe_system, ModelPlan};
 use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed, lower_ollama_priority};
 use bootstrap::profile::{get_profile, save_profile};
+use bootstrap::tools::ensure_tool_models;
 use base64::Engine as _;
 use events::ChannelSink;
 use workbench_core::engine::OllamaEngine;
@@ -261,10 +262,11 @@ fn pipeline_config(app: &tauri::AppHandle, plan: &ModelPlan) -> Result<PipelineC
         llm_model: plan.llm.clone(),
         vision_model: plan.vision.clone(),
         embed_model: plan.embed.clone(),
-        // Phase 2 wires downloads for these; the paths are fixed now.
-        whisper_model_path: models_dir.join("ggml-base.en.bin"),
-        ocr_detection_model: models_dir.join("text-detection.rten"),
-        ocr_recognition_model: models_dir.join("text-recognition.rten"),
+        // Downloaded by setup (bootstrap::tools::ensure_tool_models); the file
+        // names live there so the downloader and the pipeline can't drift.
+        whisper_model_path: models_dir.join(bootstrap::tools::WHISPER_FILE),
+        ocr_detection_model: models_dir.join(bootstrap::tools::OCR_DETECTION_FILE),
+        ocr_recognition_model: models_dir.join(bootstrap::tools::OCR_RECOGNITION_FILE),
     })
 }
 
@@ -626,6 +628,7 @@ pub fn run() {
             probe_system,
             get_profile,
             save_profile,
+            ensure_tool_models,
             ensure_models,
             set_model_plan,
             assess_model,

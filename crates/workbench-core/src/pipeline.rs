@@ -73,10 +73,7 @@ pub async fn run_turn(
     // Make the plan cover what was asked: a small planner routinely skips the
     // photo or the SOP search. Here and not in `run_from_plan`, so a plan the
     // user edited in the HITL modal is never "completed" behind their back.
-    let available = Available {
-        vision: !engine.vision_model().trim().is_empty(),
-        audio: config.whisper_model_path.is_file(),
-    };
+    let available = available_tools(engine, config);
     let (plan, added) =
         complete_plan(plan, uploads, prompt, wants_knowledge(&intent, prompt), available);
     if !added.is_empty() {
@@ -171,16 +168,48 @@ fn screen_uploads(uploads: &[InputFile], sink: &dyn ProgressSink) -> Vec<InputFi
 /// Warn about any attachment no plan step reads, so a silently-ignored file is
 /// visible rather than a mystery. (`validate_plan` counts nothing here — one
 /// `ocr_image` step "covers" fifty images as far as it is concerned.)
-fn warn_uncovered_files(plan: &Plan, uploads: &[InputFile], sink: &dyn ProgressSink) {
+/// Which file-reading tools can actually run here. Shared by plan completion
+/// and the uncovered-file warning so the two can never disagree.
+fn available_tools(engine: &OllamaEngine, config: &PipelineConfig) -> Available {
+    Available {
+        vision: !engine.vision_model().trim().is_empty(),
+        ocr: config.ocr_detection_model.is_file() && config.ocr_recognition_model.is_file(),
+        audio: config.whisper_model_path.is_file(),
+    }
+}
+
+fn warn_uncovered_files(
+    plan: &Plan,
+    uploads: &[InputFile],
+    available: Available,
+    sink: &dyn ProgressSink,
+) {
+    use crate::engine::schemas::FileKind;
+
     // Same definition `complete_plan` uses, so after completion this fires only
-    // for a file whose tool is switched off (or on a resumed plan).
+    // for a file whose tool is switched off (or on a resumed plan) — and then
+    // the user should be told which tool, not just that the file was skipped.
     for f in uploads {
         if !crate::planner::is_covered(plan, uploads, f) {
+            let why = match f.kind {
+                FileKind::Image if !available.vision && !available.ocr => Some(
+                    "Image reading is off: this profile has no vision model and the OCR model \
+                     files are missing. Restart the app so setup installs them, or tick Photos \
+                     via Change profile.",
+                ),
+                FileKind::Audio if !available.audio => Some(
+                    "Audio transcription is off: the speech model file (ggml-base.en.bin) is \
+                     missing. Tick Voice notes via Change profile and restart, or put the file \
+                     in the app's models folder.",
+                ),
+                _ => None,
+            };
             crate::events::warn(
                 sink,
                 format!(
-                    "Attached file \"{}\" is not read by any step of this plan.",
-                    f.original_name
+                    "Attached file \"{}\" is not read by any step of this plan.{}",
+                    f.original_name,
+                    why.map(|w| format!(" {w}")).unwrap_or_default()
                 ),
                 None,
             );
@@ -205,7 +234,7 @@ async fn run_from_plan(
     // One model call instead of two when both analysis steps were planned. Here,
     // not in `plan_turn`, so fresh, resumed and force-resumed plans all get it.
     let plan = crate::planner::fold_analysis(plan);
-    warn_uncovered_files(&plan, uploads, sink);
+    warn_uncovered_files(&plan, uploads, available_tools(engine, config), sink);
 
     // --- strictly sequential tool execution --------------------------------
     let session_blob = session.context_blob();

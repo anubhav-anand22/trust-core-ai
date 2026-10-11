@@ -1382,6 +1382,40 @@ fake key returns `AuthenticationError: Invalid or expired API key`, and the
 worker's header set gets a 401, not a CORS failure. **Not yet run in the app
 with a real key.**
 
+## Fix pass — part 20: an attached image must be readable on a fresh machine
+
+The teammate's fresh install, latest tip: an invoice PNG came back "not read
+by any step" and the answer was "no data". On a second try, with the
+fallback plan, it came back "missing image analysis". Two causes stacked:
+
+- **The OCR and speech models were never installed (part A, FIX).** The two
+  `.rten` files and `ggml-base.en.bin` aren't Ollama models; the README said
+  to download them by hand, and setup only pulled Ollama models. So OCR and
+  audio were silently off on every new machine. `bootstrap::tools::
+  ensure_tool_models` now runs in **Download & start**, with the same progress
+  lines: OCR always (~12 MB), whisper (~148 MB) only when the profile expects
+  voice notes or is unsure. Each file streams into `<file>.part` and is renamed
+  only when the byte count matches Content-Length. Any read that sees no data
+  for 30 s gives up: setup awaits this before opening the app, so a stalled
+  download must not hang Start (found in review). Every failure removes the
+  `.part`, is non-fatal, and names the folder to drop the file into (the
+  air-gapped path). The file names are shared with `PipelineConfig`.
+- **With no vision model, nothing fell back to OCR (part B, FEATURE).** A
+  profile without photos has no vision model. Part-18 completion skipped an
+  uncovered image in that case, and both the model's plan and `fallback_plan`
+  send every image to `analyze_image`, which can only fail with vision off.
+  Now `Available` has an `ocr` flag (both `.rten` files present), and with no
+  vision model `complete_plan` reroutes `analyze_image` steps to `ocr_image`
+  and covers uncovered images with it. One `available_tools()` feeds both
+  completion and `warn_uncovered_files`, whose message now says *why* and
+  what to do ("tick Photos via Change profile", "tick Voice notes…").
+
+Each half reviewed by the other session. `cargo test -p workbench-core -j 1`
+→ **76/76**, `cargo test -p tauri-app -j 1` → **45/45** (fake-server tests for
+complete, truncated and stalled downloads). **Not live-tested**: the model
+hosts were unreachable from the dev machine's network. Known nit, left as is:
+a photo the planner sent to both image tools gets OCR'd twice.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

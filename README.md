@@ -94,11 +94,23 @@ ollama pull moondream               # vision
 ollama pull nomic-embed-text        # embeddings (required for retrieval)
 ```
 
-### Optional tool models
+### Tool models (OCR and speech-to-text)
 
-Audio and OCR degrade gracefully without these — the step reports that the model
-is missing rather than failing the turn. To enable them, drop the files into
-`%APPDATA%\com.anubhav_anand.tauri-app\models\`:
+**Installed automatically by setup** (2026-10-11): **Download & start** fetches
+them right after the Ollama models, with the same progress lines. OCR is always
+installed (~12 MB; photographed invoices and nameplates are the common case).
+The speech model (~148 MB) is installed only when your profile ticks *Voice
+notes* or leaves inputs as *Not sure*. Present files are skipped, so later
+launches cost nothing. A failed download never blocks startup; that tool just
+stays off and the line tells you where to put the file.
+
+Before this, on every fresh machine OCR and audio were silently off: an attached
+invoice photo was "not read by any step" and the report said "no data".
+
+**Offline / air-gapped:** drop the files into the app's `models` folder
+(Windows `%APPDATA%\com.anubhav_anand.tauri-app\models\`, Linux
+`~/.local/share/com.anubhav_anand.tauri-app/models/`, macOS
+`~/Library/Application Support/com.anubhav_anand.tauri-app/models/`):
 
 | File | Source |
 |---|---|

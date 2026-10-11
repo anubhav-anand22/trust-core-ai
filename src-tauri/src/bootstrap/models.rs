@@ -722,7 +722,7 @@ pub struct ModelProgress {
 ///
 /// Returns `None` if the volume can't be identified — a missing disk reading must
 /// not block a download, only an affirmatively-too-small one does.
-fn free_disk_gb(path: &std::path::Path) -> Option<f32> {
+pub(super) fn free_disk_gb(path: &std::path::Path) -> Option<f32> {
     use sysinfo::Disks;
     let disks = Disks::new_with_refreshed_list();
     disks
