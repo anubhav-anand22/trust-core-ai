@@ -329,6 +329,196 @@ pub fn fold_analysis(plan: Plan) -> Plan {
     Plan { steps }
 }
 
+/// Does some step of `plan` read attachment `f`?
+///
+/// Yes if a step names it in `args.file`, or if a step that consumes its kind
+/// names no file and `f` is the first upload of that kind (what
+/// `ToolContext::file_for` falls back to). Any tool of the kind counts: a photo
+/// the planner sent to `ocr_image` is covered, not missing an `analyze_image`.
+pub fn is_covered(plan: &Plan, uploads: &[InputFile], f: &InputFile) -> bool {
+    use crate::planner::registry::lookup;
+
+    let named = plan
+        .steps
+        .iter()
+        .any(|s| s.args.get("file").and_then(|v| v.as_str()) == Some(f.original_name.as_str()));
+    let is_first_of_kind =
+        uploads.iter().find(|u| u.kind == f.kind).map(|u| &u.original_name) == Some(&f.original_name);
+    let covered_by_fallback = is_first_of_kind
+        && plan.steps.iter().any(|s| {
+            s.args.get("file").is_none()
+                && lookup(&s.task).and_then(|spec| spec.requires_file) == Some(f.kind)
+        });
+    named || covered_by_fallback
+}
+
+/// Should this turn search the SOP knowledge base?
+///
+/// Role A's `needs_knowledge`, OR the request plainly asks for it. Role A is a
+/// small model too: on "check it against our SOPs" it said `false` in two of
+/// three runs. Whole words only ("sop" must not fire on "isopropyl"), and no
+/// bare "standard" — "what's the standard rate on this card?" is a fee
+/// question, not a compliance one.
+pub fn wants_knowledge(intent: &IntentResult, prompt: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "sop", "sops", "procedure", "procedures", "compliance", "compliant", "regulation",
+        "regulations", "standards",
+    ];
+    const PHRASES: &[&str] = &["check against", "checked against", "per standard", "against the standard"];
+
+    let p = prompt.to_lowercase();
+    intent.needs_knowledge
+        || p.split(|c: char| !c.is_alphanumeric()).any(|w| WORDS.contains(&w))
+        || PHRASES.iter().any(|ph| p.contains(ph))
+}
+
+/// Which tools can actually succeed on this machine. Completion never adds a
+/// step that is certain to fail — that would only buy a "degraded" badge.
+#[derive(Clone, Copy, Debug)]
+pub struct Available {
+    /// A vision model is configured (the profile can switch photos off).
+    pub vision: bool,
+    /// The whisper model file is on disk.
+    pub audio: bool,
+}
+
+/// Add what a validated plan left out of the request.
+///
+/// A 1.5B planner draws a different plan almost every run: across six
+/// identical turns it skipped the photo in three, the SOP search in three and
+/// any analysis in two (one plan was `parse_pdf` alone). The validator only
+/// checks that a plan is *runnable*; this makes it *complete*:
+/// 1. every attachment gets an extraction step (if its tool can run);
+/// 2. `search_knowledge` when `wants_kb` and there is none;
+/// 3. existing analysis steps also depend on what was added — `AnalysisTool`
+///    reads only its declared dependencies, so otherwise it never sees it;
+/// 4. evidence but no analysis → `summarize` (+ `compare_to_sop` with the KB),
+///    which [`fold_analysis`] later turns into one `assess`.
+///
+/// Only for fresh plans: never a resumed one, whose shape the user chose in the
+/// HITL modal. A conversational plan (`answer_followup` / `answer_directly`) is
+/// left alone unless files were attached that it ignores; then the files are
+/// covered and analysed alongside the answer step, but no KB search is added.
+/// The result is re-validated; if that ever fails the original is returned.
+///
+/// Returns the plan and a short label per added step, for the log.
+pub fn complete_plan(
+    plan: Plan,
+    uploads: &[InputFile],
+    prompt: &str,
+    wants_kb: bool,
+    available: Available,
+) -> (Plan, Vec<String>) {
+    use crate::planner::registry::{lookup, Stage};
+
+    let conversational = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s.task.as_str(), "answer_followup" | "answer_directly"));
+
+    let mut used: std::collections::HashSet<String> =
+        plan.steps.iter().map(|s| s.id.clone()).collect();
+    let mut fresh = |prefix: &str| {
+        let id = (1..)
+            .map(|n| format!("{prefix}{n}"))
+            .find(|id| !used.contains(id))
+            .expect("unbounded range");
+        used.insert(id.clone());
+        id
+    };
+    let step = |id: String, task: &str, args: serde_json::Value, deps: Vec<String>| TaskStep {
+        id,
+        task: task.to_string(),
+        args,
+        depends_on: deps,
+    };
+
+    let mut front: Vec<TaskStep> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+
+    for f in uploads.iter().filter(|f| !is_covered(&plan, uploads, f)) {
+        let task = match f.kind {
+            FileKind::Pdf => "parse_pdf",
+            FileKind::Image if available.vision => "analyze_image",
+            FileKind::Audio if available.audio => "transcribe_audio",
+            // Tool switched off, or unsupported: leave it uncovered and let
+            // `warn_uncovered_files` say so.
+            _ => continue,
+        };
+        front.push(step(fresh("c"), task, serde_json::json!({ "file": f.original_name }), vec![]));
+        added.push(format!("{task}({})", f.original_name));
+    }
+
+    if wants_kb && !conversational && !plan.steps.iter().any(|s| s.task == "search_knowledge") {
+        // The planner's own query would have come from the intents; the raw
+        // request is the closest deterministic stand-in.
+        front.push(step(
+            fresh("kb"),
+            "search_knowledge",
+            serde_json::json!({ "query": prompt }),
+            vec![],
+        ));
+        added.push("search_knowledge".into());
+    }
+
+    let is_analysis = |s: &TaskStep| lookup(&s.task).map(|t| t.stage) == Some(Stage::Analyze);
+    let has_analysis = plan.steps.iter().any(is_analysis);
+    // "Check it against our SOPs" with a plan that summarises but never
+    // compares: the KB search alone doesn't run the check. (Found in review.)
+    let kb_present = plan.steps.iter().chain(&front).any(|s| s.task == "search_knowledge");
+    let needs_compare = wants_kb
+        && !conversational
+        && kb_present
+        && has_analysis
+        && !plan.steps.iter().any(|s| s.task == "compare_to_sop");
+    if front.is_empty() && !needs_compare && (has_analysis || conversational) {
+        return (plan, added);
+    }
+
+    let new_ids: Vec<String> = front.iter().map(|s| s.id.clone()).collect();
+    let mut steps = front;
+    for mut s in plan.steps.iter().cloned() {
+        if is_analysis(&s) {
+            s.depends_on.extend(new_ids.iter().cloned());
+        }
+        steps.push(s);
+    }
+
+    if !has_analysis {
+        // Everything gathered so far, including a conversational answer step.
+        let evidence: Vec<String> = steps
+            .iter()
+            .filter(|s| lookup(&s.task).is_some_and(|t| t.stage != Stage::Analyze))
+            .map(|s| s.id.clone())
+            .collect();
+        if !evidence.is_empty() {
+            let kb = steps.iter().any(|s| s.task == "search_knowledge");
+            steps.push(step(fresh("sum"), "summarize", serde_json::json!({}), evidence.clone()));
+            added.push("summarize".into());
+            if kb {
+                steps.push(step(fresh("sop"), "compare_to_sop", serde_json::json!({}), evidence));
+                added.push("compare_to_sop".into());
+            }
+        }
+    } else if needs_compare {
+        let evidence: Vec<String> = steps
+            .iter()
+            .filter(|s| lookup(&s.task).is_some_and(|t| t.stage != Stage::Analyze))
+            .map(|s| s.id.clone())
+            .collect();
+        steps.push(step(fresh("sop"), "compare_to_sop", serde_json::json!({}), evidence));
+        added.push("compare_to_sop".into());
+    }
+
+    let completed = Plan { steps };
+    let errors = validate_plan(&completed, uploads);
+    if !errors.is_empty() {
+        tracing::warn!(?errors, ?added, "plan completion produced an invalid plan; keeping the original");
+        return (plan, Vec::new());
+    }
+    (completed, added)
+}
+
 #[cfg(test)]
 mod fallback_tests {
     use super::*;
@@ -525,5 +715,196 @@ mod fold_tests {
             tasks(&fold_analysis(plan)),
             ["parse_pdf", "summarize", "search_knowledge", "compare_to_sop"]
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    const ON: Available = Available { vision: true, audio: true };
+
+    fn step(id: &str, task: &str, file: Option<&str>, deps: &[&str]) -> TaskStep {
+        TaskStep {
+            id: id.into(),
+            task: task.into(),
+            args: match file {
+                Some(f) => serde_json::json!({ "file": f }),
+                None => serde_json::json!({}),
+            },
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    fn tasks(plan: &Plan) -> Vec<&str> {
+        plan.steps.iter().map(|s| s.task.as_str()).collect()
+    }
+
+    /// Real files: completion re-validates, and the validator checks the disk.
+    fn uploads(dir: &std::path::Path) -> Vec<InputFile> {
+        [("inspection.pdf", FileKind::Pdf), ("valve.png", FileKind::Image)]
+            .into_iter()
+            .map(|(name, kind)| {
+                let path = dir.join(name);
+                std::fs::write(&path, b"x").unwrap();
+                InputFile { path: path.to_string_lossy().into_owned(), kind, original_name: name.into() }
+            })
+            .collect()
+    }
+
+    /// The worst warm run: the planner read the PDF and stopped. Completion
+    /// adds the photo, the SOP search and analysis, and the fold makes the
+    /// analysis one `assess`.
+    #[test]
+    fn a_pdf_only_plan_gets_the_photo_the_sops_and_one_assess() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan { steps: vec![step("x1", "parse_pdf", Some("inspection.pdf"), &[])] };
+
+        let (done, added) = complete_plan(plan, &up, "check it against our SOPs", true, ON);
+        assert_eq!(added, ["analyze_image(valve.png)", "search_knowledge", "summarize", "compare_to_sop"]);
+        assert!(validate_plan(&done, &up).is_empty());
+        assert_eq!(
+            tasks(&fold_analysis(done)),
+            ["analyze_image", "search_knowledge", "parse_pdf", "assess"]
+        );
+    }
+
+    /// `AnalysisTool` reads only its declared dependencies; an added step that
+    /// isn't one of them would be extracted and then ignored.
+    #[test]
+    fn existing_analysis_also_depends_on_what_was_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", Some("inspection.pdf"), &[]),
+                step("sum", "summarize", None, &["x1"]),
+            ],
+        };
+        let (done, added) = complete_plan(plan, &up, "assess the pump", false, ON);
+        assert_eq!(added, ["analyze_image(valve.png)"]);
+        let sum = done.steps.iter().find(|s| s.id == "sum").unwrap();
+        assert_eq!(sum.depends_on, ["x1", "c1"]);
+    }
+
+    #[test]
+    fn a_photo_the_planner_sent_to_ocr_is_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", Some("inspection.pdf"), &[]),
+                step("x2", "ocr_image", Some("valve.png"), &[]),
+                step("sum", "summarize", None, &["x1", "x2"]),
+            ],
+        };
+        let (_, added) = complete_plan(plan, &up, "read the nameplate", false, ON);
+        assert!(added.is_empty(), "{added:?}");
+    }
+
+    /// Profile says no photos: an `analyze_image` step could only fail.
+    #[test]
+    fn never_adds_a_step_whose_tool_is_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", Some("inspection.pdf"), &[]),
+                step("sum", "summarize", None, &["x1"]),
+            ],
+        };
+        let (done, added) = complete_plan(plan, &up, "assess", false, Available { vision: false, audio: true });
+        assert!(added.is_empty());
+        assert!(!is_covered(&done, &up, &up[1]), "left for warn_uncovered_files to report");
+    }
+
+    #[test]
+    fn a_follow_up_without_files_is_left_alone_even_when_sops_are_mentioned() {
+        let plan = Plan { steps: vec![step("fu", "answer_followup", None, &[])] };
+        let (done, added) = complete_plan(plan, &[], "and per our SOPs?", true, ON);
+        assert!(added.is_empty());
+        assert_eq!(tasks(&done), ["answer_followup"]);
+    }
+
+    /// New files on a "follow-up" mean it isn't a pure follow-up. Read them and
+    /// analyse them together with the conversational answer, but don't bolt a
+    /// KB search onto a conversation.
+    #[test]
+    fn a_follow_up_that_ignores_attached_files_gets_them_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan { steps: vec![step("fu", "answer_followup", None, &[])] };
+        let (done, added) = complete_plan(plan, &up, "and against our SOPs?", true, ON);
+        assert_eq!(added, ["parse_pdf(inspection.pdf)", "analyze_image(valve.png)", "summarize"]);
+        let sum = done.steps.last().unwrap();
+        assert_eq!(sum.depends_on, ["c1", "c2", "fu"]);
+        assert!(validate_plan(&done, &up).is_empty());
+    }
+
+    /// The likeliest under-plan for "check it against our SOPs": everything
+    /// read and summarised, the SOP check itself missing.
+    #[test]
+    fn a_summary_without_the_sop_check_gets_it_and_folds_to_assess() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", Some("inspection.pdf"), &[]),
+                step("x2", "analyze_image", Some("valve.png"), &[]),
+                step("sum", "summarize", None, &["x1", "x2"]),
+            ],
+        };
+        let (done, added) = complete_plan(plan, &up, "check it against our SOPs", true, ON);
+        assert_eq!(added, ["search_knowledge", "compare_to_sop"]);
+        assert!(validate_plan(&done, &up).is_empty());
+        assert_eq!(
+            tasks(&fold_analysis(done)),
+            ["search_knowledge", "parse_pdf", "analyze_image", "assess"]
+        );
+    }
+
+    /// Nothing to add at the front, so the early return must not swallow it.
+    #[test]
+    fn a_kb_search_with_no_comparison_gets_the_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan {
+            steps: vec![
+                step("x1", "parse_pdf", Some("inspection.pdf"), &[]),
+                step("x2", "analyze_image", Some("valve.png"), &[]),
+                step("kb", "search_knowledge", None, &[]),
+                step("sum", "summarize", None, &["x1", "x2", "kb"]),
+            ],
+        };
+        let (done, added) = complete_plan(plan, &up, "assess against our SOPs", true, ON);
+        assert_eq!(added, ["compare_to_sop"]);
+        assert_eq!(done.steps.last().unwrap().depends_on, ["x1", "x2", "kb"]);
+    }
+
+    #[test]
+    fn added_ids_never_collide_with_the_planners() {
+        let dir = tempfile::tempdir().unwrap();
+        let up = uploads(dir.path());
+        let plan = Plan {
+            steps: vec![
+                step("c1", "parse_pdf", Some("inspection.pdf"), &[]),
+                step("sum1", "summarize", None, &["c1"]),
+            ],
+        };
+        let (done, _) = complete_plan(plan, &up, "assess", false, ON);
+        let ids: Vec<&str> = done.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["c2", "c1", "sum1"]);
+    }
+
+    #[test]
+    fn knowledge_is_wanted_on_whole_words_only() {
+        let no = IntentResult { intents: vec![], file_kinds: vec![], needs_knowledge: false };
+        assert!(wants_knowledge(&no, "Assess P-101 and check it against our SOPs."));
+        assert!(wants_knowledge(&no, "is this compliant with procedure?"));
+        assert!(!wants_knowledge(&no, "isopropyl alcohol leak near the pump"));
+        assert!(!wants_knowledge(&no, "what's the standard rate on this card?"));
+        let yes = IntentResult { needs_knowledge: true, ..no };
+        assert!(wants_knowledge(&yes, "anything"));
     }
 }

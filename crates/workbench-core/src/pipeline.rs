@@ -12,7 +12,7 @@ use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::{assert_sane, compiler, execute_plan, ToolRegistry};
 use crate::memory::{Exchange, PersistentMemory, SessionContext, TurnSummary};
-use crate::planner::{plan_turn, validate_plan, PlanOutcome};
+use crate::planner::{complete_plan, plan_turn, validate_plan, wants_knowledge, Available, PlanOutcome};
 use crate::{PipelineConfig, Result};
 
 /// Terminal state of one turn.
@@ -57,7 +57,7 @@ pub async fn run_turn(
 
     // --- plan + deterministic validation (with retry ceiling) ---------------
     let plan_started = std::time::Instant::now();
-    let (_intent, outcome) =
+    let (intent, outcome) =
         plan_turn(engine, prompt, uploads, &history, session.has_history(), sink).await?;
     tracing::info!(plan_ms = plan_started.elapsed().as_millis(), "turn phase: planning done");
     let plan = match outcome {
@@ -69,6 +69,19 @@ pub async fn run_turn(
             });
         }
     };
+
+    // Make the plan cover what was asked: a small planner routinely skips the
+    // photo or the SOP search. Here and not in `run_from_plan`, so a plan the
+    // user edited in the HITL modal is never "completed" behind their back.
+    let available = Available {
+        vision: !engine.vision_model().trim().is_empty(),
+        audio: config.whisper_model_path.is_file(),
+    };
+    let (plan, added) =
+        complete_plan(plan, uploads, prompt, wants_knowledge(&intent, prompt), available);
+    if !added.is_empty() {
+        tracing::info!(?added, "plan completed: the planner left these out");
+    }
 
     run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, session, sink).await
 }
@@ -159,25 +172,10 @@ fn screen_uploads(uploads: &[InputFile], sink: &dyn ProgressSink) -> Vec<InputFi
 /// visible rather than a mystery. (`validate_plan` counts nothing here — one
 /// `ocr_image` step "covers" fifty images as far as it is concerned.)
 fn warn_uncovered_files(plan: &Plan, uploads: &[InputFile], sink: &dyn ProgressSink) {
-    use crate::planner::registry::lookup;
-
+    // Same definition `complete_plan` uses, so after completion this fires only
+    // for a file whose tool is switched off (or on a resumed plan).
     for f in uploads {
-        // Covered if some step names this exact file…
-        let named = plan.steps.iter().any(|s| {
-            s.args.get("file").and_then(|v| v.as_str()) == Some(f.original_name.as_str())
-        });
-        // …or a step consumes this kind without naming a file, in which case
-        // `ToolContext::file_for` falls back to the first upload of that kind.
-        let is_first_of_kind =
-            uploads.iter().find(|u| u.kind == f.kind).map(|u| &u.original_name)
-                == Some(&f.original_name);
-        let covered_by_fallback = is_first_of_kind
-            && plan.steps.iter().any(|s| {
-                s.args.get("file").is_none()
-                    && lookup(&s.task).and_then(|spec| spec.requires_file) == Some(f.kind)
-            });
-
-        if !named && !covered_by_fallback {
+        if !crate::planner::is_covered(plan, uploads, f) {
             crate::events::warn(
                 sink,
                 format!(

@@ -1308,6 +1308,49 @@ fake-server tests for full text, throttle, tail, timings and a cut-off
 stream); FIX re-ran tauri-app 41/41 against the new signatures. The live
 streaming in the app is **untested** until a real turn runs.
 
+## Feature pass — part 18: a plan must cover what was asked
+
+The repeated warm runs (part 16) showed six identical turns producing five
+different plans: photo skipped 3/6, SOP search 3/6, analysis 2/6, and one
+plan was `parse_pdf` alone, giving a 6 s turn with a generic answer.
+`validate_plan` checks that a plan is *runnable*; nothing checked that it is
+*complete*. The user chose to guarantee coverage over the fastest possible
+turn.
+
+`planner::complete_plan` runs after validation, in `run_turn` only:
+- every attachment gets an extraction step (`parse_pdf` / `analyze_image` /
+  `transcribe_audio`), unless any step of that kind already reads it (a photo
+  sent to `ocr_image` is covered) or its tool is off (no vision model in the
+  profile, no whisper file), since a step that can only fail just buys a
+  degraded badge;
+- `search_knowledge` when role A's `needs_knowledge` is set **or** the request
+  says so (whole words: sop/sops/procedure/compliance/regulation/standards,
+  or "check against"). No bare "standard": "what's the standard rate?" is the
+  fee-card demo, not a compliance question;
+- existing analysis steps also depend on what was added (`AnalysisTool` reads
+  only declared dependencies, so an added photo would otherwise be extracted
+  and then ignored);
+- evidence but no analysis → `summarize` (+ `compare_to_sop` with the KB),
+  which the part-16 fold turns into one `assess`;
+- SOPs wanted, a KB search present, analysis present but no `compare_to_sop`
+  → add it. Found in review: the likeliest under-plan for "check it against
+  our SOPs" is PDF + photo + `summarize`, and without this rule the SOP check
+  never ran, even with the KB search added.
+
+Why `run_turn` and not `run_from_plan` (where the fold lives): a resumed plan
+is one the user edited in the HITL modal, and completing it would undo their
+edit. A conversational plan is left alone, except when it ignores attached
+files: then they are read and analysed together with the answer step, with
+no KB search added. Added ids are fresh, the result is re-validated, and the
+original plan is kept if that ever fails. `warn_uncovered_files` now uses the
+same `is_covered`, so after completion it warns only about switched-off tools.
+
+Design reviewed by the FIX session before coding (resume, tools switched
+off, OCR coverage, the keyword bug, re-validation). `cargo test -p
+workbench-core -j 1` → **74/74**, 10 new tests built from the warm runs'
+plan shapes. Cost: an under-planned turn now takes as long as a full one
+(~25 s on the teammate's machine). **Not yet run against a live model.**
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass
