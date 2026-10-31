@@ -1416,6 +1416,97 @@ complete, truncated and stalled downloads). **Not live-tested**: the model
 hosts were unreachable from the dev machine's network. Known nit, left as is:
 a photo the planner sent to both image tools gets OCR'd twice.
 
+## Feature pass — part 21: the mesh, phase 1 (the scheduler, before the network)
+
+The goal: a weak Host hands plan steps to stronger Workers on the LAN, keeps
+all state, and sends each Worker only what its step needs. The design and the
+lead's 15 decisions are in [12-mesh.md](12-mesh.md). This part builds the
+scheduler with **no networking**, so the hard part (what goes where, in which
+order, with what) is tested before any socket exists.
+
+- **What was in the way:** the executor and the tools assumed one machine.
+  `execute_plan` ran a `for` loop, and every tool read the whole `outputs`
+  map. The plan is a DAG, though, and only the analysis tool reads outputs at
+  all.
+- **The evidence that shaped it:** `analysis.rs` falls back to *every output
+  so far* when its dependencies give no evidence. A naive parallel scheduler
+  would have handed analysis a different evidence set than the sequential one
+  (missing a step still running, or including a later step that finished
+  early). So analysis-stage steps, and unknown tasks like `assess`, wait for
+  every earlier step and get exactly those outputs. A test plants a later step
+  that finishes first and asserts analysis never sees it.
+- **What changed:** new `mesh.rs` (`StepJob`, `Dispatcher` trait, `run_job`,
+  `execute_plan_mesh`); `run_turn_with_mesh` / `resume_turn_with_mesh` beside the
+  unchanged `run_turn` / `resume_turn`. Two behaviour-preserving extractions so
+  both executors share one implementation: `executor::run_step` / `finish_step`
+  (timeouts, failures, logs) and `tools::resolve_file` (which attachment a step
+  reads). One job per device at a time keeps the one-resident-model rule per
+  machine. A failed Worker → next Worker → Host, with a warning each time.
+- **Deliberately not done:** any network code (phase 2 needs four new crates);
+  the stepper UI still assumes one running step, so parallel steps' `ExecutingTool`
+  events interleave (phase 5); `CallTiming` isn't serialisable yet, so Worker
+  timings don't reach the turn breakdown (phase 3).
+
+`cargo test --workspace --offline` → every binary green (the existing suites
+unchanged, plus 6 mesh integration tests and 3 unit tests), no warnings.
+Clippy isn't installed on this toolchain, so it wasn't run. Not live-tested:
+there is nothing to run live until phase 2.
+
+**Takeaway:** before parallelising anything, find every place that reads
+"everything so far". Each one is an ordering assumption hiding in plain sight.
+
+## Feature pass — part 22: the mesh, phases 2–3 (the link, the hub, the Worker)
+
+New crate `crates/workbench-mesh` (Tauri-free, so its tests don't build the
+app on a 2-core laptop). It holds the pairing code, SPAKE2 + Noise handshake,
+encrypted chunked frames over a WebSocket, mDNS discovery, the scheduler, the
+Host hub that implements part 21's `Dispatcher` over real links, and the Worker
+runtime. Four new crates (`tokio-tungstenite`, `snow`, `spake2` 0.4, `mdns-sd`);
+`Cargo.lock` +231 lines. Design in [12-mesh.md](12-mesh.md).
+
+Three things broke on the way, each worth knowing:
+
+- **`u128 is not supported`.** The happy-path hub test ran the step on the
+  Host instead of the Worker. The warning showed the Worker *had* run it, then
+  "the connection closed". The hub's reader dropped the error, so step one
+  was to pass it on, and the real reason appeared: decoding the `Done` frame
+  failed. `Frame` was `#[serde(tag = "t")]`, and serde decodes internally
+  tagged enums through a buffer with no `u128`, but `ToolResult::elapsed_ms` is
+  one. Fixed by external tagging, pinned by a round-trip test of every frame.
+  Rejected: changing `elapsed_ms` to `u64`, which touches working core code
+  the UI reads.
+- **A green run that wasn't.** The link test with the same `Done` frame had
+  "passed" earlier. It hadn't run: cargo stopped after the first failing test
+  binary. `--no-fail-fast` from then on.
+- **A deadlock in a test, not the code.** A 3 MB frame was sent, then read, in
+  one task. Base64 makes it ~4 MB, more than a loopback socket buffers, so the
+  send waited forever for a reader that hadn't started. The real hub and Worker
+  read and write on separate tasks; the test now does too. Found by running the
+  tests one at a time into a log, since the piped output showed nothing.
+
+Also caught in review before any test: the Worker's link tasks were bare
+`tokio::spawn`s, which keep running when their handle is dropped, so a Worker
+loop the app abandons would have kept its link open and accepted jobs. They are
+abort-on-drop now (test: `a_worker_that_vanishes_mid_job_leaves_the_step_to_the_host`).
+And `StepJob` now carries the engine's persona line (one getter on
+`OllamaEngine`), or a Worker's answers would be framed differently.
+
+The lead asked for a short code that is easy to read out, so it went from 9
+characters to 6 (`K7Q-4M9`: a 2-character tag, a 4-character secret). That is
+safe only because of SPAKE2 plus the 5-failure limit (about 1 in 200,000 for a
+guesser). The shorter tag made one test flaky: it asserted two *random* codes
+had different tags, which fails about 1 run in 1,024. It now derives a
+different tag.
+
+Tests: `cargo test -p workbench-mesh --no-fail-fast` → 15 unit + 4 hub + 6 link,
+all green, no warnings. The multicast discovery test passed once on this
+laptop's real interface (`-- --ignored`). **Not live-tested**: there is no UI or
+Tauri wiring yet, so no two real machines have talked. Not done: Worker call
+timings in the Host's turn breakdown, and the GPU cap.
+
+**Takeaway:** when a fallback hides a failure, make the fallback say why
+before you go looking. One `map_err` turned a guess into a line number.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

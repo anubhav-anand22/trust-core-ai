@@ -1,0 +1,35 @@
+[package]
+name = "workbench-mesh"
+description = "LAN mesh link for TrustCore: pairing code, encrypted WebSocket, discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+workbench-core = { path = "../workbench-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+# Already in the tree via workbench-core.
+futures-util = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+
+# --- new for the mesh (docs/12-mesh.md, MESH-1/13) ---------------------------
+# WebSocket over a plain TcpStream. No TLS feature: encryption is Noise, below.
+tokio-tungstenite = "0.30"
+# Noise protocol: the encrypted, mutually authenticated channel. Pure Rust.
+snow = "0.10"
+# PAKE: turns the short pairing code into a strong shared key, so a captured
+# handshake can't be brute-forced offline. 0.5 is still a pre-release.
+spake2 = "0.4"
+# LAN discovery: the Host advertises `_trustcore._tcp`, Workers find it by code.
+mdns-sd = "0.21"
+
+[dev-dependencies]
+tempfile = "3"

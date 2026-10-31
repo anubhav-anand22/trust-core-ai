@@ -17,6 +17,7 @@ reference. Read them in order the first time.
 | 09 | [Running on a CPU-only machine](09-running-on-cpu.md) | Model tiers, thread budgets, process priority, timeouts and Stop — why the desktop used to freeze and what fixed it |
 | 10 | [Documents and tables](10-documents-and-tables.md) | How a PDF becomes evidence, the three ways a fact gets lost on that path, and Fast vs Deep read |
 | 11 | [Conversations and memory](11-conversations-and-memory.md) | Per-session chat storage, the sidebar, how follow-up questions are answered, and the two memory tiers |
+| 12 | [The mesh](12-mesh.md) | Running plan steps on nearby machines: what a Worker gets, the two rules that keep answers identical, the MESH decisions (in progress) |
 
 ## Glossary (quick reference)
 
