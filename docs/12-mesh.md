@@ -1,8 +1,9 @@
 # 12 · The mesh: borrowing nearby machines without giving them your data
 
-> Status: **Phases 1–4 of 6 landed**: the core scheduler, the encrypted link,
-> the Host hub plus Worker runtime, and delegated planning, all tested over
-> loopback. Not yet wired into the app: no UI and no Tauri commands. See [Phases](#phases).
+> Status: **Phases 1–5 of 6 landed**: the core scheduler, the encrypted link,
+> the Host hub plus Worker runtime, delegated planning, and the app (Tauri
+> commands plus the Mesh panel). Tested over loopback and type-checked. **Two
+> real devices have not been tested yet**: that is phase 6, [the device test](#phase-6-the-two-device-test).
 
 TrustCore is built to run on a weak, often GPU-less office machine. On a
 machine like that a turn takes minutes. Most offices have a stronger
@@ -158,6 +159,62 @@ Host: plan_turn ── parse_intent ──▶ delegator Worker (its model, maybe
 - With no mesh, or no delegator chosen, `run_turn_with_mesh` makes the same
   `plan_turn(engine, …)` call as before.
 
+## In the app (phase 5)
+
+| Piece | File | What it does |
+|---|---|---|
+| Header button | `src/App.tsx` | "Mesh" pill on the right of the top bar. Its dot is grey when off, green with a role, and amber when a device is waiting for consent ("· approve?"). |
+| Mesh panel | `src/components/MeshSidebar.tsx` (+ `.css`) | A drawer over the right edge, so the layout underneath never moves. **Off:** "Use nearby devices" or "Lend this device" (code, or address as a fallback), plus one-click Reconnect to remembered Hosts. **Host:** the code with a countdown, the consent card per new device, approved devices (GPU/cores/RAM/speed/link, Working/Idle, "Plans turns", pin, remove), this device's speed. **Worker:** Host name, Idle / "Running a step: parse pdf" (the type, never the content), and a thread slider. |
+| Consent card | same | What the device will see (questions and conversation when planning; files and extracted text for its steps), what it never gets (memory, knowledge base, other chats), and "only allow devices you trust". Allow / Don't allow. |
+| Worker lock | `src/components/PromptPanel.tsx` | Optional `lockedReason`: the prompt box is read-only with the reason above it. The backend refuses too (`mesh::refuse_if_worker`). |
+| Commands | `src-tauri/src/mesh.rs` | `mesh_status`, `mesh_start_host`, `mesh_new_code`, `mesh_approve`, `mesh_remove`, `mesh_pin_delegator`, `mesh_join`, `mesh_reconnect`, `mesh_forget_host`, `mesh_set_threads`, `mesh_leave`. |
+| Turn wiring | `src-tauri/src/lib.rs` | `submit_turn` / `resume_turn` use `run_turn_with_mesh` **only when this device hosts at least one approved Worker**. Otherwise it is the literal call from before the mesh. |
+
+- **Off at every launch** (lead's choice). The Host listens on a port the OS
+  picks, on all interfaces, only while hosting. Windows will show a firewall
+  prompt the first time: allow it on private networks.
+- **Speed:** each device measures its own decode speed with one short answer
+  from its model (a few seconds on a CPU). A Host measures in the background,
+  and plans its own turns until the measurement lands. A Worker measures
+  before joining: "Measuring this device and connecting…".
+- **Caps (lead's choice):** a Worker lends all cores but one, the app's own
+  rule (`HardwareInfo::worker_threads`). The slider applies from the next step.
+  With a GPU, "Lend the GPU" (on by default) can be unticked to run jobs
+  CPU-only (`ResourceLimits::num_gpu = Some(0)`; `None`, Ollama's choice, for
+  every normal turn). The Host ranked the Worker by the GPU it reported at
+  join, so a withheld GPU still gets model steps, just slower.
+- **Where each step ran:** `StepEvent::ToolFinished` has an optional `device`,
+  shown in the audit panel as "parse_pdf · on gpu-box". It is omitted from the
+  JSON when the step ran here, so turns without the mesh emit exactly the
+  events they always did.
+- **Status is polled:** every 1 s with the panel open, 3 s otherwise. Plain
+  `invoke`, not `timed`, so the log isn't flooded.
+- **Files:** `<app data>/mesh/identity.json`, `workers.json` (Host side),
+  `hosts.json` (Worker side), `scratch/` (Worker temp folders).
+
+## Phase 6: the two-device test
+
+Needs two machines on the same Wi-Fi/LAN, both on this branch, both through
+setup with Ollama running. Ideally A is weak (no GPU) and B is stronger.
+
+1. **A:** Mesh → **Start hosting**. Expect a code like `K7Q-4M9` and a 10:00 countdown.
+2. **B:** Mesh → **Join** with that code. Expect "Measuring this device and
+   connecting…" for a few seconds, then "Working for A", and B's prompt box locked.
+3. **A:** expect an amber dot and a consent card naming B. Click **Allow**.
+   Expect B under "Devices helping", with its speed and link.
+4. **A:** ask a question with a PDF attached. Expect the answer as usual. In A's
+   log (`open_log_dir`): `submit_turn: running on the mesh`, `mesh: job sent`. On
+   B, while it runs: "Running a step: parse pdf".
+5. **Speed:** run the same question with the mesh off (Stop hosting) and on.
+   Compare the turn times in the log (`turn phase` lines). Report both numbers.
+6. **Failure:** start a long question on A, then turn B's Wi-Fi off. Expect an
+   amber warning on A, and the turn still finishing on A.
+7. **Privacy:** after a step on B, B's `<app data>/mesh/scratch/` is empty.
+8. **Reconnect:** Leave on B, then **Reconnect** to A. No code is needed and no
+   consent card appears.
+9. **Discovery blocked:** if step 2 says no Host found, use "Enter its address"
+   with the address A's panel shows.
+
 ## Decisions
 
 Recorded so any session can defend them, or notice when a request contradicts
@@ -197,7 +254,7 @@ trust.
 |---|---|---|
 | 1 | Core: `StepJob`, `Dispatcher`, `run_job`, `execute_plan_mesh`, pipeline seam | **done**: 6 integration tests (`tests/mesh_executor.rs`) + 3 unit tests |
 | 2 | Link: code → SPAKE2 → Noise, WebSocket frames, mDNS (`crates/workbench-mesh`) | **done**: 6 link tests (+1 multicast, run by hand) + unit tests |
-| 3 | Scheduler, delegator rule, Host hub (`Dispatcher` over real links), Worker runtime | **done**: 4 end-to-end hub tests + scheduler unit tests. Open: Worker `CallTiming`s don't reach the Host's turn breakdown; GPU cap (`num_gpu`) comes with the UI caps in phase 5 |
+| 3 | Scheduler, delegator rule, Host hub (`Dispatcher` over real links), Worker runtime | **done**: 4 end-to-end hub tests + scheduler unit tests. A Worker's model-call timings come back in `Done` and are logged on the Host as `mesh model call timing` (with the device) |
 | 4 | Delegated planning (`RemotePlanner`, `PlanJob`/`Planned` frames) | **done**: 3 core tests (Worker plans while the Host validates and retries; fallback after one failure; Stop) + 1 end-to-end over a real link |
-| 5 | UI: header toggle, sidebar, consent, Worker mode, `served_by` in the audit panel | todo |
-| 6 | Two-machine LAN benchmark | todo |
+| 5 | App: Tauri commands, header button, Mesh panel, consent card, Worker lock, turn wiring, "on <device>" per step in the audit panel, Worker GPU switch | **done**: `tsc` clean, workspace tests green |
+| 6 | Two-device test and benchmark | **todo, needs the lead's two devices**: [steps above](#phase-6-the-two-device-test) |

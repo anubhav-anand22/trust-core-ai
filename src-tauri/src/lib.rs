@@ -12,6 +12,7 @@
 mod bootstrap;
 mod events;
 mod logging;
+mod mesh;
 
 use std::sync::Mutex;
 
@@ -431,6 +432,7 @@ async fn submit_turn(
         "submit_turn: start"
     );
 
+    mesh::refuse_if_worker(&app).await?;
     let (config, uploads, engine, _cancel) = turn_setup(&app, &state, &session_id, &files, mode)?;
     tracing::debug!(
         model = engine.llm_model(),
@@ -442,10 +444,20 @@ async fn submit_turn(
     let registry = default_registry();
     let sink = ChannelSink(on_event);
 
-    let result = workbench_core::run_turn(
-        &engine, &registry, &config, &session_id, &prompt, &uploads, &sink,
-    )
-    .await;
+    // With no approved Worker this is the same call as before the mesh existed.
+    let result = match mesh::turn_dispatcher(&app, &uploads).await {
+        None => {
+            workbench_core::run_turn(&engine, &registry, &config, &session_id, &prompt, &uploads, &sink)
+                .await
+        }
+        Some(dispatcher) => {
+            tracing::info!("submit_turn: running on the mesh");
+            workbench_core::run_turn_with_mesh(
+                &engine, &registry, &config, &session_id, &prompt, &uploads, &sink, Some(&dispatcher),
+            )
+            .await
+        }
+    };
     clear_cancel(&state);
 
     match result {
@@ -537,14 +549,26 @@ async fn resume_turn(
         "resume_turn: start"
     );
 
+    mesh::refuse_if_worker(&app).await?;
     let (config, uploads, engine, _cancel) = turn_setup(&app, &state, &session_id, &files, mode)?;
     let registry = default_registry();
     let sink = ChannelSink(on_event);
 
-    let result = workbench_core::resume_turn(
-        &engine, &registry, &config, &session_id, &prompt, &uploads, &plan_json, force, &sink,
-    )
-    .await;
+    let result = match mesh::turn_dispatcher(&app, &uploads).await {
+        None => {
+            workbench_core::resume_turn(
+                &engine, &registry, &config, &session_id, &prompt, &uploads, &plan_json, force, &sink,
+            )
+            .await
+        }
+        Some(dispatcher) => {
+            workbench_core::resume_turn_with_mesh(
+                &engine, &registry, &config, &session_id, &prompt, &uploads, &plan_json, force, &sink,
+                Some(&dispatcher),
+            )
+            .await
+        }
+    };
     clear_cancel(&state);
 
     match result {
@@ -620,6 +644,9 @@ pub fn run() {
             model_plan: Mutex::new(None),
             cancel: Mutex::new(None),
         })
+        // Off at every launch: nothing listens on the network until the user
+        // picks a role in the mesh sidebar.
+        .manage(mesh::MeshState::default())
         .invoke_handler(tauri::generate_handler![
             generate_response,
             is_ollama_installed,
@@ -646,6 +673,18 @@ pub fn run() {
             rename_session,
             logging::ui_log,
             open_log_dir,
+            mesh::mesh_status,
+            mesh::mesh_start_host,
+            mesh::mesh_new_code,
+            mesh::mesh_approve,
+            mesh::mesh_remove,
+            mesh::mesh_pin_delegator,
+            mesh::mesh_join,
+            mesh::mesh_reconnect,
+            mesh::mesh_forget_host,
+            mesh::mesh_set_threads,
+            mesh::mesh_set_lend_gpu,
+            mesh::mesh_leave,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1535,6 +1535,38 @@ its call sites are unchanged. Not live-tested.
 **Takeaway:** look for the trait before you move a function. The seam was
 already there; the work was only to put the network behind it.
 
+## Feature pass — part 24: the mesh, phase 5 (in the app)
+
+- **What changed:** `src-tauri/src/mesh.rs` (one role at a time: off, Host or
+  Worker, with 11 commands); `submit_turn` / `resume_turn` pass the hub's
+  dispatcher only when at least one approved Worker exists; a "Mesh" button on
+  the right of the top bar and a drawer panel (`MeshSidebar.tsx`) with the
+  consent card; an optional `lockedReason` on `PromptPanel` for Worker mode.
+  The hub gained `shutdown` and `pinned`. Discovery also advertises the Host's
+  device id, so a remembered Worker finds its Host with no code.
+- **The lead's choices:** button in the top bar, mesh off at every launch, a
+  Worker lends all cores but one.
+- **Caught in review, before running:** a Worker's serve loop resets the role
+  to Off when its Host disappears. If the user had meanwhile left and joined
+  another Host, that stale loop would have wiped the new role. Each join now
+  carries a generation number, and a loop only clears its own.
+- **Then the three open ends:** `ToolFinished` gained an optional `device`
+  (skipped in the JSON when empty, so a turn without the mesh emits
+  byte-identical events) and the audit panel shows "· on gpu-box";
+  `ResourceLimits::num_gpu` (default `None`, Ollama's choice) backs a Worker's
+  "Lend the GPU" switch; `CallTiming` is `Deserialize`, and `Done` frames carry
+  the Worker's timings, which the Host logs as `mesh model call timing`.
+- **Deliberately not done:** event push instead of polling. Nothing in the app
+  uses Tauri events yet, so polling avoided a second mechanism.
+
+`cargo check -p tauri-app` clean, `tsc --noEmit` clean, workspace tests green.
+**Not live-tested**: no two devices have run it. The test plan is in
+[12-mesh.md, phase 6](12-mesh.md#phase-6-the-two-device-test).
+
+**Takeaway:** a background task that "cleans up when it ends" must know which
+state it owns. Here, "the role is Worker" wasn't enough; it had to be "the
+role is *my* Worker".
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

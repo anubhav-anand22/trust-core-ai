@@ -25,8 +25,11 @@ export function PromptPanel({
   resetToken,
   exampleText,
   exampleToken,
+  lockedReason,
 }: {
   busy: boolean;
+  /** Set while this device serves as a mesh Worker: the panel is read-only and says why. */
+  lockedReason?: string;
   onSubmit: (prompt: string, files: File[], mode: TurnMode) => void;
   /** Bumped by `App` each time a turn actually delivers a report. */
   resetToken: number;
@@ -92,20 +95,23 @@ export function PromptPanel({
     });
   }
 
+  const locked = busy || !!lockedReason;
+
   function submit() {
-    if (!prompt.trim() || busy) return;
+    if (!prompt.trim() || locked) return;
     setStopping(false);
     onSubmit(prompt.trim(), files, deep ? "deep" : "fast");
   }
 
   return (
     <div className="prompt-panel">
+      {lockedReason && <p className="prompt-locked">{lockedReason}</p>}
       <textarea
         ref={textareaRef}
         className="prompt-input"
         placeholder="Describe the task, e.g. “Assess corrosion risk on pump P-101 from these attachments,” or “What credit-card fee applies to a ₹1000 payment per this rate card?”"
         value={prompt}
-        disabled={busy}
+        disabled={locked}
         onChange={(e) => setPrompt(e.currentTarget.value)}
         onKeyDown={(e) => {
           if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
@@ -174,7 +180,7 @@ export function PromptPanel({
         <input
           type="checkbox"
           checked={deep}
-          disabled={busy}
+          disabled={locked}
           onChange={(e) => setDeep(e.currentTarget.checked)}
         />
         Deep read (whole document, slower)
@@ -184,7 +190,7 @@ export function PromptPanel({
         <button
           type="button"
           className="run-btn"
-          disabled={busy || !prompt.trim()}
+          disabled={locked || !prompt.trim()}
           onClick={submit}
         >
           {busy ? "Running…" : "Run"}

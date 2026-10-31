@@ -10,6 +10,8 @@ interface ToolTiming {
   tool: string;
   ok: boolean;
   ms: number;
+  /** The mesh device that ran it; absent when it ran here. */
+  device?: string;
 }
 
 // A static trail through the pipeline, independent of any turn actually
@@ -67,7 +69,7 @@ export function AuditSidebar({
 
   const timings: ToolTiming[] = events
     .filter((e): e is Extract<StepEvent, { stage: "tool_finished" }> => e.stage === "tool_finished")
-    .map((e) => ({ tool: e.tool, ok: e.ok, ms: e.elapsed_ms }));
+    .map((e) => ({ tool: e.tool, ok: e.ok, ms: e.elapsed_ms, device: e.device }));
 
   const totalMs = timings.reduce((a, t) => a + t.ms, 0);
 
@@ -151,7 +153,10 @@ export function AuditSidebar({
                 <tbody>
                   {timings.map((t, i) => (
                     <tr key={i} className={t.ok ? "" : "row-fail"}>
-                      <td>{t.tool}</td>
+                      <td>
+                        {t.tool}
+                        {t.device && <span className="muted small"> · on {t.device}</span>}
+                      </td>
                       <td className="num">{t.ms} ms</td>
                     </tr>
                   ))}

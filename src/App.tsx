@@ -6,6 +6,7 @@ import "./App.css";
 import { AuditSidebar } from "./components/AuditSidebar";
 import { BootstrapGate } from "./components/BootstrapGate";
 import { HitlModal } from "./components/HitlModal";
+import { MeshSidebar } from "./components/MeshSidebar";
 import { SearchSidebar } from "./components/SearchSidebar";
 import { ProfileGate } from "./components/ProfileGate";
 import { PromptPanel } from "./components/PromptPanel";
@@ -21,6 +22,7 @@ import {
   getProfile,
   listSessions,
   loadSession,
+  meshStatus,
   renameSession,
   resumeTurn,
   submitTurn,
@@ -31,6 +33,7 @@ import type {
   Exchange,
   FinalReport,
   MemoryFact,
+  MeshStatus,
   ModelPlan,
   SessionMeta,
   StepEvent,
@@ -167,6 +170,30 @@ function App() {
   const [memory, setMemory] = useState<MemoryFact[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<{ message: string; detail?: string | null }[]>([]);
+
+  // --- LAN mesh (docs/12-mesh.md) ---------------------------------------
+  // Polled, not pushed: every second while the panel is open (code countdown,
+  // device list), every 3 s otherwise so the header dot can flag a device
+  // waiting for consent. A local call, cheap.
+  const [meshOpen, setMeshOpen] = useState(false);
+  const [mesh, setMesh] = useState<MeshStatus | null>(null);
+  useEffect(() => {
+    let live = true;
+    const tick = () =>
+      meshStatus()
+        .then((s) => live && setMesh(s))
+        .catch(() => {
+          /* backend not up yet; the next tick retries */
+        });
+    tick();
+    const id = window.setInterval(tick, meshOpen ? 1000 : 3000);
+    return () => {
+      live = false;
+      window.clearInterval(id);
+    };
+  }, [meshOpen]);
+  const meshWaiting = mesh?.host?.devices.some((d) => !d.consented) ?? false;
+  const meshHelpers = mesh?.host?.devices.filter((d) => d.consented).length ?? 0;
 
   const lastTurn = useRef<{
     prompt: string;
@@ -474,7 +501,23 @@ function App() {
         <h1>TrustCore AI</h1>
         <span className="wb-tagline">Sovereign AI Agentic Workbench</span>
         <span className="wb-tier">{plan.tier_label}</span>
+        <button
+          className="mesh-toggle"
+          onClick={() => setMeshOpen((o) => !o)}
+          aria-expanded={meshOpen}
+          title="Use nearby devices, or lend this one"
+        >
+          <span
+            className={`mesh-dot${meshWaiting ? " mesh-dot-alert" : mesh && mesh.role !== "off" ? " mesh-dot-on" : ""}`}
+          />
+          {mesh?.role === "host"
+            ? `Mesh · ${meshHelpers} helping${meshWaiting ? " · approve?" : ""}`
+            : mesh?.role === "worker"
+              ? "Mesh · lending"
+              : "Mesh"}
+        </button>
       </header>
+      {meshOpen && <MeshSidebar status={mesh} onStatus={setMesh} onClose={() => setMeshOpen(false)} />}
 
       <div className="wb-body">
         <SessionSidebar
@@ -612,6 +655,11 @@ function App() {
               resetToken={inputResetToken}
               exampleText={exampleText}
               exampleToken={exampleToken}
+              lockedReason={
+                mesh?.role === "worker"
+                  ? `This device is working for ${mesh.worker?.host_name ?? "another device"}. Your own questions are paused; leave the mesh to use it again.`
+                  : undefined
+              }
             />
           </section>
 

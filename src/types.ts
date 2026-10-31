@@ -110,7 +110,8 @@ export type StepEvent =
   | { stage: "awaiting_user"; errors: string[]; plan_json: string }
   | { stage: "warning"; message: string; detail?: string | null }
   | { stage: "executing_tool"; tool: string; index: number; total: number }
-  | { stage: "tool_finished"; tool: string; ok: boolean; elapsed_ms: number }
+  /** `device`: the mesh device that ran it, absent when it ran on this one. */
+  | { stage: "tool_finished"; tool: string; ok: boolean; elapsed_ms: number; device?: string }
   | { stage: "quality_check"; passed: boolean }
   | { stage: "synthesizing" }
   | { stage: "done"; report_json: string }
@@ -175,4 +176,53 @@ export interface TaskStep {
 }
 export interface Plan {
   steps: TaskStep[];
+}
+
+// src-tauri/src/mesh.rs — the LAN mesh (docs/12-mesh.md)
+export type MeshRole = "off" | "host" | "worker";
+
+export interface MeshDevice {
+  device_id: string;
+  name: string;
+  /** false = paired just now, waiting on the consent screen. */
+  consented: boolean;
+  busy: boolean;
+  gpu: boolean;
+  gpu_name: string;
+  cores: number;
+  ram_gb: number;
+  llm_model: string | null;
+  tok_s: number | null;
+  link_mbps: number | null;
+}
+
+export interface MeshHostStatus {
+  /** null once expired. */
+  code: string | null;
+  code_seconds_left: number;
+  /** "192.168.1.20:52345", for networks where discovery finds nothing. */
+  address: string | null;
+  discoverable: boolean;
+  tok_s: number | null;
+  devices: MeshDevice[];
+  delegator: string | null;
+  pinned: string | null;
+}
+
+export interface MeshWorkerStatus {
+  host_name: string;
+  /** "idle" or the running job's task type, never its content. */
+  activity: string;
+  threads: number;
+  max_threads: number;
+  has_gpu: boolean;
+  lend_gpu: boolean;
+}
+
+export interface MeshStatus {
+  role: MeshRole;
+  device_name: string;
+  host: MeshHostStatus | null;
+  worker: MeshWorkerStatus | null;
+  known_hosts: { device_id: string; name: string }[];
 }

@@ -7,6 +7,7 @@ import type {
   AuditPaths,
   LlmAssessment,
   MemoryFact,
+  MeshStatus,
   ModelPlan,
   ModelProgress,
   SessionContext,
@@ -273,6 +274,32 @@ export function resumeTurn(
       }),
   );
 }
+
+// --- LAN mesh (src-tauri/src/mesh.rs, docs/12-mesh.md) ------------------------------
+
+/** Polled every second or so: deliberately not `timed`, or the log fills with it. */
+export const meshStatus = () => invoke<MeshStatus>("mesh_status");
+
+export const meshStartHost = () => timed("mesh_start_host", undefined, () => invoke<MeshStatus>("mesh_start_host"));
+export const meshNewCode = () => timed("mesh_new_code", undefined, () => invoke<MeshStatus>("mesh_new_code"));
+export const meshApprove = (deviceId: string) =>
+  timed("mesh_approve", { deviceId }, () => invoke<MeshStatus>("mesh_approve", { deviceId }));
+export const meshRemove = (deviceId: string) =>
+  timed("mesh_remove", { deviceId }, () => invoke<MeshStatus>("mesh_remove", { deviceId }));
+export const meshPinDelegator = (deviceId: string | null) =>
+  timed("mesh_pin_delegator", { deviceId }, () => invoke<MeshStatus>("mesh_pin_delegator", { deviceId }));
+/** The code itself is never logged. */
+export const meshJoin = (code: string, address: string | null) =>
+  timed("mesh_join", { manualAddress: !!address }, () => invoke<MeshStatus>("mesh_join", { code, address }));
+export const meshReconnect = (deviceId: string) =>
+  timed("mesh_reconnect", { deviceId }, () => invoke<MeshStatus>("mesh_reconnect", { deviceId }));
+export const meshForgetHost = (deviceId: string) =>
+  timed("mesh_forget_host", { deviceId }, () => invoke<MeshStatus>("mesh_forget_host", { deviceId }));
+export const meshSetThreads = (threads: number) =>
+  timed("mesh_set_threads", { threads }, () => invoke<MeshStatus>("mesh_set_threads", { threads }));
+export const meshSetLendGpu = (lend: boolean) =>
+  timed("mesh_set_lend_gpu", { lend }, () => invoke<MeshStatus>("mesh_set_lend_gpu", { lend }));
+export const meshLeave = () => timed("mesh_leave", undefined, () => invoke<MeshStatus>("mesh_leave"));
 
 /** Read a File into the base64 shape `submit_turn` expects. */
 export function fileToUpload(file: File): Promise<UploadedFile> {

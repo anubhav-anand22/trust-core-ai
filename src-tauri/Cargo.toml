@@ -32,6 +32,8 @@ tokio-stream = "0.1.19"
 sysinfo = "0.33"
 base64 = "0.22"
 workbench-core = { path = "../crates/workbench-core" }
+# LAN mesh: pairing, encrypted link, Host hub, Worker runtime (src/mesh.rs).
+workbench-mesh = { path = "../crates/workbench-mesh" }
 # Diagnostics. The core crate emits `tracing` events; without a subscriber here
 # they go nowhere, so the host owns setup and writes to console + a daily file.
 tracing = { workspace = true }

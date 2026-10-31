@@ -1,0 +1,52 @@
+/* Mesh panel. A fixed drawer over the right edge, so opening it never changes
+   the workbench layout underneath. Only the app's colour tokens are shared. */
+.mesh-sidebar {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 30;
+  width: min(380px, 100vw);
+  background: var(--panel); border-left: 1px solid var(--line);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.45);
+  padding: 14px; overflow: auto;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.mesh-head { display: flex; align-items: center; justify-content: space-between; }
+.mesh-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0; }
+.mesh-close { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: var(--radius); padding: 2px 8px; cursor: pointer; }
+.mesh-note { margin: 0; font-size: 12px; line-height: 1.45; color: var(--muted); }
+.mesh-card { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; display: grid; gap: 8px; }
+.mesh-card h5, .mesh-consent h5 { margin: 0; font-size: 13px; color: var(--text); }
+.mesh-muted { margin: 0; font-size: 12px; line-height: 1.4; color: var(--muted); overflow-wrap: anywhere; }
+.mesh-muted code { color: var(--text); }
+.mesh-warn { margin: 0; font-size: 12px; color: var(--warn); }
+.mesh-form { display: grid; gap: 8px; }
+.mesh-input { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; font: inherit; }
+.mesh-code-input { font-family: ui-monospace, monospace; font-size: 18px; letter-spacing: 0.2em; text-align: center; }
+.mesh-code { font-family: ui-monospace, monospace; font-size: 30px; letter-spacing: 0.18em; text-align: center; color: var(--accent); padding: 6px 0; user-select: all; }
+.mesh-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mesh-spread { justify-content: space-between; }
+.mesh-secondary { background: none; border: 1px solid var(--line); color: var(--text); border-radius: var(--radius); padding: 6px 10px; cursor: pointer; font-size: 12px; justify-self: start; }
+.mesh-secondary:disabled, .mesh-link:disabled { opacity: 0.5; cursor: default; }
+.mesh-link { background: none; border: none; padding: 0; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; justify-self: start; }
+.mesh-danger { color: var(--err); }
+.mesh-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.mesh-item { border-top: 1px solid var(--line); padding-top: 8px; display: grid; gap: 4px; }
+.mesh-item:first-child { border-top: none; padding-top: 0; }
+.mesh-name { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+.mesh-pill { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+.mesh-busy { color: var(--ok); border-color: var(--ok); }
+.mesh-planner { color: var(--accent); border-color: var(--accent); }
+.mesh-consent { border: 1px solid var(--warn); border-radius: var(--radius); background: var(--panel-2); padding: 12px; display: grid; gap: 6px; font-size: 12px; line-height: 1.45; }
+.mesh-consent p, .mesh-consent ul { margin: 0; }
+.mesh-consent ul { padding-left: 18px; }
+.mesh-status-line { margin: 0; font-size: 13px; color: var(--text); }
+.mesh-slider { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+.mesh-check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text); }
+.mesh-error { font-size: 12px; color: var(--err); border: 1px solid var(--err); border-radius: var(--radius); padding: 8px 10px; overflow-wrap: anywhere; }
+
+/* Header button (App.tsx). */
+.mesh-toggle { font-size: 12px; padding: 4px 10px; background: none; border: 1px solid var(--line); color: var(--text); border-radius: 999px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.mesh-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.mesh-dot-on { background: var(--ok); }
+.mesh-dot-alert { background: var(--warn); }
+
+/* Worker mode notice above the prompt box (PromptPanel). */
+.prompt-locked { margin: 0 0 8px; font-size: 12px; color: var(--warn); border: 1px solid var(--warn); border-radius: var(--radius); padding: 8px 10px; }
