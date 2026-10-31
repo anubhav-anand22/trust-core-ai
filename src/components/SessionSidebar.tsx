@@ -3,6 +3,7 @@
 
 import { useState } from "react";
 import type { SessionMeta } from "../types";
+import { PixelIcon } from "./PixelIcon";
 
 function when(secs: number): string {
   if (!secs) return "";
@@ -48,6 +49,8 @@ export function SessionSidebar({
       <button className="new-chat-btn" disabled={busy} onClick={onNew}>
         + New chat
       </button>
+
+      <p className="rail-label">Chats</p>
 
       <ul className="session-list">
         {sessions.length === 0 && (
@@ -112,6 +115,15 @@ export function SessionSidebar({
           );
         })}
       </ul>
+
+      <div className="trust-card">
+        <PixelIcon name="lock" size={22} />
+        <span>
+          Trusted. Secure.
+          <br />
+          On your infrastructure.
+        </span>
+      </div>
     </aside>
   );
 }

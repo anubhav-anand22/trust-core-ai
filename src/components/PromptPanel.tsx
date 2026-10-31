@@ -1,8 +1,9 @@
-// Prompt textarea + multi-file drop zone (audio / pdf / image), plus the
-// fast/deep read toggle.
+// Prompt card: textarea, Attach + drop anywhere on the card (audio / pdf /
+// image), the fast/deep read toggle, the local-model chip and Run.
 
 import { useEffect, useRef, useState } from "react";
 import { cancelTurn, type TurnMode } from "../lib/pipeline";
+import { PixelIcon } from "./PixelIcon";
 
 // Kept in sync with `FileKind::from_extension` in
 // crates/workbench-core/src/engine/schemas.rs. A type not listed here is still
@@ -26,8 +27,11 @@ export function PromptPanel({
   exampleText,
   exampleToken,
   lockedReason,
+  modelLabel,
 }: {
   busy: boolean;
+  /** The resident model's tag, shown as the "Local model" chip. */
+  modelLabel?: string;
   /** Set while this device serves as a mesh Worker: the panel is read-only and says why. */
   lockedReason?: string;
   onSubmit: (prompt: string, files: File[], mode: TurnMode) => void;
@@ -104,48 +108,48 @@ export function PromptPanel({
   }
 
   return (
-    <div className="prompt-panel">
+    <div
+      className={`prompt-panel${dragOver ? " prompt-panel-over" : ""}`}
+      // The whole card is the drop target now, not a separate dashed box.
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        // dragleave also fires when the pointer moves onto a child (the
+        // textarea, a chip). Only a leave to outside the panel ends the hover.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        addFiles(e.dataTransfer.files);
+      }}
+    >
       {lockedReason && <p className="prompt-locked">{lockedReason}</p>}
-      <textarea
-        ref={textareaRef}
-        className="prompt-input"
-        placeholder="Describe the task, e.g. “Assess corrosion risk on pump P-101 from these attachments,” or “What credit-card fee applies to a ₹1000 payment per this rate card?”"
-        value={prompt}
-        disabled={locked}
-        onChange={(e) => setPrompt(e.currentTarget.value)}
-        onKeyDown={(e) => {
-          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
-        }}
-      />
+      <div className="prompt-card">
+        <textarea
+          ref={textareaRef}
+          className="prompt-input"
+          placeholder="Describe your task or attach a file, e.g. “Assess corrosion risk on pump P-101 from these attachments.”"
+          value={prompt}
+          disabled={locked}
+          onChange={(e) => setPrompt(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") submit();
+          }}
+        />
 
-      <div
-        className={`dropzone${dragOver ? " dropzone-over" : ""}`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDragOver(true);
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setDragOver(false);
-          addFiles(e.dataTransfer.files);
-        }}
-        onClick={() => inputRef.current?.click()}
-      >
-        {files.length === 0 ? (
-          <span>Drop PDF / image / audio files here, or click to choose</span>
-        ) : (
+        {files.length > 0 && (
           <ul className="file-list">
             {files.map((f) => (
               <li key={f.name}>
-                <span>{f.name}</span>
+                <span title={f.name}>{f.name}</span>
                 <button
                   type="button"
                   className="file-remove"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setFiles((prev) => prev.filter((x) => x.name !== f.name));
-                  }}
+                  aria-label={`Remove ${f.name}`}
+                  onClick={() => setFiles((prev) => prev.filter((x) => x.name !== f.name))}
                 >
                   ✕
                 </button>
@@ -153,6 +157,58 @@ export function PromptPanel({
             ))}
           </ul>
         )}
+
+        <div className="prompt-toolbar">
+          <button
+            type="button"
+            className="tool-btn"
+            title="PDF, image or audio. You can also drop files anywhere on this box."
+            onClick={() => inputRef.current?.click()}
+          >
+            <PixelIcon name="clip" size={14} />
+            Attach
+          </button>
+          <label className="deep-toggle" title="Read the whole document in passes instead of retrieving the relevant part. Slower, thorough — use for a long document where a specific figure must not be missed.">
+            <input
+              type="checkbox"
+              checked={deep}
+              disabled={locked}
+              onChange={(e) => setDeep(e.currentTarget.checked)}
+            />
+            Deep read
+          </label>
+
+          <span className="toolbar-spacer" />
+
+          {modelLabel && (
+            <span className="model-chip" title="Runs on this machine; nothing leaves it.">
+              <span className="model-chip-label">Local model</span>
+              <span className="model-chip-name">{modelLabel}</span>
+            </span>
+          )}
+          {busy && (
+            <button
+              type="button"
+              className="stop-btn"
+              onClick={() => {
+                setStopping(true);
+                cancelTurn();
+              }}
+              disabled={stopping}
+            >
+              {stopping ? "Stopping…" : "Stop"}
+            </button>
+          )}
+          <button
+            type="button"
+            className="run-btn"
+            disabled={locked || !prompt.trim()}
+            onClick={submit}
+          >
+            <PixelIcon name="run" size={12} />
+            {busy ? "Running…" : "Run"}
+          </button>
+        </div>
         <input
           ref={inputRef}
           type="file"
@@ -175,40 +231,9 @@ export function PromptPanel({
           </button>
         </p>
       )}
-
-      <label className="deep-toggle" title="Read the whole document in passes instead of retrieving the relevant part. Slower, thorough — use for a long document where a specific figure must not be missed.">
-        <input
-          type="checkbox"
-          checked={deep}
-          disabled={locked}
-          onChange={(e) => setDeep(e.currentTarget.checked)}
-        />
-        Deep read (whole document, slower)
-      </label>
-
-      <div className="run-row">
-        <button
-          type="button"
-          className="run-btn"
-          disabled={locked || !prompt.trim()}
-          onClick={submit}
-        >
-          {busy ? "Running…" : "Run"}
-        </button>
-        {busy && (
-          <button
-            type="button"
-            className="stop-btn"
-            onClick={() => {
-              setStopping(true);
-              cancelTurn();
-            }}
-            disabled={stopping}
-          >
-            {stopping ? "Stopping…" : "Stop"}
-          </button>
-        )}
-      </div>
+      <p className="prompt-hint">
+        {dragOver ? "Drop to attach" : "Drop PDF / image / audio files on the box · Ctrl+Enter to run"}
+      </p>
     </div>
   );
 }

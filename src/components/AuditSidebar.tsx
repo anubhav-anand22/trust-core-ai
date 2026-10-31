@@ -48,6 +48,34 @@ const HOW_IT_WORKS: { label: string; tag?: string; detail: string }[] = [
   },
 ];
 
+/** Which HOW_IT_WORKS row the latest event is on; -1 = no turn, 5 = done. */
+function workflowPosition(events: StepEvent[]): number {
+  // Warnings and streamed text are asides, not stages (same rule as Stepper).
+  // `error` is skipped too: it ends a turn but isn't a row, so the position
+  // must stay on the stage that failed for that row to render as `hiw-error`.
+  const last = [...events]
+    .reverse()
+    .find((e) => e.stage !== "warning" && e.stage !== "streaming" && e.stage !== "error");
+  switch (last?.stage) {
+    case "parsing_context":
+      return 0;
+    case "validating_plan":
+    case "awaiting_user":
+      return 1;
+    case "executing_tool":
+    case "tool_finished":
+      return 2;
+    case "quality_check":
+      return 3;
+    case "synthesizing":
+      return 4;
+    case "done":
+      return 5;
+    default:
+      return -1;
+  }
+}
+
 export function AuditSidebar({
   events,
   plan,
@@ -72,6 +100,8 @@ export function AuditSidebar({
     .map((e) => ({ tool: e.tool, ok: e.ok, ms: e.elapsed_ms, device: e.device }));
 
   const totalMs = timings.reduce((a, t) => a + t.ms, 0);
+  const pos = workflowPosition(events);
+  const errored = events.some((e) => e.stage === "error");
 
   return (
     <aside className={`audit${open ? "" : " audit-collapsed"}`}>
@@ -82,11 +112,17 @@ export function AuditSidebar({
       {open && (
         <div className="audit-body">
           <section>
-            <h4>How it works</h4>
+            <h4>Workflow</h4>
             <ol className="hiw-list">
               {HOW_IT_WORKS.map((s, i) => (
-                <li key={s.label} title={s.detail}>
-                  <span className="hiw-num">{i + 1}</span>
+                <li
+                  key={s.label}
+                  title={s.detail}
+                  className={
+                    i < pos ? "hiw-done" : i === pos ? (errored ? "hiw-error" : "hiw-active") : ""
+                  }
+                >
+                  <span className="hiw-num">{i < pos ? "✓" : i + 1}</span>
                   <span className="hiw-label">{s.label}</span>
                   {s.tag && <span className="hiw-tag">{s.tag}</span>}
                 </li>
@@ -99,13 +135,16 @@ export function AuditSidebar({
           </section>
 
           <section>
-            <h4>Active models</h4>
+            <h4>
+              Active models
+              {plan && <span className="status-pill">Ready</span>}
+            </h4>
             {plan ? (
               <dl className="audit-dl">
                 <dt>resident LLM</dt>
                 <dd>{plan.llm}</dd>
                 <dt>vision</dt>
-                <dd>{plan.vision}</dd>
+                <dd>{plan.vision || "none"}</dd>
                 <dt>embeddings</dt>
                 <dd>{plan.embed}</dd>
                 <dt>tier</dt>

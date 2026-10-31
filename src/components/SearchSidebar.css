@@ -2,20 +2,20 @@
    shared, so it matches the audit rail without depending on its classes. */
 .tf-sidebar { width: clamp(280px, 18vw, 360px); flex-shrink: 0; border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow: auto; }
 .tf-collapsed { width: 56px; padding: 14px 8px; }
-.tf-toggle { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: var(--radius); padding: 5px 8px; cursor: pointer; font-size: 12px; width: 100%; }
+.tf-toggle { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: var(--radius); padding: 5px 8px; cursor: pointer; font-size: var(--fs-sm); width: 100%; }
 .tf-body { display: grid; gap: 14px; margin-top: 14px; }
-.tf-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 6px; }
-.tf-note { margin: 0; font-size: 12px; line-height: 1.45; color: var(--muted); }
+.tf-title { font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 6px; }
+.tf-note { margin: 0; font-size: var(--fs-sm); line-height: 1.45; color: var(--muted); }
 .tf-note strong { color: var(--accent); font-weight: 600; }
 .tf-form { display: grid; gap: 8px; }
 .tf-input { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; font: inherit; }
-.tf-link-btn { justify-self: start; background: none; border: none; padding: 0; color: var(--muted); font-size: 12px; cursor: pointer; text-decoration: underline; }
-.tf-error { font-size: 12px; color: var(--err); border: 1px solid var(--err); border-radius: var(--radius); padding: 8px 10px; overflow-wrap: anywhere; }
+.tf-link-btn { justify-self: start; background: none; border: none; padding: 0; color: var(--muted); font-size: var(--fs-sm); cursor: pointer; text-decoration: underline; }
+.tf-error { font-size: var(--fs-sm); color: var(--err); border: 1px solid var(--err); border-radius: var(--radius); padding: 8px 10px; overflow-wrap: anywhere; }
 .tf-results { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 .tf-result { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; }
-.tf-result-title { background: none; border: none; padding: 0; margin: 0 0 5px; color: var(--accent); font: inherit; font-size: 13px; font-weight: 600; text-align: left; cursor: pointer; }
+.tf-result-title { background: none; border: none; padding: 0; margin: 0 0 5px; color: var(--accent); font: inherit; font-size: var(--fs-body); font-weight: 600; text-align: left; cursor: pointer; }
 .tf-result-title:hover { text-decoration: underline; }
-.tf-result p { margin: 0; font-size: 12px; line-height: 1.4; color: var(--muted); }
+.tf-result p { margin: 0; font-size: var(--fs-sm); line-height: 1.4; color: var(--muted); }
 .tf-result-plain { cursor: default; color: var(--text); }
 
 /* On narrower screens, two open right-hand rails squeeze the chat to ~530 px

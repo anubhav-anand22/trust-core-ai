@@ -1632,6 +1632,70 @@ thread) even when a faster Worker is idle. The 640-token cap also cuts off
 **Takeaway:** a retry loop only protects the failures it actually catches.
 Read where the `?` sits, not just what the comment says.
 
+## UI pass — part 27: light/dark pixel restyle, and text that scales
+
+Tanish gave a design mockup: a light, minimal workbench with pixel accents.
+Branch `feature/ui-refresh` (his call), off f4f203e. The work was a restyle
+only. No state, event, invoke or pipeline code changed.
+
+- **Half the mockup had nothing behind it.** We checked each panel against the
+  code before building. Live CPU/RAM %, the left-nav pages (Risk Assessment,
+  SOP Assistant, Knowledge Base, Settings), Ctrl+K search, notifications and
+  per-file "Recent Items" statuses have no command or data. Building them
+  from mock data would have shown numbers that aren't real. **Decision
+  (Tanish): real data only.** Every slot shows something the app already
+  knows: the model plan, the workflow, chats, memory, timings.
+- **Light and dark from one set of tokens.** Every colour is a CSS variable,
+  and `prefers-color-scheme: dark` swaps them, so the app follows the OS.
+  Tints are separate tokens, not `color-mix()`, because older WebKitGTK
+  webviews on Linux lack it. `color-scheme: light dark` replaces the old
+  `dark`, so native dropdowns and scrollbars follow the OS too. That line was
+  the earlier fix for the white `<select>` popup, so both themes still need
+  checking.
+- **The pixel font is bundled, not linked.** `@fontsource/pixelify-sans`
+  (OFL) is imported in `main.tsx`, so Vite copies the font files into
+  `dist/`. A Google Fonts link would silently fall back on a first run with
+  no network, and offline is the product. The pixel font is only for display
+  text (wordmark, hero). Body copy stays in the system font, because a pixel
+  font at 13px is hard to read. Icons are 8×8 bitmaps drawn as SVG squares
+  (`PixelIcon.tsx`). That is seven glyphs, so we skipped an icon package.
+- **Text scales with the screen.** Tanish asked for bigger text that is easy
+  to read on every screen size. The root size is now
+  `clamp(15px, 0.45vw + 10px, 19px)`: about 15px on a 1100px laptop, 16px at
+  1366 and 18.6px at 1920. Every `font-size` in App.css and the Mesh/Web
+  drawers became one of nine `--fs-*` steps (82 raw px values replaced).
+  The smallest step has a 12px floor, so uppercase labels never drop back to
+  10px. The rails, card grid and icons size in `rem` as well, so the layout
+  grows with the text. We used vw *plus* px, not vw alone, so Ctrl+ zoom
+  still works.
+- **Small behaviour changes**, cross-reviewed by FEATURE: the whole prompt
+  card is now the drop target (the dashed dropzone is gone), and the
+  workflow card highlights the live turn's stage. **The review caught a
+  bug.** A failed turn ends on an `error` event, which `workflowPosition`
+  didn't skip, so it returned -1 and the failed row went dark instead of red.
+  Fixed, and checked with five event sequences, including the planner
+  failure from part 26.
+- **npm rewrote more than it was asked to.** Adding one package re-sorted
+  `package.json` and removed every `libc` field from the lockfile (a
+  different npm version). Those fields choose the glibc or musl binary for
+  rollup and the Tauri CLI. We reverted both files and added only the font
+  entries; `npm ci --dry-run` passes.
+
+**Checked:** `tsc` and `vite build` both pass. Headless-Chrome screenshots
+with a mocked IPC at 1100/1366/1920 wide, light and dark. **Not checked:**
+the real Tauri window, a live turn (stepper, streamed text, report card),
+and whether WebKitGTK sends `dragleave` with a null `relatedTarget`. If it
+does, the drop highlight may flicker over the textarea; that is cosmetic.
+
+**Deliberately not done:** the Mesh and Web drawers still use a heavy dark
+shadow, which looks harsh in light mode. On a narrow window the rails don't
+collapse automatically.
+
+**Takeaway:** before building a mockup, check every element against the
+data. A design shows what the product could be; the code shows what it is.
+Fluid type works best as one fluid number plus a scale of steps, not a
+`vw` value on every rule.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

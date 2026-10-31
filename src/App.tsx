@@ -7,6 +7,7 @@ import { AuditSidebar } from "./components/AuditSidebar";
 import { BootstrapGate } from "./components/BootstrapGate";
 import { HitlModal } from "./components/HitlModal";
 import { MeshSidebar } from "./components/MeshSidebar";
+import { PixelIcon, type PixelIconName } from "./components/PixelIcon";
 import { SearchSidebar } from "./components/SearchSidebar";
 import { ProfileGate } from "./components/ProfileGate";
 import { PromptPanel } from "./components/PromptPanel";
@@ -49,12 +50,16 @@ const SESSION_KEY = "wb.sessionId";
 // the empty state. Clicking a card fills the prompt text only; there is no
 // filesystem capability on the frontend to attach the file for them (see
 // docs/11-conversations-and-memory.md), so the label says which file to drop in.
-const EXAMPLES: { prompt: string; files: string[] }[] = [
+type Example = { title: string; prompt: string; files: string[] };
+
+const EXAMPLES: Example[] = [
   {
+    title: "Assess a pump inspection",
     prompt: "Assess corrosion risk on pump P-101 and check it against our SOPs.",
     files: ["inspection.pdf", "valve.png"],
   },
   {
+    title: "Look up a card fee",
     prompt: "What transaction fee applies to a ₹1000 credit card payment?",
     files: ["fee_card.pdf"],
   },
@@ -63,40 +68,56 @@ const EXAMPLES: { prompt: string; files: string[] }[] = [
 // One extra card for the industry chosen on the profile screen, shown first.
 // These use the user's own files (no fixture ships for them), so the card says
 // "your …"; the two fixture-backed examples above stay for everyone.
-const INDUSTRY_EXAMPLES: Record<string, { prompt: string; files: string[] }> = {
+const INDUSTRY_EXAMPLES: Record<string, Example> = {
   finance: {
+    title: "Check an invoice",
     prompt: "Summarise this invoice and flag any charge above ₹50,000.",
     files: ["your invoice.pdf"],
   },
   construction: {
+    title: "Review a method statement",
     prompt: "List the safety requirements in this method statement and flag anything missing.",
     files: ["your method statement.pdf"],
   },
   legal: {
+    title: "Summarise a contract",
     prompt: "Summarise the obligations, deadlines and penalties in this contract.",
     files: ["your contract.pdf"],
   },
   healthcare: {
+    title: "Explain a report",
     prompt: "Summarise this report in plain language and list the follow-up actions.",
     files: ["your report.pdf"],
   },
   logistics: {
+    title: "Find late shipments",
     prompt: "Which shipments in this manifest are late, and what is the likely cause?",
     files: ["your manifest.pdf"],
   },
   it: {
+    title: "Summarise an incident",
     prompt: "Summarise this incident report: root cause, impact and fixes.",
     files: ["your incident report.pdf"],
   },
   government: {
+    title: "Summarise a circular",
     prompt: "Summarise this circular and list who must act, and by when.",
     files: ["your circular.pdf"],
   },
   education: {
+    title: "Turn a chapter into notes",
     prompt: "Turn this chapter into five key points and three quiz questions.",
     files: ["your chapter.pdf"],
   },
 };
+
+/** Card icon from the first file the example asks for. */
+function exampleIcon(files: string[]): PixelIconName {
+  const f = files[0]?.toLowerCase() ?? "";
+  if (/\.(png|jpe?g|webp|tiff?|bmp)$/.test(f)) return "image";
+  if (/\.(wav|mp3|m4a|flac|ogg|aac|wma)$/.test(f)) return "audio";
+  return "doc";
+}
 
 function examplesFor(industry: string | undefined) {
   const extra = industry ? INDUSTRY_EXAMPLES[industry] : undefined;
@@ -498,8 +519,16 @@ function App() {
   return (
     <div className="workbench">
       <header className="wb-header">
-        <h1>TrustCore AI</h1>
-        <span className="wb-tagline">Sovereign AI Agentic Workbench</span>
+        <span className="wb-logo" aria-hidden>
+          {/* 3×3 pixel mark; the lit cells are set in CSS. */}
+          {Array.from({ length: 9 }, (_, i) => (
+            <i key={i} />
+          ))}
+        </span>
+        <div className="wb-brand">
+          <h1>TrustCore AI</h1>
+          <span className="wb-tagline">Sovereign AI Agentic Workbench</span>
+        </div>
         <span className="wb-tier">{plan.tier_label}</span>
         <button
           className="mesh-toggle"
@@ -545,32 +574,53 @@ function App() {
             >
               {transcript.length === 0 && !showLive && (
                 <div className="welcome">
-                  <p className="muted transcript-empty">
-                    Ask a question, attach a document, and the analysis appears here.
-                    Follow-up questions in the same chat keep their context.
-                  </p>
+                  <div className="hero">
+                    <p className="hero-eyebrow">
+                      <span className="pixel-dot" aria-hidden />
+                      Sovereign AI Agentic Workbench
+                    </p>
+                    <h2 className="hero-title">Hello,</h2>
+                    <p className="hero-sub">How can I help you today?</p>
+                    <p className="muted transcript-empty">
+                      Ask a question, attach a document, and the analysis appears here.
+                      Follow-up questions in the same chat keep their context.
+                    </p>
+                    <span className="hero-pixels" aria-hidden>
+                      {Array.from({ length: 9 }, (_, i) => (
+                        <i key={i} />
+                      ))}
+                    </span>
+                  </div>
 
                   <div className="examples">
                     <p className="examples-label">Try one of these</p>
-                    {examplesFor(profile?.industry).map((ex) => (
-                      <button
-                        key={ex.prompt}
-                        type="button"
-                        className="example-card"
-                        onClick={() => applyExample(ex.prompt)}
-                      >
-                        <span className="example-prompt">“{ex.prompt}”</span>
-                        <span className="example-files">
-                          attach{" "}
-                          {ex.files.map((f, i) => (
-                            <span key={f}>
-                              {i > 0 && " + "}
-                              <code>{f}</code>
+                    <div className="example-grid">
+                      {examplesFor(profile?.industry).map((ex) => (
+                        <button
+                          key={ex.prompt}
+                          type="button"
+                          className="example-card"
+                          onClick={() => applyExample(ex.prompt)}
+                        >
+                          <span className="example-icon">
+                            <PixelIcon name={exampleIcon(ex.files)} size={20} />
+                          </span>
+                          <span className="example-text">
+                            <span className="example-title">{ex.title}</span>
+                            <span className="example-prompt">“{ex.prompt}”</span>
+                            <span className="example-files">
+                              attach{" "}
+                              {ex.files.map((f, i) => (
+                                <span key={f}>
+                                  {i > 0 && " + "}
+                                  <code>{f}</code>
+                                </span>
+                              ))}
                             </span>
-                          ))}
-                        </span>
-                      </button>
-                    ))}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
                     <p className="examples-hint muted small">
                       Fixtures live in <code>demo/fixtures/</code>. Missing? Run{" "}
                       <code>python demo/make_fixtures.py</code>.
@@ -655,6 +705,7 @@ function App() {
               resetToken={inputResetToken}
               exampleText={exampleText}
               exampleToken={exampleToken}
+              modelLabel={plan.llm}
               lockedReason={
                 mesh?.role === "worker"
                   ? `This device is working for ${mesh.worker?.host_name ?? "another device"}. Your own questions are paused; leave the mesh to use it again.`
