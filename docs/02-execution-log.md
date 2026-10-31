@@ -1696,6 +1696,50 @@ data. A design shows what the product could be; the code shows what it is.
 Fluid type works best as one fluid number plus a scale of steps, not a
 `vw` value on every rule.
 
+## Feature pass — part 28: the bigger model plans and writes
+
+Second two-device test, with the Worker now on `llama3.2:3b`. The answer
+was still half a sentence. Part 26's logging fix made the cause readable
+for the first time:
+
+- the Worker's 3B wrote a proper analysis (`role=analysis
+  model=llama3.2:3b … 305 tokens`, 20 s), then
+- the Host's 0.5B rewrote it as the final report: `output_compiler
+  model=qwen2.5:0.5b-instruct … 57 s, 36 tokens` → "The system is
+  architected to eliminate the traditional".
+- Planning also ran on the 0.5B. Election only compared speed: the Host
+  measured 25 tok/s on a 3-token warm-up, the Worker 28 tok/s. That is not
+  ≥2×, so the 3B never planned. The follow-up "wth is this ?" got three
+  invented image plans, then a fallback that searched an empty knowledge
+  base.
+
+What changed (MESH-10 revised, MESH-16 new; lead: "plan and make workers do
+the heavy work"):
+
+- **Election counts model size.** A Worker running ≥2× the Host's
+  parameters at no less than its speed now plans. Size is read from the
+  Ollama tag; an unknown size never wins on size. The test replays the
+  exact numbers above.
+- **The delegator writes the report too.** `PlanSource` gained
+  `compile_report`, `compiler::compile` takes the writer instead of the
+  engine, and the pipeline passes a `RemotePlanner` when there is a
+  delegator. The Worker gets the prompt, the conversation summary and the
+  step results, **never facility memory**: the consent screen promises it
+  stays on the Host. Any failure → the Host writes it, with memory, as
+  before. The consent screen now says the planner also sees every step's
+  results.
+- **Protocol 2.** An old Worker would otherwise fail to decode the new
+  call mid-turn. Now it is turned away at join with the existing mismatch
+  error.
+
+**Deliberately not done:** the Host's speed is still measured on 3 tokens,
+which overstates it. The size rule made that harmless here, so it waits.
+Mesh-off is unchanged: no dispatcher → `engine` writes, exactly as before.
+
+**Takeaway:** "the output is bad" had two possible causes, the model or
+the plumbing. One log line naming which model wrote which part settled it
+in a minute. Log what ran *where*, not just how long it took.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

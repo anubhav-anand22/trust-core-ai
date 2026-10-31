@@ -261,12 +261,13 @@ one. The lead decided these on 2026-10-31.
 | MESH-7 | Worker failure → **next Worker, then the Host** | fail and ask: interrupts the turn | — |
 | MESH-8 | Workers **may run a bigger model** | same-model-only | structured output from a bigger model breaks the validators |
 | MESH-9 | A delegator Worker **plans and assigns; the Host validates and relays every job** | delegator dispatches: it would see every job | — |
-| MESH-10 | Delegator election is **automatic** (≥2× Host decode tok/s) with a **user pin** | manual only | users pin constantly (the threshold is wrong) |
+| MESH-10 | Delegator election is **automatic** with a **user pin**. A Worker plans if it decodes ≥2× the Host's tok/s, **or (revised 2026-11-01) runs a model ≥2× the Host's parameters at no less than the Host's speed**; biggest model wins, then fastest. Size is read from the Ollama tag (`llama3.2:3b` → 3B); an unknown size never wins on size | manual only; speed only (the first device test: a 3B Worker at 28 tok/s lost to a 0.5B Host measured at 25, so the 0.5B planned) | users pin constantly (the threshold is wrong), or a bigger model plans worse than the Host's |
 | MESH-11 | **Parallel** ready steps, only with the mesh on | always sequential: wastes the Workers | — |
 | MESH-12 | Worker UI shows status and job *type*, never content, with thread/GPU caps. **Worker mode is dedicated** | showing content to the Worker's owner | — |
 | MESH-13 | **A 6-character code (`K7Q-4M9`), valid 10 min for any number of Workers, 5 failed attempts**, then remember the device key. Lead, 2026-10-31: short and alphanumeric so it is easy to read out | fixed code (a leak lets anyone in); fresh code per Worker (more clicks); 4 digits (10,000 values, too guessable); 9 characters (hard to read out) | guessing attempts show up in the logs |
 | MESH-14 | Host with a usable GPU (`HardwareInfo::has_usable_gpu`, which includes Apple unified memory) is also a node. **Without one it offloads everything except Host-only steps** | — | — |
 | MESH-15 | Labels: **Host / Worker** | Master/Slave | — |
+| MESH-16 | **The delegator also writes the report** (role C), lead 2026-11-01: "plan and make workers do the heavy work". It gets the prompt, the conversation summary and every step's result, **never facility memory**. Any failure → the Host writes it, with memory, as before. Protocol bumped to 2 | Host always writes (the first device test: a 3B Worker's analysis was rewritten by the Host's 0.5B into half a sentence, 57 s at 1 thread); send memory too (the consent screen promises it stays) | reports lose context users expect from saved facts |
 
 ## What a Worker can see, plainly
 

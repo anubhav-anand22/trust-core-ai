@@ -43,6 +43,7 @@ function ConsentCard({ device, onAllow, onDeny, pending }: {
       <ul>
         <li>your questions, and the conversation so far when it plans a turn</li>
         <li>the files and extracted text for each step it runs</li>
+        <li>when it plans a turn, every step's results, so it can write the answer</li>
       </ul>
       <p>It never receives your saved memory, your knowledge base or your other chats, and it keeps nothing after a step.</p>
       <p className="mesh-muted">Only allow devices you trust.</p>

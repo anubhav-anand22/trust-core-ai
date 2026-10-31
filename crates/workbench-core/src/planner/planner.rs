@@ -8,7 +8,7 @@
 //! concrete client, so the retry ceiling and the HITL hand-off can be unit-tested
 //! with a mock and no running Ollama.
 
-use crate::engine::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep};
+use crate::engine::schemas::{FileKind, FinalReport, InputFile, IntentResult, Plan, TaskStep, ToolResult};
 use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::planner::registry::validate_plan;
@@ -38,6 +38,21 @@ pub trait PlanSource: Send + Sync {
         uploads: &[InputFile],
         previous_errors: &[String],
     ) -> Result<Plan>;
+
+    /// Role C, the report writer. Lives here so the device that plans can also
+    /// write the report (MESH-16). Sources that don't offer it say so.
+    async fn compile_report(
+        &self,
+        _prompt: &str,
+        _results: &[ToolResult],
+        _session_summary: &str,
+        _facility_memory: &str,
+    ) -> Result<FinalReport> {
+        Err(CoreError::Tool {
+            tool: "compile_report".into(),
+            message: "this plan source does not write reports".into(),
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -60,6 +75,16 @@ impl PlanSource for OllamaEngine {
         previous_errors: &[String],
     ) -> Result<Plan> {
         OllamaEngine::build_plan(self, prompt, history, intent, uploads, previous_errors).await
+    }
+
+    async fn compile_report(
+        &self,
+        prompt: &str,
+        results: &[ToolResult],
+        session_summary: &str,
+        facility_memory: &str,
+    ) -> Result<FinalReport> {
+        OllamaEngine::compile_report(self, prompt, results, session_summary, facility_memory).await
     }
 }
 

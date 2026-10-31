@@ -5,18 +5,19 @@
 //! after a retry, fall back to a plain-text report rather than failing the turn.
 
 use crate::engine::schemas::{FinalReport, ToolResult};
-use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
+use crate::planner::PlanSource;
 
 /// Compile the report, retrying once on a schema error, then degrading to a
 /// best-effort text summary built from the tool outputs.
 ///
-/// **Inputs:** engine, the user prompt, every tool result, the running session
+/// **Inputs:** the writer (the Host's engine, or the delegator Worker via
+/// `RemotePlanner`), the user prompt, every tool result, the running session
 /// summary, and long-term facility memory.
 /// **Output:** always a [`FinalReport`] — never an error — so a flaky compiler
 /// can't sink an otherwise good run.
 pub async fn compile(
-    engine: &OllamaEngine,
+    writer: &dyn PlanSource,
     prompt: &str,
     results: &[ToolResult],
     session_summary: &str,
@@ -27,7 +28,7 @@ pub async fn compile(
     let any_failure = results.iter().any(|r| !r.ok);
 
     for attempt in 1..=2 {
-        match engine
+        match writer
             .compile_report(prompt, results, session_summary, facility_memory)
             .await
         {

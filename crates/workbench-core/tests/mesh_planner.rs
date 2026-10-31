@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use workbench_core::engine::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep, ToolResult};
+use workbench_core::engine::schemas::{FileKind, FinalReport, InputFile, IntentResult, Plan, TaskStep, ToolResult};
 use workbench_core::engine::OllamaEngine;
 use workbench_core::events::VecSink;
 use workbench_core::mesh::{run_plan_job, Dispatcher, Node, PlanCall, PlanJob, PlanReply, RemotePlanner, StepJob};
@@ -22,11 +22,13 @@ fn step(task: &str) -> TaskStep {
 struct Planner {
     intent_calls: AtomicU32,
     build_calls: AtomicU32,
+    /// Facility memory each report call was given.
+    reports: Mutex<Vec<String>>,
 }
 
 impl Planner {
     fn new() -> Self {
-        Self { intent_calls: AtomicU32::new(0), build_calls: AtomicU32::new(0) }
+        Self { intent_calls: AtomicU32::new(0), build_calls: AtomicU32::new(0), reports: Mutex::new(vec![]) }
     }
     fn calls(&self) -> u32 {
         self.intent_calls.load(Ordering::SeqCst) + self.build_calls.load(Ordering::SeqCst)
@@ -42,6 +44,17 @@ impl PlanSource for Planner {
     async fn build_plan(&self, _p: &str, _h: &str, _i: &IntentResult, _u: &[InputFile], _e: &[String]) -> Result<Plan> {
         let prior = self.build_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Plan { steps: vec![step(if prior == 0 { "not_a_real_task" } else { "search_knowledge" })] })
+    }
+    async fn compile_report(&self, _p: &str, _r: &[ToolResult], _s: &str, memory: &str) -> Result<FinalReport> {
+        self.reports.lock().unwrap().push(memory.to_string());
+        Ok(FinalReport {
+            summary: "written here".into(),
+            findings: vec![],
+            citations: vec![],
+            safety_notes: vec![],
+            degraded: false,
+            memory_proposals: vec![],
+        })
     }
 }
 
@@ -121,6 +134,7 @@ async fn the_worker_plans_and_the_host_still_validates_and_retries() {
         let (history, uploads) = match &job.call {
             PlanCall::ParseIntent { history, uploads, .. } => (history, uploads),
             PlanCall::BuildPlan { history, uploads, .. } => (history, uploads),
+            PlanCall::Compile { .. } => unreachable!("planning only"),
         };
         assert_eq!(history, "HISTORY", "MESH-5: the delegator sees the conversation");
         assert_eq!(uploads[0].path, "pump-report.pdf", "names and kinds only, never the Host's path");
@@ -168,4 +182,38 @@ async fn stop_ends_delegated_planning_promptly() {
     assert!(matches!(r, Err(CoreError::Cancelled)));
     assert!(mesh.cancelled.load(Ordering::SeqCst), "the Worker was told");
     assert_eq!(local.calls(), 0);
+}
+
+/// MESH-16: the delegator writes the report too, and the Host's facility memory
+/// never goes with it (the consent screen promises it stays on the Host).
+#[tokio::test]
+async fn the_delegator_writes_the_report_without_the_hosts_memory() {
+    let mesh = Delegating::new(Behaviour::Answer);
+    let local = Planner::new();
+    let engine = OllamaEngine::new("http://127.0.0.1:11434", "m", "v", "e");
+    let sink = VecSink::new();
+    let remote = RemotePlanner::new(&mesh, "gpu-box".into(), &local, &engine, &sink);
+
+    let report = remote.compile_report("p", &[], "HISTORY", "plant = Panipat").await.unwrap();
+
+    assert_eq!(report.summary, "written here");
+    assert_eq!(*mesh.worker_planner.reports.lock().unwrap(), [""], "the Worker got no facility memory");
+    assert!(local.reports.lock().unwrap().is_empty(), "the Host's model was not used");
+    let jobs = mesh.jobs.lock().unwrap();
+    let PlanCall::Compile { session_summary, .. } = &jobs[0].call else { panic!("a report call") };
+    assert_eq!(session_summary, "HISTORY");
+}
+
+#[tokio::test]
+async fn a_worker_that_cannot_write_the_report_hands_it_back_with_memory() {
+    let mesh = Delegating::new(Behaviour::Fail);
+    let local = Planner::new();
+    let engine = OllamaEngine::new("http://127.0.0.1:11434", "m", "v", "e");
+    let sink = VecSink::new();
+    let remote = RemotePlanner::new(&mesh, "gpu-box".into(), &local, &engine, &sink);
+
+    let report = remote.compile_report("p", &[], "", "plant = Panipat").await.unwrap();
+
+    assert_eq!(report.summary, "written here");
+    assert_eq!(*local.reports.lock().unwrap(), ["plant = Panipat"], "the Host wrote it, with its memory");
 }

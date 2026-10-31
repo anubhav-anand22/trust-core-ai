@@ -139,12 +139,32 @@ pub fn rank(task: &str, file_bytes: u64, host: &Capabilities, workers: &[WorkerV
 /// A Worker this much faster than the Host plans instead of it (MESH-10).
 pub const DELEGATE_SPEEDUP: f64 = 2.0;
 
+/// A Worker whose model has this many times the Host's parameters plans, even
+/// at the Host's speed (MESH-10, revised 2026-11-01): a 3B plans and writes
+/// far better than a 0.5B, and speed alone missed that.
+pub const DELEGATE_MODEL_RATIO: f64 = 2.0;
+
+/// Parameter count in billions from an Ollama tag: `llama3.2:3b` → 3.0,
+/// `qwen2.5:0.5b-instruct` → 0.5. `None` when the tag doesn't say
+/// (`phi3:mini`, `mixtral:8x7b`, no tag), so an unknown size never wins on size.
+pub fn model_params_b(model: &str) -> Option<f64> {
+    let tag = model.split_once(':')?.1;
+    let digits: String = tag.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let next = tag[digits.len()..].chars().next()?;
+    if !next.eq_ignore_ascii_case(&'b') {
+        return None;
+    }
+    digits.parse().ok().filter(|b: &f64| *b > 0.0)
+}
+
 /// Who should plan this turn: `None` = the Host itself.
 ///
-/// A pinned device wins if it is connected and has a model. Otherwise the
-/// fastest Worker, if its measured decode speed is at least
-/// [`DELEGATE_SPEEDUP`]× the Host's. With no Host measurement, the Host plans:
-/// handing off on a guess would be worse than not handing off.
+/// A pinned device wins if it is connected and has a model. Otherwise a Worker
+/// qualifies if it decodes at least [`DELEGATE_SPEEDUP`]× the Host's speed, or
+/// runs a model at least [`DELEGATE_MODEL_RATIO`]× the Host's size while being
+/// no slower. Among those, the biggest model wins, then the fastest. With no
+/// Host measurement, the Host plans: handing off on a guess would be worse
+/// than not handing off.
 pub fn delegator(host: &Capabilities, workers: &[WorkerView], pinned: Option<&str>) -> Option<String> {
     let has_llm = |w: &&WorkerView| w.caps.llm_model.is_some();
     if let Some(pin) = pinned {
@@ -153,12 +173,21 @@ pub fn delegator(host: &Capabilities, workers: &[WorkerView], pinned: Option<&st
         }
     }
     let host_speed = host.decode_tok_s?;
+    let size = |c: &Capabilities| c.llm_model.as_deref().and_then(model_params_b);
+    let host_size = size(host);
+    let bigger = |c: &Capabilities| match (size(c), host_size) {
+        (Some(w), Some(h)) => w >= h * DELEGATE_MODEL_RATIO,
+        _ => false,
+    };
     workers
         .iter()
         .filter(has_llm)
         .filter_map(|w| w.caps.decode_tok_s.map(|s| (s, w)))
-        .filter(|(s, _)| *s >= host_speed * DELEGATE_SPEEDUP)
-        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .filter(|(s, w)| *s >= host_speed * DELEGATE_SPEEDUP || (bigger(&w.caps) && *s >= host_speed))
+        .max_by(|a, b| {
+            let (sa, sb) = (size(&a.1.caps).unwrap_or(0.0), size(&b.1.caps).unwrap_or(0.0));
+            sa.total_cmp(&sb).then(a.0.total_cmp(&b.0))
+        })
         .map(|(_, w)| w.device_id.clone())
 }
 
@@ -247,5 +276,49 @@ mod tests {
         assert_eq!(delegator(&host, &barely, Some("gone")), None, "a pin to a missing device is ignored");
         let unmeasured = Capabilities { decode_tok_s: None, ..host };
         assert_eq!(delegator(&unmeasured, &twice, None), None);
+    }
+
+    fn with_model(mut c: Capabilities, model: &str) -> Capabilities {
+        c.llm_model = Some(model.into());
+        c
+    }
+
+    /// The lead's 2026-11-01 test: a 0.5B Host measured at 25 tok/s, a Worker
+    /// running llama3.2:3b at 28 tok/s. Speed alone kept planning on the 0.5B.
+    #[test]
+    fn a_much_bigger_model_plans_when_it_is_no_slower() {
+        let host = with_model(caps(false, 25.0, 2), "qwen2.5:0.5b-instruct");
+        let big = [worker("3b", with_model(caps(false, 28.0, 8), "llama3.2:3b"))];
+        assert_eq!(delegator(&host, &big, None), Some("3b".into()));
+
+        let big_but_slow = [worker("3b", with_model(caps(false, 20.0, 8), "llama3.2:3b"))];
+        assert_eq!(delegator(&host, &big_but_slow, None), None, "a slower Worker would stretch the turn");
+
+        let same_size = [worker("q", with_model(caps(false, 28.0, 8), "qwen2.5:0.5b"))];
+        assert_eq!(delegator(&host, &same_size, None), None, "same model, 1.1× speed: no hop");
+
+        let unknown = [worker("u", with_model(caps(false, 28.0, 8), "phi3:mini"))];
+        assert_eq!(delegator(&host, &unknown, None), None, "an unknown size never wins on size");
+    }
+
+    #[test]
+    fn the_bigger_model_beats_the_faster_small_one() {
+        let host = with_model(caps(false, 10.0, 2), "qwen2.5:0.5b");
+        let workers = [
+            worker("fast-small", with_model(caps(true, 90.0, 8), "qwen2.5:1.5b")),
+            worker("big", with_model(caps(true, 30.0, 8), "qwen2.5:7b")),
+        ];
+        assert_eq!(delegator(&host, &workers, None), Some("big".into()));
+    }
+
+    #[test]
+    fn model_sizes_parse_from_ollama_tags() {
+        assert_eq!(model_params_b("llama3.2:3b"), Some(3.0));
+        assert_eq!(model_params_b("qwen2.5:0.5b-instruct"), Some(0.5));
+        assert_eq!(model_params_b("qwen2.5:7B-instruct-q4_K_M"), Some(7.0));
+        assert_eq!(model_params_b("phi3:mini"), None);
+        assert_eq!(model_params_b("mixtral:8x7b"), None);
+        assert_eq!(model_params_b("llama3.2"), None);
+        assert_eq!(model_params_b("x:b"), None);
     }
 }

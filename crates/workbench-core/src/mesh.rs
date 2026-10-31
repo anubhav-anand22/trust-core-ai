@@ -20,7 +20,7 @@ use std::time::Duration;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::schemas::{InputFile, IntentResult, Plan, TaskStep, ToolResult};
+use crate::engine::schemas::{FinalReport, InputFile, IntentResult, Plan, TaskStep, ToolResult};
 use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::executor::{finish_step, run_step};
@@ -121,7 +121,7 @@ pub struct PlanJob {
     pub persona: String,
 }
 
-/// The two calls of [`PlanSource`]. `uploads` carry names and kinds only: the
+/// The calls of [`PlanSource`]. `uploads` carry names and kinds only: the
 /// path is replaced with the name, so the Host's folders never leave it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,6 +134,9 @@ pub enum PlanCall {
         uploads: Vec<InputFile>,
         previous_errors: Vec<String>,
     },
+    /// Write the report (MESH-16). Facility memory is never sent: the consent
+    /// screen promises it stays on the Host.
+    Compile { prompt: String, results: Vec<ToolResult>, session_summary: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,6 +144,7 @@ pub enum PlanCall {
 pub enum PlanReply {
     Intent(IntentResult),
     Plan(Plan),
+    Report(FinalReport),
 }
 
 /// Run one planner call on this device. A delegator Worker calls this.
@@ -153,6 +157,10 @@ pub async fn run_plan_job(job: &PlanJob, source: &dyn PlanSource) -> Result<Plan
             .build_plan(prompt, history, intent, uploads, previous_errors)
             .await
             .map(PlanReply::Plan),
+        PlanCall::Compile { prompt, results, session_summary } => source
+            .compile_report(prompt, results, session_summary, "")
+            .await
+            .map(PlanReply::Report),
     }
 }
 
@@ -207,7 +215,7 @@ impl<'a> RemotePlanner<'a> {
                 self.gave_up.store(true, Ordering::SeqCst);
                 crate::events::warn(
                     self.sink,
-                    "The mesh device planning this turn couldn't answer; planning on this device.",
+                    "The mesh device planning this turn couldn't answer; continuing on this device.",
                     Some(e.to_string()),
                 );
                 tracing::warn!(worker = %self.worker, error = %e, "mesh: delegated planning failed, planning locally");
@@ -235,9 +243,9 @@ impl PlanSource for RemotePlanner<'_> {
         };
         match self.ask(call).await? {
             Some(PlanReply::Intent(intent)) => Ok(intent),
-            Some(PlanReply::Plan(_)) => Err(CoreError::Tool {
+            Some(_) => Err(CoreError::Tool {
                 tool: format!("mesh:{}", self.worker),
-                message: "answered an intent call with a plan".into(),
+                message: "answered an intent call with something else".into(),
             }),
             None => self.local.parse_intent(prompt, history, uploads).await,
         }
@@ -260,11 +268,36 @@ impl PlanSource for RemotePlanner<'_> {
         };
         match self.ask(call).await? {
             Some(PlanReply::Plan(plan)) => Ok(plan),
-            Some(PlanReply::Intent(_)) => Err(CoreError::Tool {
+            Some(_) => Err(CoreError::Tool {
                 tool: format!("mesh:{}", self.worker),
-                message: "answered a plan call with an intent".into(),
+                message: "answered a plan call with something else".into(),
             }),
             None => self.local.build_plan(prompt, history, intent, uploads, previous_errors).await,
+        }
+    }
+
+    /// The report is the part the user reads, so it goes to the bigger model
+    /// too (MESH-16). Any trouble on the Worker → the Host writes it, with its
+    /// facility memory, exactly as before.
+    async fn compile_report(
+        &self,
+        prompt: &str,
+        results: &[ToolResult],
+        session_summary: &str,
+        facility_memory: &str,
+    ) -> Result<FinalReport> {
+        let call = PlanCall::Compile {
+            prompt: prompt.to_string(),
+            results: results.to_vec(),
+            session_summary: session_summary.to_string(),
+        };
+        match self.ask(call).await? {
+            Some(PlanReply::Report(report)) => Ok(report),
+            Some(_) => {
+                tracing::warn!(worker = %self.worker, "mesh: report call answered with something else; writing locally");
+                self.local.compile_report(prompt, results, session_summary, facility_memory).await
+            }
+            None => self.local.compile_report(prompt, results, session_summary, facility_memory).await,
         }
     }
 }

@@ -326,9 +326,23 @@ async fn run_from_plan(
     // the user confirmed, never an automatic digest of some other conversation.
     let facility = PersistentMemory::load(&config.persistent_path());
 
+    // The device that plans also writes the report (MESH-16): it runs the
+    // bigger model, and this is the part the user reads. No delegator, or any
+    // trouble on it → the Host writes it, as before.
+    let remote_writer = mesh
+        .and_then(|d| d.delegator().map(|worker| (d, worker)))
+        .map(|(d, worker)| {
+            tracing::info!(%worker, "turn phase: writing the report on a mesh device");
+            RemotePlanner::new(d, worker, engine, engine, sink)
+        });
+    let writer: &dyn crate::planner::PlanSource = match &remote_writer {
+        Some(remote) => remote,
+        None => engine,
+    };
+
     let compile_started = std::time::Instant::now();
     let mut report = compiler::compile(
-        engine,
+        writer,
         prompt,
         &results,
         &session.context_blob(),

@@ -24,7 +24,7 @@ pub mod worker;
 
 /// Bumped on any change to the handshake or the frame format. A mismatch is
 /// rejected with a clear message instead of a confusing decode error.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MeshError {
