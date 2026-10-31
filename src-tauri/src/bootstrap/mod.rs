@@ -6,3 +6,5 @@
 pub mod hardware;
 pub mod models;
 pub mod ollama;
+pub mod profile;
+pub mod tools;

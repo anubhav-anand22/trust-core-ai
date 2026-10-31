@@ -1,4 +1,4 @@
-//! Tauri host for the Sovereign On-Premise AI Workbench.
+//! Tauri host for TrustCore AI.
 //!
 //! What stays on the Rust side of the app:
 //!   * Ollama bootstrap — install + tier-aware model pulls ([`bootstrap`])
@@ -23,17 +23,17 @@ use tauri::ipc::Channel;
 use tauri::{Manager, State};
 
 use bootstrap::hardware::detect_hardware;
-use bootstrap::models::{assess_llm, ensure_models, probe_system, LlmAssessment, ModelPlan};
+use bootstrap::models::{assess_model, ensure_models, probe_system, ModelPlan};
 use bootstrap::ollama::{ensure_ollama_installed, is_ollama_installed, lower_ollama_priority};
+use bootstrap::profile::{get_profile, save_profile};
+use bootstrap::tools::ensure_tool_models;
 use base64::Engine as _;
 use events::ChannelSink;
 use workbench_core::engine::OllamaEngine;
-use workbench_core::memory::{SessionContext, SessionMeta};
-use workbench_core::schemas::{FileKind, InputFile};
+use workbench_core::memory::{PersistentMemory, SessionContext, SessionMeta};
+use workbench_core::schemas::{FileKind, InputFile, MemoryFact};
 use workbench_core::tools::default_registry;
-use workbench_core::{
-    persist_long_term, CancelFlag, PipelineConfig, ProgressSink, StepEvent, TurnMode,
-};
+use workbench_core::{CancelFlag, PipelineConfig, ProgressSink, StepEvent, TurnMode};
 
 /// Where the local Ollama server listens. Fixed — this is an offline desktop app.
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -80,31 +80,47 @@ fn set_model_plan(plan: ModelPlan, state: State<'_, AppState>) {
     *state.model_plan.lock().expect("model_plan mutex poisoned") = Some(plan);
 }
 
-/// Judge a resident-model choice against this host, for the bootstrap override
-/// warning. Re-probes the hardware so the RAM figure reflects the machine's state
-/// right now, not whatever it was at first launch.
+/// Cross-chat memory: the facts the user has confirmed. Nothing reaches this
+/// store automatically — that automatic per-turn digest fold is what leaked one
+/// chat's context into another — so every entry here passed through
+/// [`confirm_memory`].
 #[tauri::command]
-fn assess_model(model: String) -> LlmAssessment {
-    let hw = detect_hardware();
-    let assessment = assess_llm(&model, &hw);
-    tracing::info!(
-        model = %model,
-        severity = %assessment.severity,
-        approx_ram_gb = assessment.approx_ram_gb,
-        warnings = assessment.warnings.len(),
-        "model assessment for override"
-    );
-    assessment
+fn get_memory(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<Vec<MemoryFact>, String> {
+    let config = pipeline_config(&app, &state.plan())?;
+    Ok(PersistentMemory::load(&config.persistent_path()).facts())
 }
 
-/// Finalise a session: fold its rolling context into encrypted long-term memory.
-/// Safe to call at any time (e.g. window close, "new session" button).
+/// Store one proposed fact the user clicked "Remember" on. Returns the updated list.
 #[tauri::command]
-fn end_session(app: tauri::AppHandle, state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+fn confirm_memory(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+    value: String,
+) -> Result<Vec<MemoryFact>, String> {
     let config = pipeline_config(&app, &state.plan())?;
-    let session = SessionContext::load_or_new(&config.session_path_for(&session_id), &session_id);
-    persist_long_term(&config, &session);
-    Ok(())
+    let path = config.persistent_path();
+    let mut memory = PersistentMemory::load(&path);
+    memory.confirm(&key, &value);
+    memory.persist(&path).map_err(|e| e.to_string())?;
+    tracing::info!(%key, "memory fact confirmed by user");
+    Ok(memory.facts())
+}
+
+/// Remove a remembered fact. Returns the updated list.
+#[tauri::command]
+fn forget_memory(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<Vec<MemoryFact>, String> {
+    let config = pipeline_config(&app, &state.plan())?;
+    let path = config.persistent_path();
+    let mut memory = PersistentMemory::load(&path);
+    memory.forget(&key);
+    memory.persist(&path).map_err(|e| e.to_string())?;
+    tracing::info!(%key, "memory fact forgotten by user");
+    Ok(memory.facts())
 }
 
 /// Move a pre-Stage-4 single `session_context.json` into `sessions/<id>.json`
@@ -149,7 +165,8 @@ fn load_session(
         .ok_or_else(|| format!("no session `{session_id}`"))
 }
 
-/// Delete a session file. `end_session`'s long-term digest is left intact.
+/// Delete a session file. Confirmed cross-chat facts live in a separate store
+/// and are left intact.
 #[tauri::command]
 fn delete_session(
     app: tauri::AppHandle,
@@ -245,10 +262,11 @@ fn pipeline_config(app: &tauri::AppHandle, plan: &ModelPlan) -> Result<PipelineC
         llm_model: plan.llm.clone(),
         vision_model: plan.vision.clone(),
         embed_model: plan.embed.clone(),
-        // Phase 2 wires downloads for these; the paths are fixed now.
-        whisper_model_path: models_dir.join("ggml-base.en.bin"),
-        ocr_detection_model: models_dir.join("text-detection.rten"),
-        ocr_recognition_model: models_dir.join("text-recognition.rten"),
+        // Downloaded by setup (bootstrap::tools::ensure_tool_models); the file
+        // names live there so the downloader and the pipeline can't drift.
+        whisper_model_path: models_dir.join(bootstrap::tools::WHISPER_FILE),
+        ocr_detection_model: models_dir.join(bootstrap::tools::OCR_DETECTION_FILE),
+        ocr_recognition_model: models_dir.join(bootstrap::tools::OCR_RECOGNITION_FILE),
     })
 }
 
@@ -363,7 +381,14 @@ fn turn_setup(
     )
     .with_limits(limits)
     .with_cancel(cancel.clone())
-    .with_mode(mode);
+    .with_mode(mode)
+    // One line from the user's profile (≤ ~40 tokens), framing every role's
+    // answers for their domain. Empty when there's no profile or it says nothing.
+    .with_persona(
+        bootstrap::profile::load(app)
+            .map(|p| p.needs().persona)
+            .unwrap_or_default(),
+    );
     Ok((config, uploads, engine, cancel))
 }
 
@@ -567,9 +592,11 @@ struct LogGuard(#[allow(dead_code)] Mutex<tracing_appender::non_blocking::Worker
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Cap the OCR runtime's thread pool before anything can build it, so a turn
-    // never pins every core and locks up the desktop.
-    workbench_core::init_thread_pools();
+    // Cap whisper's and the OCR runtime's threads before anything can build a
+    // pool, so a turn never pins every core and locks up the desktop. Physical
+    // cores − 1, the same budget Ollama gets — the pipeline crate used to count
+    // hyperthreads here, which gave audio/OCR 3 threads on a 2-core laptop.
+    workbench_core::init_thread_pools(bootstrap::hardware::physical_worker_threads());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -599,6 +626,9 @@ pub fn run() {
             ensure_ollama_installed,
             detect_hardware,
             probe_system,
+            get_profile,
+            save_profile,
+            ensure_tool_models,
             ensure_models,
             set_model_plan,
             assess_model,
@@ -607,7 +637,9 @@ pub fn run() {
             audit_paths,
             submit_turn,
             resume_turn,
-            end_session,
+            get_memory,
+            confirm_memory,
+            forget_memory,
             list_sessions,
             load_session,
             delete_session,

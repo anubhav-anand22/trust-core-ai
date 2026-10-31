@@ -67,5 +67,6 @@ fn fallback_report(results: &[ToolResult], any_failure: bool) -> FinalReport {
         citations: Vec::new(),
         safety_notes: Vec::new(),
         degraded: true,
+        memory_proposals: Vec::new(),
     }
 }

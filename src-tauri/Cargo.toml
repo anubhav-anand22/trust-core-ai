@@ -20,6 +20,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+# Tool-model downloads (bootstrap/tools.rs). Same 0.12 the tree already builds
+# for ollama-rs / lancedb, and TLS comes from there via feature unification, so
+# this adds nothing to compile.
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -33,3 +37,7 @@ workbench-core = { path = "../crates/workbench-core" }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+[dev-dependencies]
+# Already in the tree via workbench-core; used by bootstrap/tools.rs tests.
+tempfile = "3"

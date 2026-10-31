@@ -200,7 +200,7 @@ The six implementations:
 | `audio.rs` | `transcribe_audio` | `symphonia` decodes any container → down-mix to mono → hand-rolled linear resample to 16 kHz → `whisper-rs`. The `WhisperContext` is dropped at the end of the function so the model leaves RAM. |
 | `vision.rs` | `analyze_image` | base64-encode the image, `ctx.engine.analyze_image(b64, question)` → `moondream` via Ollama with `keep_alive: 0`. |
 | `rag.rs` | `search_knowledge` | On first use, chunk + embed every KB file into an embedded **LanceDB** table (`data/lancedb/sop_kb`). On query, embed the query and let LanceDB return the nearest chunks by cosine distance. See [doc 06](06-rag-and-why-not-a-vector-db.md). |
-| `analysis.rs` | `summarize`, `compare_to_sop` | One struct, two constructors. Gathers the `data` of its `depends_on` steps from `ctx.outputs`, sends it to the resident model with a task-specific instruction. |
+| `analysis.rs` | `summarize`, `compare_to_sop`, `assess` | One struct, three constructors. Gathers the `data` of its `depends_on` steps from `ctx.outputs`, sends it to the resident model with a task-specific instruction. `assess` is both jobs in one call; the planner never emits it, and `planner::fold_analysis` swaps the pair for it after validation. |
 
 Every tool follows the same skeleton: check the input exists (return `ok: false`
 if not), do the work off the async thread if it's blocking, wrap the output in a
@@ -245,9 +245,10 @@ let quality  = assert_sane(&plan, &results, None);
 sink.emit(StepEvent::QualityCheck { passed: quality.passed });
 let mut report = compiler::compile(engine, prompt, &results, &session_blob, &facility_blob, sink).await;
 report.degraded = report.degraded || !quality.passed;
-session.append_turn(turn, engine, &config.session_path()).await?;   // best-effort
-persist_long_term(config, &session);                                // encrypt every turn
+report.memory_proposals.retain(|p| !facility.has(p));               // don't re-ask
+session.record_turn(exchange, turn, engine, &path).await?;          // best-effort; stamps ts
 sink.emit(StepEvent::Done { report_json: to_string(&report)? });
+// persistent_memory.json is written only by confirm_memory / forget_memory (docs/11)
 ```
 
 ### `examples/e2e.rs`
@@ -279,7 +280,8 @@ the GUI. Run it: see [doc 07](07-build-test-run.md).
 - **Commands** (`#[tauri::command]` — callable from JS via `invoke`):
   `generate_response` (debug), `is_ollama_installed`, `ensure_ollama_installed`,
   `detect_hardware`, `probe_system`, `ensure_models`, `set_model_plan`,
-  `warm_model`, `audit_paths`, `submit_turn`, `end_session`.
+  `warm_model`, `audit_paths`, `submit_turn`, `resume_turn`, `get_memory`,
+  `confirm_memory`, `forget_memory`, session list/load/rename/delete.
 - **`submit_turn`** — decodes the base64 file uploads, writes them under
   `uploads/<session>/`, builds the `PipelineConfig` + `OllamaEngine` +
   `default_registry()`, wraps the incoming `Channel<StepEvent>` in a
@@ -341,5 +343,21 @@ output and the two silent-failure traps it guards against.
     active model names, and the resolved on-disk paths (from `audit_paths`).
 - **`App.tsx`** — holds the state (`events`, `report`, `hitl`), renders
   `BootstrapGate` until a `ModelPlan` is chosen, then the workbench.
+
+> **Two rules `App.tsx` learned the hard way** (see execution log, part 5 — one
+> input once rendered three identical answers):
+>
+> 1. **A state updater must be pure.** The function passed to a set-function may
+>    read `prev` and return a new value; nothing else. React may call it more than
+>    once and StrictMode deliberately does. To carry a value out of an async
+>    callback — the report arrives on the channel, not as `submitTurn`'s return
+>    value — use a **ref** (`liveReport`), never a nested `setOther(...)`.
+> 2. **One owner per rendered thing.** A finished turn is drawn by the transcript
+>    *or* by the live pane, never both. `commitTurn` **moves** it: append to
+>    `transcript`, then clear `report`/`livePrompt`. `events` deliberately
+>    survives the move because `AuditSidebar` derives its timings from it, so a
+>    separate `turnCommitted` flag — not an emptied `events` — is what retires the
+>    live block. `warnings` and `fatal` also survive: they are not duplicated
+>    anywhere, so they stay on screen under the finished exchange.
 
 Next: [04 · The agentic pipeline](04-agentic-pipeline.md) — one turn, traced.

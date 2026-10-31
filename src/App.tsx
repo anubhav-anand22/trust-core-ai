@@ -1,4 +1,4 @@
-// Sovereign AI Workbench — app shell.
+// TrustCore AI — app shell.
 // Bootstrap gate -> chat (session rail + transcript + prompt + audit sidebar).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -6,14 +6,19 @@ import "./App.css";
 import { AuditSidebar } from "./components/AuditSidebar";
 import { BootstrapGate } from "./components/BootstrapGate";
 import { HitlModal } from "./components/HitlModal";
+import { SearchSidebar } from "./components/SearchSidebar";
+import { ProfileGate } from "./components/ProfileGate";
 import { PromptPanel } from "./components/PromptPanel";
 import { ReportView } from "./components/ReportView";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { Stepper } from "./components/Stepper";
 import {
+  confirmMemory,
   deleteSession,
-  endSession,
   fileToUpload,
+  forgetMemory,
+  getMemory,
+  getProfile,
   listSessions,
   loadSession,
   renameSession,
@@ -25,13 +30,75 @@ import { installGlobalErrorLogging, log } from "./lib/log";
 import type {
   Exchange,
   FinalReport,
+  MemoryFact,
   ModelPlan,
   SessionMeta,
   StepEvent,
   UploadedFile,
+  UserProfile,
 } from "./types";
 
 const SESSION_KEY = "wb.sessionId";
+
+// Two prompts pulled straight from the manual-testing walkthrough (README §2 and
+// §3), against fixtures that ship in `demo/fixtures/` — a judge clicking these is
+// guaranteed a working, already-verified path rather than something invented for
+// the empty state. Clicking a card fills the prompt text only; there is no
+// filesystem capability on the frontend to attach the file for them (see
+// docs/11-conversations-and-memory.md), so the label says which file to drop in.
+const EXAMPLES: { prompt: string; files: string[] }[] = [
+  {
+    prompt: "Assess corrosion risk on pump P-101 and check it against our SOPs.",
+    files: ["inspection.pdf", "valve.png"],
+  },
+  {
+    prompt: "What transaction fee applies to a ₹1000 credit card payment?",
+    files: ["fee_card.pdf"],
+  },
+];
+
+// One extra card for the industry chosen on the profile screen, shown first.
+// These use the user's own files (no fixture ships for them), so the card says
+// "your …"; the two fixture-backed examples above stay for everyone.
+const INDUSTRY_EXAMPLES: Record<string, { prompt: string; files: string[] }> = {
+  finance: {
+    prompt: "Summarise this invoice and flag any charge above ₹50,000.",
+    files: ["your invoice.pdf"],
+  },
+  construction: {
+    prompt: "List the safety requirements in this method statement and flag anything missing.",
+    files: ["your method statement.pdf"],
+  },
+  legal: {
+    prompt: "Summarise the obligations, deadlines and penalties in this contract.",
+    files: ["your contract.pdf"],
+  },
+  healthcare: {
+    prompt: "Summarise this report in plain language and list the follow-up actions.",
+    files: ["your report.pdf"],
+  },
+  logistics: {
+    prompt: "Which shipments in this manifest are late, and what is the likely cause?",
+    files: ["your manifest.pdf"],
+  },
+  it: {
+    prompt: "Summarise this incident report: root cause, impact and fixes.",
+    files: ["your incident report.pdf"],
+  },
+  government: {
+    prompt: "Summarise this circular and list who must act, and by when.",
+    files: ["your circular.pdf"],
+  },
+  education: {
+    prompt: "Turn this chapter into five key points and three quiz questions.",
+    files: ["your chapter.pdf"],
+  },
+};
+
+function examplesFor(industry: string | undefined) {
+  const extra = industry ? INDUSTRY_EXAMPLES[industry] : undefined;
+  return extra ? [extra, ...EXAMPLES] : EXAMPLES;
+}
 
 function newSessionId(): string {
   return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -56,6 +123,9 @@ function initialSessionId(): string {
 
 function App() {
   const [plan, setPlan] = useState<ModelPlan | null>(null);
+  // undefined = still reading profile.json; null = first launch (ask).
+  const [profile, setProfile] = useState<UserProfile | null | undefined>(undefined);
+  const [editingProfile, setEditingProfile] = useState(false);
 
   // --- session / transcript -------------------------------------------
   const [sessionId, setSessionId] = useState<string>(initialSessionId);
@@ -67,7 +137,34 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [report, setReport] = useState<FinalReport | null>(null);
   const [livePrompt, setLivePrompt] = useState<string>("");
+  // Set once a turn's result has moved into the transcript. `events` deliberately
+  // survives that move — the audit sidebar's timings table is derived from it — so
+  // this flag, not an empty `events`, is what retires the live transcript block.
+  const [turnCommitted, setTurnCommitted] = useState(false);
+  // Bumped only when a turn actually delivers a report; `PromptPanel` watches it
+  // and empties the prompt + attachments. Deliberately NOT driven by `busy`
+  // going false — a failed or parked turn must keep the user's input.
+  const [inputResetToken, setInputResetToken] = useState(0);
+  // Text from the last-clicked "try one of these" example card, plus a counter
+  // PromptPanel watches so a repeat click of the same card still re-fills —
+  // same shape as `inputResetToken` above.
+  const [exampleText, setExampleText] = useState("");
+  const [exampleToken, setExampleToken] = useState(0);
   const [hitl, setHitl] = useState<{ errors: string[]; planJson: string } | null>(null);
+  // What the model is writing right now (streamed). Deliberately NOT part of
+  // `events`: the Stepper reads the last event as the current stage, and the
+  // activity list / audit timings are derived from `events` — ~3 updates a second
+  // would make all of them churn.
+  const [liveText, setLiveText] = useState<{
+    tool: string;
+    text: string;
+    /** Its step reported `tool_finished` — the text is complete, not in flight. */
+    finished: boolean;
+  } | null>(null);
+  // Cross-chat memory: only facts the user explicitly confirmed. Shared by every
+  // session, which is the point — and safe, because nothing lands here
+  // automatically (the automatic digest fold is what used to leak between chats).
+  const [memory, setMemory] = useState<MemoryFact[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<{ message: string; detail?: string | null }[]>([]);
 
@@ -76,6 +173,26 @@ function App() {
     uploads: UploadedFile[];
     mode: TurnMode;
   } | null>(null);
+
+  // The report as it arrived on the channel. `commitTurn` reads it from here so the
+  // transcript append never has to live inside a state updater: React treats updaters
+  // as pure and may call them more than once, and StrictMode deliberately does — which
+  // is how one turn used to land in the transcript twice.
+  const liveReport = useRef<FinalReport | null>(null);
+
+  // Authoritative in-flight flag. The `busy` state is set asynchronously, so two fast
+  // activations (double-click Run, Ctrl+Enter twice) both read the stale `busy === false`
+  // and fire two real `submit_turn` invokes — two pipeline runs, two exchanges on disk.
+  const inFlight = useRef(false);
+
+  // The transcript is its own scroll container now (the page itself no longer
+  // scrolls), so new output has to be followed deliberately.
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  // Whether to keep following. Updated from the scroll handler rather than
+  // measured inside the effect, because by the time the effect runs the new
+  // content is already in the DOM and "was the user at the bottom?" can no
+  // longer be answered.
+  const stickToBottom = useRef(true);
 
   const persistId = useCallback((id: string) => {
     try {
@@ -99,18 +216,33 @@ function App() {
     loadSession(sessionId)
       .then((s) => setTranscript(s.exchanges ?? []))
       .catch(() => setTranscript([])); // brand-new session: nothing on disk yet
+    getMemory()
+      .then(setMemory)
+      .catch((e) => log.error("get_memory failed", { error: String(e) }));
+    getProfile()
+      .then((p) => setProfile(p ?? null))
+      .catch(() => setProfile(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist long-term memory when the window is closing/reloading.
+  function remember(fact: MemoryFact) {
+    log.info("user confirmed a memory fact", { key: fact.key });
+    confirmMemory(fact)
+      .then(setMemory)
+      .catch((e) => log.error("confirm_memory failed", { error: String(e) }));
+  }
+
+  function forget(key: string) {
+    log.info("user forgot a memory fact", { key });
+    forgetMemory(key)
+      .then(setMemory)
+      .catch((e) => log.error("forget_memory failed", { error: String(e) }));
+  }
+
   useEffect(() => {
-    const onUnload = () => {
-      log.info("window closing; persisting long-term memory");
-      endSession(sessionId).catch(() => {});
-    };
-    window.addEventListener("beforeunload", onUnload);
-    return () => window.removeEventListener("beforeunload", onUnload);
-  }, [sessionId]);
+    const el = transcriptRef.current;
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
+  }, [transcript, events, report, warnings]);
 
   const activity = useMemo(
     () =>
@@ -127,14 +259,42 @@ function App() {
     setFatal(null);
     setWarnings([]);
     setLivePrompt("");
+    setTurnCommitted(false);
+    setLiveText(null);
+    liveReport.current = null;
   }
 
   // Fold a StepEvent stream into UI state. Shared by the initial turn and a resume.
   function onEvent(e: StepEvent) {
+    if (e.stage === "streaming") {
+      setLiveText({ tool: e.tool, text: e.text, finished: false });
+      return;
+    }
     setEvents((prev) => [...prev, e]);
+    // The step finished: keep its text on screen, labelled done. Deep-read
+    // labels look like "assess · deep read 2/5", hence startsWith.
+    if (e.stage === "tool_finished") {
+      setLiveText((lt) => (lt && lt.tool.startsWith(e.tool) ? { ...lt, finished: true } : lt));
+    }
+    // A new step or the end of the turn retires it. `synthesizing` deliberately
+    // does not: the report step is often the second-longest wait, and the
+    // finished analysis is the most useful thing to read meanwhile. A Stop does
+    // not either — what was written so far stays, marked partial.
+    if (
+      e.stage === "executing_tool" ||
+      e.stage === "done" ||
+      e.stage === "error" ||
+      e.stage === "awaiting_user"
+    ) {
+      setLiveText(null);
+    }
     if (e.stage === "done") {
       try {
-        setReport(JSON.parse(e.report_json) as FinalReport);
+        const parsed = JSON.parse(e.report_json) as FinalReport;
+        // The ref is what `commitTurn` reads; the state is what the live pane renders
+        // while the turn is still on screen.
+        liveReport.current = parsed;
+        setReport(parsed);
       } catch {
         /* leave report null */
       }
@@ -147,21 +307,45 @@ function App() {
     }
   }
 
-  // When a turn ends, move its result into the transcript and refresh the rail.
+  // When a turn ends, MOVE its result into the transcript and refresh the rail.
+  //
+  // "Move", not "copy": the live pane renders the same report at the bottom of the
+  // transcript, and it used to stay mounted after the turn finished (`showLive` is still
+  // true because `events` is non-empty), so the finished report was drawn twice.
+  //
+  // Two things this must NOT do:
+  //  - call `clearLive()` — it also clears `hitl`, and this runs after *every* turn
+  //    including one the planner parked, which would close the HITL modal on open;
+  //  - clear `warnings`/`fatal` — they are not duplicated anywhere, and the user should
+  //    still see "Skipped x.mov" after the report lands.
   function commitTurn(prompt: string, attachments: string[]) {
-    setReport((r) => {
-      if (r) {
-        setTranscript((prev) => [
-          ...prev,
-          { prompt, attachments, report: r, ts: Math.floor(Date.now() / 1000) },
-        ]);
-      }
-      return r;
-    });
+    const finished = liveReport.current;
+    liveReport.current = null;
+
+    if (finished) {
+      setTranscript((prev) => [
+        ...prev,
+        { prompt, attachments, report: finished, ts: Math.floor(Date.now() / 1000) },
+      ]);
+      setReport(null);
+      setLivePrompt("");
+      setTurnCommitted(true);
+      setInputResetToken((n) => n + 1);
+    }
+
     refreshSessions();
   }
 
+  // A "try one of these" card was clicked. Only fills PromptPanel's text — see
+  // the matching effect there for why the file can't be attached automatically.
+  function applyExample(text: string) {
+    setExampleText(text);
+    setExampleToken((n) => n + 1);
+  }
+
   async function run(prompt: string, files: File[], mode: TurnMode) {
+    if (inFlight.current) return;
+    inFlight.current = true;
     log.info("user submitted a turn", { prompt_chars: prompt.length, mode });
     setBusy(true);
     clearLive();
@@ -179,22 +363,28 @@ function App() {
       setFatal(String(e));
     } finally {
       setBusy(false);
+      inFlight.current = false;
     }
   }
 
   async function resume(planJson: string, force: boolean) {
+    if (inFlight.current) return;
     log.info("user resumed a parked turn", { force });
     const ctx = lastTurn.current;
     if (!ctx) {
       setFatal("nothing to resume — submit a prompt first");
       return;
     }
+    inFlight.current = true;
     setBusy(true);
     setEvents([]);
     setReport(null);
     setHitl(null);
     setFatal(null);
     setWarnings([]);
+    setTurnCommitted(false);
+    setLiveText(null);
+    liveReport.current = null;
     try {
       await resumeTurn(
         { prompt: ctx.prompt, sessionId, files: ctx.uploads, planJson, force, mode: ctx.mode },
@@ -205,12 +395,12 @@ function App() {
       setFatal(String(e));
     } finally {
       setBusy(false);
+      inFlight.current = false;
     }
   }
 
   async function switchTo(id: string) {
     if (busy || id === sessionId) return;
-    await endSession(sessionId).catch(() => {});
     setSessionId(id);
     persistId(id);
     clearLive();
@@ -225,7 +415,6 @@ function App() {
 
   async function newChat() {
     if (busy) return;
-    await endSession(sessionId).catch(() => {});
     const id = newSessionId();
     setSessionId(id);
     persistId(id);
@@ -250,14 +439,40 @@ function App() {
     else refreshSessions();
   }
 
-  if (!plan) return <BootstrapGate onReady={setPlan} />;
+  // Profile → hardware/model → workbench. The profile is asked once and stored;
+  // "Change profile" on the hardware screen brings it back.
+  if (profile === undefined) return <div className="bootstrap" />;
+  if (profile === null || editingProfile) {
+    return (
+      <ProfileGate
+        initial={profile}
+        onDone={(p) => {
+          setProfile(p);
+          setEditingProfile(false);
+        }}
+      />
+    );
+  }
+  if (!plan) {
+    return (
+      <BootstrapGate
+        profile={profile}
+        onChangeProfile={() => setEditingProfile(true)}
+        onReady={setPlan}
+      />
+    );
+  }
 
-  const showLive = busy || events.length > 0 || !!fatal || warnings.length > 0;
+  // Warnings and a fatal error outlive the commit: they are not duplicated in the
+  // transcript, so they stay on screen under the finished exchange.
+  const showLive =
+    busy || (!turnCommitted && events.length > 0) || !!fatal || warnings.length > 0;
 
   return (
     <div className="workbench">
       <header className="wb-header">
-        <h1>Sovereign AI Workbench</h1>
+        <h1>TrustCore AI</h1>
+        <span className="wb-tagline">Sovereign AI Agentic Workbench</span>
         <span className="wb-tier">{plan.tier_label}</span>
       </header>
 
@@ -274,12 +489,51 @@ function App() {
 
         <main className="wb-main">
           <section className="wb-left">
-            <div className="transcript">
+            <div
+              className="transcript"
+              ref={transcriptRef}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                // Scrolling up to re-read an earlier answer must not be yanked
+                // back to the bottom on the next event.
+                stickToBottom.current =
+                  el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+              }}
+            >
               {transcript.length === 0 && !showLive && (
-                <p className="muted transcript-empty">
-                  Ask a question, attach a document, and the analysis appears here.
-                  Follow-up questions in the same chat keep their context.
-                </p>
+                <div className="welcome">
+                  <p className="muted transcript-empty">
+                    Ask a question, attach a document, and the analysis appears here.
+                    Follow-up questions in the same chat keep their context.
+                  </p>
+
+                  <div className="examples">
+                    <p className="examples-label">Try one of these</p>
+                    {examplesFor(profile?.industry).map((ex) => (
+                      <button
+                        key={ex.prompt}
+                        type="button"
+                        className="example-card"
+                        onClick={() => applyExample(ex.prompt)}
+                      >
+                        <span className="example-prompt">“{ex.prompt}”</span>
+                        <span className="example-files">
+                          attach{" "}
+                          {ex.files.map((f, i) => (
+                            <span key={f}>
+                              {i > 0 && " + "}
+                              <code>{f}</code>
+                            </span>
+                          ))}
+                        </span>
+                      </button>
+                    ))}
+                    <p className="examples-hint muted small">
+                      Fixtures live in <code>demo/fixtures/</code>. Missing? Run{" "}
+                      <code>python demo/make_fixtures.py</code>.
+                    </p>
+                  </div>
+                </div>
               )}
 
               {transcript.map((x, i) => (
@@ -296,15 +550,17 @@ function App() {
                       </div>
                     )}
                   </div>
-                  {x.report && <ReportView report={x.report} />}
+                  {x.report && (
+                    <ReportView report={x.report} remembered={memory} onRemember={remember} />
+                  )}
                 </div>
               ))}
 
               {showLive && (
                 <div className="exchange">
                   {livePrompt && <div className="bubble bubble-user">{livePrompt}</div>}
-                  {events.length > 0 && <Stepper events={events} />}
-                  {activity.length > 0 && (
+                  {!turnCommitted && events.length > 0 && <Stepper events={events} />}
+                  {!turnCommitted && activity.length > 0 && (
                     <ul className="activity">
                       {activity.map((e, i) => (
                         <li key={i}>
@@ -314,6 +570,21 @@ function App() {
                         </li>
                       ))}
                     </ul>
+                  )}
+                  {!turnCommitted && liveText && liveText.text.trim() && (
+                    <div className="live-text" aria-live="polite">
+                      <div className="live-text-label">
+                        {liveText.tool} ·{" "}
+                        {liveText.finished
+                          ? busy
+                            ? "done — the report is being written from this"
+                            : "done"
+                          : busy
+                            ? "writing…"
+                            : "stopped — partial output"}
+                      </div>
+                      <pre>{liveText.text}</pre>
+                    </div>
                   )}
                   {warnings.length > 0 && (
                     <ul className="warnings" aria-label="Pipeline warnings">
@@ -328,15 +599,24 @@ function App() {
                     </ul>
                   )}
                   {fatal && <div className="fatal">Error: {fatal}</div>}
-                  {report && <ReportView report={report} />}
+                  {report && (
+                    <ReportView report={report} remembered={memory} onRemember={remember} />
+                  )}
                 </div>
               )}
             </div>
 
-            <PromptPanel busy={busy} onSubmit={run} />
+            <PromptPanel
+              busy={busy}
+              onSubmit={run}
+              resetToken={inputResetToken}
+              exampleText={exampleText}
+              exampleToken={exampleToken}
+            />
           </section>
 
-          <AuditSidebar events={events} plan={plan} />
+          <AuditSidebar events={events} plan={plan} memory={memory} onForget={forget} />
+          <SearchSidebar />
         </main>
       </div>
 

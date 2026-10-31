@@ -10,6 +10,18 @@
   --warn: #e8b451;
   --err: #ef6b73;
   font-synthesis: none;
+
+  /* The webview draws native widgets — the <select> popup list, scrollbars, the
+     checkbox — in LIGHT mode unless the page says otherwise. Everything else here
+     is dark, so the dropdown opened as a bright white panel with our near-white
+     --text on it: barely readable, and jarring next to the rest of the screen.
+     This one line is the actual fix; it also darkens scrollbars app-wide. */
+  color-scheme: dark;
+
+  /* Industrial, not rounded-friendly: one tight radius scale, used everywhere,
+     instead of the ad-hoc 7/8/10/12px that had accumulated. */
+  --radius: 6px;
+  --radius-sm: 4px;
 }
 
 * { box-sizing: border-box; }
@@ -68,12 +80,33 @@ select, textarea, input[type="text"] {
   padding: 8px 10px;
   font: inherit;
 }
+/* The popup list is drawn by the OS, so `color-scheme: dark` above is what
+   actually themes it. These state the same intent explicitly for engines that
+   honour per-option colours, and keep the contrast deliberate rather than
+   inherited by accident. */
+select option, select optgroup {
+  background: var(--panel-2);
+  color: var(--text);
+}
+select:not(:disabled) { cursor: pointer; }
+select:focus-visible, textarea:focus-visible, input[type="text"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+select:disabled, textarea:disabled, input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 .pull-status { margin-top: 14px; display: grid; gap: 6px; }
 .pull-row { display: flex; gap: 10px; font-size: 12px; }
 .pull-row b { min-width: 150px; }
 
 /* ---------- workbench shell ---------- */
-.workbench { display: flex; flex-direction: column; min-height: 100vh; }
+/* `height`, not `min-height`: the shell owns the viewport and the panes scroll
+   inside it. With min-height the whole page scrolled, which is why the prompt box
+   could be pushed off-screen by a long transcript. */
+.workbench { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .wb-header {
   display: flex;
   align-items: baseline;
@@ -83,7 +116,14 @@ select, textarea, input[type="text"] {
   background: var(--panel);
 }
 .wb-header h1 { font-size: 16px; margin: 0; }
+/* Secondary to the wordmark, not a third equal item — the category name, read
+   quietly. */
+.wb-tagline { font-size: 12px; color: var(--muted); }
 .wb-tier {
+  /* Anchors to the header's right edge. Without this, the header — full-width
+     since the layout rework — would reopen the same dead-space problem that was
+     fixed for the workspace below it, just one row higher. */
+  margin-left: auto;
   font-size: 12px;
   color: var(--muted);
   border: 1px solid var(--line);
@@ -94,7 +134,7 @@ select, textarea, input[type="text"] {
 .wb-body { display: flex; flex: 1; min-height: 0; }
 
 /* --- session rail ------------------------------------------------------- */
-.session-rail { width: 232px; flex-shrink: 0; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; padding: 12px 10px; gap: 10px; overflow: hidden; }
+.session-rail { width: clamp(232px, 15vw, 300px); flex-shrink: 0; border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; padding: 12px 10px; gap: 10px; overflow: hidden; }
 .new-chat-btn { background: var(--accent); color: #04121f; border: none; border-radius: 7px; padding: 9px 12px; font-weight: 600; cursor: pointer; }
 .new-chat-btn:disabled { opacity: 0.5; cursor: default; }
 .session-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; display: grid; gap: 3px; }
@@ -113,24 +153,83 @@ select, textarea, input[type="text"] {
 .session-actions button:hover:not(:disabled) { background: var(--line); color: var(--text); }
 
 /* --- transcript ------------------------------------------------------- */
-.transcript { display: flex; flex-direction: column; gap: 22px; margin-bottom: 20px; }
+.transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 20px 22px;
+}
 .transcript-empty { max-width: 46ch; line-height: 1.5; }
+
+/* ---------- empty-chat "try one of these" cards ---------- */
+.welcome { display: flex; flex-direction: column; gap: 16px; }
+.examples { display: grid; gap: 8px; max-width: 62ch; }
+.examples-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); margin: 0; }
+.example-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  text-align: left;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.example-card:hover { border-color: var(--accent); background: var(--panel-2); }
+.example-prompt { font-size: 13px; line-height: 1.4; }
+.example-files { font-size: 11.5px; color: var(--muted); }
+.example-files code { background: var(--panel-2); border-radius: var(--radius-sm); padding: 1px 5px; }
+.examples-hint { margin: 2px 0 0; }
+.examples-hint code { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 1px 5px; }
+
 .exchange { display: flex; flex-direction: column; gap: 12px; }
-.bubble { border-radius: 10px; padding: 11px 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
-.bubble-user { background: var(--panel-2); border: 1px solid var(--line); align-self: flex-start; max-width: 90%; }
+.bubble { border-radius: var(--radius); padding: 11px 14px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; }
+/* A ch cap, so full-bleed does not turn one sentence into a 1600px line. */
+.bubble-user { background: var(--panel-2); border: 1px solid var(--line); align-self: flex-start; max-width: min(90%, 88ch); }
 .bubble-files { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-.chip { font-size: 11px; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px; color: var(--muted); }
+.chip { font-size: 11px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 2px 7px; color: var(--muted); }
 
 .wb-main { display: flex; flex: 1; min-height: 0; }
-.wb-left { flex: 1; padding: 20px; overflow: auto; max-width: 860px; }
+
+/* `.wb-left` used to carry `max-width: 860px` inside a flex row, so on anything
+   wider than ~1400px the leftover width became a dead gutter between the
+   transcript and the audit rail. It now fills the row; the rails below take a
+   share of the extra width via clamp() so an ultrawide widens all three columns
+   instead of dumping everything into the middle one.
+
+   Column, not block: the transcript scrolls and the prompt panel stays pinned to
+   the bottom, which is what makes this read as an app rather than a document. */
+.wb-left {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 
 /* ---------- prompt panel ---------- */
-.prompt-panel { display: grid; gap: 12px; }
-.prompt-input { width: 100%; min-height: 84px; resize: vertical; }
+/* Pinned to the bottom of the workspace, separated by a rule rather than a
+   shadow — the transcript scrolls behind it. */
+.prompt-panel {
+  flex-shrink: 0;
+  display: grid;
+  gap: 10px;
+  padding: 14px 22px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+.prompt-input { width: 100%; min-height: 68px; resize: vertical; line-height: 1.45; }
 .dropzone {
   border: 1px dashed var(--line);
-  border-radius: 8px;
-  padding: 14px;
+  border-radius: var(--radius);
+  padding: 10px;
   text-align: center;
   color: var(--muted);
   cursor: pointer;
@@ -151,7 +250,7 @@ select, textarea, input[type="text"] {
   justify-self: start;
 }
 .run-btn:disabled { opacity: 0.5; cursor: default; }
-.deep-toggle { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--muted); margin: 6px 0 10px; cursor: pointer; user-select: none; }
+.deep-toggle { display: flex; gap: 8px; align-items: center; font-size: 12.5px; color: var(--muted); margin: 0; cursor: pointer; user-select: none; }
 .deep-toggle input { accent-color: var(--accent); }
 .reject-note { display: flex; gap: 8px; align-items: baseline; }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; text-decoration: underline; }
@@ -172,29 +271,64 @@ select, textarea, input[type="text"] {
 .step-waiting { color: var(--warn); border-color: rgba(232, 180, 81, 0.5); }
 .step-error { color: var(--err); border-color: rgba(239, 107, 115, 0.5); }
 
-.activity { list-style: none; margin: 0 0 18px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+.activity { list-style: none; margin: 0 0 18px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
 
-.assess { list-style: none; margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px; font-size: 12.5px; line-height: 1.5; display: grid; gap: 5px; }
+.assess { list-style: none; margin: 10px 0 4px; padding: 10px 12px; border-radius: var(--radius); font-size: 12.5px; line-height: 1.5; display: grid; gap: 5px; }
 .assess-caution { background: rgba(230, 168, 78, 0.12); border: 1px solid rgba(230, 168, 78, 0.4); color: var(--muted); }
 .assess-blocked { background: rgba(239, 107, 115, 0.12); border: 1px solid rgba(239, 107, 115, 0.45); color: var(--err); }
 .warnings { list-style: none; margin: 12px 0; padding: 0; display: grid; gap: 6px; }
-.warnings li { display: flex; gap: 8px; align-items: flex-start; background: rgba(230, 168, 78, 0.12); border: 1px solid rgba(230, 168, 78, 0.4); color: var(--muted); border-radius: 8px; padding: 9px 11px; font-size: 12.5px; line-height: 1.45; }
+.warnings li { display: flex; gap: 8px; align-items: flex-start; background: rgba(230, 168, 78, 0.12); border: 1px solid rgba(230, 168, 78, 0.4); color: var(--muted); border-radius: var(--radius); padding: 9px 11px; font-size: 12.5px; line-height: 1.45; }
 .warnings .warn-icon { color: #e6a84e; flex-shrink: 0; }
-.fatal { background: rgba(239, 107, 115, 0.1); border: 1px solid rgba(239, 107, 115, 0.4); color: var(--err); border-radius: 8px; padding: 12px; margin: 12px 0; }
+.fatal { background: rgba(239, 107, 115, 0.1); border: 1px solid rgba(239, 107, 115, 0.4); color: var(--err); border-radius: var(--radius); padding: 12px; margin: 12px 0; }
 
 /* ---------- report ---------- */
-.report { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-top: 18px; }
+/* On a wide screen a single narrow column of findings left most of the panel
+   empty. Sections now flow into as many columns as fit and collapse to one when
+   narrow — no media query, no JSX change. */
+.report {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px 28px;
+  align-items: start;
+}
+.report-head, .report-summary { grid-column: 1 / -1; }
 .report-head { display: flex; align-items: center; gap: 10px; }
-.report-summary { font-size: 15px; }
-.report section { margin-top: 14px; }
-.report ul { margin: 6px 0; padding-left: 20px; }
+/* The title is a micro-label, matching the audit rail; the summary is the lead. */
+.report-head h2 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--muted);
+  margin: 0;
+}
+.report-summary { font-size: 15px; line-height: 1.55; max-width: 96ch; margin: 2px 0 0; }
+.report section { margin-top: 0; border-top: 1px solid var(--line); padding-top: 12px; }
+.report section h3 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+.report ul { margin: 0; padding-left: 18px; display: grid; gap: 5px; }
+.report li { line-height: 1.5; }
+/* A report with only one section (the degraded fallback) would otherwise stretch
+   that section across the whole panel. The panel still fills the width — only the
+   text keeps a measure. No effect in the multi-column case, where a track is
+   already narrower than this. */
+.report section > ul { max-width: 84ch; }
 .report-safety h3 { color: var(--warn); }
-.report-cites { color: var(--muted); }
+.report-cites { color: var(--muted); font-size: 12.5px; }
 .badge { font-size: 11px; border-radius: 999px; padding: 2px 8px; }
 .badge-warn { background: rgba(232, 180, 81, 0.15); color: var(--warn); }
 
 /* ---------- audit sidebar ---------- */
-.audit { width: 320px; border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow: auto; }
+.audit { width: clamp(320px, 21vw, 420px); flex-shrink: 0; border-left: 1px solid var(--line); background: var(--panel); padding: 14px; overflow: auto; }
 .audit-collapsed { width: 56px; padding: 14px 8px; }
 .audit-toggle { background: none; border: 1px solid var(--line); color: var(--muted); border-radius: 6px; padding: 5px 8px; cursor: pointer; font-size: 12px; width: 100%; }
 .audit-body { display: grid; gap: 18px; margin-top: 14px; }
@@ -202,6 +336,33 @@ select, textarea, input[type="text"] {
 .audit-dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; font-size: 12px; }
 .audit-dl dt { color: var(--muted); }
 .audit-dl dd { margin: 0; }
+
+/* ---------- "How it works" strip ---------- */
+/* A numbered flow, not a horizontal strip with arrows: the audit rail is too
+   narrow at its clamp() floor (320px) for five chips-in-a-row to stay legible.
+   Each row's title attr carries the longer explanation, for anyone who hovers. */
+.hiw-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 7px; cursor: default; }
+.hiw-list li { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.hiw-num {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.hiw-label { flex-shrink: 0; }
+.hiw-tag {
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+}
 .audit-table { width: 100%; font-size: 12px; border-collapse: collapse; }
 .audit-table td { padding: 3px 0; border-bottom: 1px solid var(--line); }
 .audit-table .num { text-align: right; color: var(--muted); }
@@ -220,3 +381,29 @@ select, textarea, input[type="text"] {
 .hitl-editor { width: 100%; min-height: 220px; font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: 12px; }
 .hitl-json-error { color: var(--err); font-size: 12px; }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+
+/* First-run profile screen. */
+.profile { max-width: 920px; }
+.profile-q { margin: 14px 0; }
+.profile-q h3 { margin: 0 0 8px; font-size: 14px; }
+.profile-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
+.profile-card { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--panel); color: inherit; cursor: pointer; font: inherit; font-size: 13px; }
+.profile-card:hover { border-color: var(--accent); }
+.profile-card-on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.profile-unsure { color: var(--muted); }
+.profile-hint { font-size: 11px; color: var(--muted); }
+.profile-line { margin-top: -6px; }
+.reasons { margin: 4px 0 10px; padding-left: 18px; font-size: 12.5px; color: var(--muted); display: grid; gap: 3px; }
+.alternatives { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+
+/* Streamed model output while a prose step runs. Capped height, scrolls itself. */
+.live-text { margin: 0 0 18px; padding: 10px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); }
+.live-text-label { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+.live-text pre { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; font: inherit; font-size: 13px; }
+
+/* Cross-chat memory: proposals under a report, confirmed list in the audit rail. */
+.report-memory ul,
+.memory-list { list-style: none; padding: 0; margin: 6px 0 0; display: grid; gap: 6px; }
+.memory-proposal { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.memory-proposal span { flex: 1; min-width: 12ch; }
+.memory-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 4px 8px; }

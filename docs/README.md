@@ -1,4 +1,4 @@
-# Sovereign AI Workbench — Documentation
+# TrustCore AI — Documentation
 
 These docs are written for someone learning to program who wants to understand
 **how this codebase works and why it's shaped the way it is** — not just API

@@ -1,4 +1,5 @@
-//! `summarize` and `compare_to_sop` — the analysis-stage steps.
+//! `summarize`, `compare_to_sop` and their merged form `assess` — the
+//! analysis-stage steps.
 //!
 //! These consume the evidence produced by earlier extraction/retrieval steps and
 //! run it through the *resident* model (no extra weights). They exist as explicit
@@ -6,6 +7,7 @@
 //! step, rather than folding all analysis silently into the final compiler.
 
 use crate::engine::schemas::{TaskStep, ToolResult};
+use crate::engine::ollama_engine::LiveOutput;
 use crate::events::StepEvent;
 use crate::tools::{Tool, ToolContext};
 use crate::{CoreError, Result, TurnMode};
@@ -42,6 +44,31 @@ impl AnalysisTool {
             instruction: "Compare the observed conditions against the SOP / procedure passages in \
                           the evidence. List each point as COMPLIANT or DEVIATION with a one-line \
                           reason and the SOP source name.",
+        }
+    }
+
+    /// `summarize` + `compare_to_sop` in one call. Never planned directly: the
+    /// planner still emits the pair, and `planner::fold_analysis` swaps it for
+    /// this after validation. Both steps read the same evidence, so running them
+    /// separately paid the evidence ranking (an embedding-model reload) and a
+    /// ~half-window prefill twice for no extra information.
+    ///
+    /// Same `num_predict` ceiling as either step alone — raising it would buy
+    /// back the decode time the merge saves — hence "briefly", and the SOP
+    /// check comes *first*: if the cap truncates anything it should be the
+    /// findings, which role C can still read straight off the raw extraction
+    /// outputs. The compliance verdicts exist nowhere else.
+    pub fn assess() -> Self {
+        Self {
+            task: "assess",
+            instruction: "Do two things, briefly, in this order.\n\
+                          1. SOP CHECK: compare the observed conditions against the SOP / procedure \
+                          passages in the evidence. One line per point, marked COMPLIANT or \
+                          DEVIATION, with a one-line reason and the SOP source name. If the \
+                          evidence contains no SOP passages, write only \"No SOP passages \
+                          retrieved.\" — never a COMPLIANT or DEVIATION line without one.\n\
+                          2. FINDINGS: the key findings from the evidence as a short list. Keep \
+                          equipment tags, measurements and dates exact.",
         }
     }
 }
@@ -92,7 +119,8 @@ impl Tool for AnalysisTool {
         )
         .await;
 
-        match ctx.engine.analyze(self.instruction, &evidence, ctx.prompt).await {
+        let live = LiveOutput { sink: ctx.sink, tool: self.name() };
+        match ctx.engine.analyze(self.instruction, &evidence, ctx.prompt, Some(live)).await {
             Ok(text) => Ok(ToolResult {
                 step_id: step.id.clone(),
                 task: self.name().into(),
@@ -143,12 +171,15 @@ impl AnalysisTool {
         let mut partials: Vec<String> = Vec::with_capacity(n);
         for (i, w) in windows.iter().enumerate() {
             ctx.engine.cancel_check()?;
+            // One label for the stepper and the live text, so the two agree.
+            let label = format!("{} · deep read {}/{}", self.name(), i + 1, n);
             ctx.sink.emit(StepEvent::ExecutingTool {
-                tool: format!("{} · deep read {}/{}", self.name(), i + 1, n),
+                tool: label.clone(),
                 index: i,
                 total: n,
             });
-            match ctx.engine.analyze(self.instruction, w, ctx.prompt).await {
+            let live = LiveOutput { sink: ctx.sink, tool: &label };
+            match ctx.engine.analyze(self.instruction, w, ctx.prompt, Some(live)).await {
                 Ok(a) if !a.trim().is_empty() => partials.push(a),
                 Ok(_) => {}
                 Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
@@ -178,7 +209,9 @@ impl AnalysisTool {
                           Merge them into a single answer. Keep every specific figure, rate, \
                           percentage, equipment tag, date and source name exactly as written. \
                           Do not introduce anything that is not in a partial.";
-            match ctx.engine.analyze(reduce, &combined, ctx.prompt).await {
+            let label = format!("{} · deep read merge", self.name());
+            let live = LiveOutput { sink: ctx.sink, tool: &label };
+            match ctx.engine.analyze(reduce, &combined, ctx.prompt, Some(live)).await {
                 Ok(t) => t,
                 Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
                 Err(e) => {

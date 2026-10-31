@@ -278,7 +278,9 @@ let turn = TurnSummary {
     report_summary: "Corrosion risk on pump P-101 is moderate …",
 };
 session.append_turn(turn, engine, &config.session_path()).await;   // → session_context.json
-persist_long_term(config, &session);                               // → persistent_memory.json (AES-256-GCM)
+// (2026-10-10: the per-turn `persist_long_term` digest that used to follow here
+//  is gone — persistent_memory.json is now written only when the user confirms a
+//  proposed fact. See docs/11.)
 ```
 
 `session_context.json` is now one turn long. `persistent_memory.json` on disk is

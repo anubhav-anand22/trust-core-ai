@@ -9,6 +9,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   assessModel,
   ensureModels,
+  ensureToolModels,
   ensureOllamaInstalled,
   isOllamaInstalled,
   probeSystem,
@@ -16,7 +17,7 @@ import {
   warmModel,
 } from "../lib/pipeline";
 import { log as logger } from "../lib/log";
-import type { LlmAssessment, ModelPlan, SystemProbe } from "../types";
+import type { LlmAssessment, ModelPlan, ModelProgress, SystemProbe, UserProfile } from "../types";
 
 type Phase =
   | "checking-ollama"
@@ -27,20 +28,27 @@ type Phase =
   | "warming"
   | "error";
 
-// Resident-LLM options offered in the override dropdown, smallest first. Mirrors
-// LLM_CATALOG in src-tauri/src/bootstrap/models.rs. Deliberately no "thinking"
-// model (e.g. qwen3): they return an empty body under this app's structured-output
-// mode. The backend's assess_model call is what warns if a pick is too big.
-const LLM_CHOICES = [
-  "qwen2.5:0.5b-instruct",
-  "qwen2.5:1.5b-instruct",
-  "qwen2.5:3b-instruct",
-  "llama3.2:3b",
-  "phi4-mini",
-  "qwen2.5:7b-instruct",
-];
+/** One line summarising the profile, e.g. "energy · inspection, compliance · photos · balanced". */
+function profileSummary(p: UserProfile): string {
+  const parts = [
+    p.industry || "any industry",
+    p.work.length ? p.work.join(", ") : "",
+    p.inputs.length ? p.inputs.join(", ") : "",
+    p.priority || "balanced",
+    p.language && p.language !== "english" ? p.language : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
 
-export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void }) {
+export function BootstrapGate({
+  profile,
+  onChangeProfile,
+  onReady,
+}: {
+  profile: UserProfile;
+  onChangeProfile: () => void;
+  onReady: (plan: ModelPlan) => void;
+}) {
   const [phase, setPhase] = useState<Phase>("checking-ollama");
   const [log, setLog] = useState<string[]>([]);
   const [probe, setProbe] = useState<SystemProbe | null>(null);
@@ -85,10 +93,44 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
     })();
   }, []);
 
+  // The vision model follows the resident choice (a multimodal model reads images
+  // itself; "no photos" means none), so it comes from the assessment of `llm`.
   const chosenPlan: ModelPlan | null = useMemo(() => {
     if (!probe) return null;
-    return { ...probe.recommended, llm };
-  }, [probe, llm]);
+    const vision =
+      assessment && assessment.model === llm ? assessment.vision : probe.recommended.vision;
+    return { ...probe.recommended, llm, vision };
+  }, [probe, llm, assessment]);
+
+  // The backend catalogue, plus any chat model already on this machine that isn't
+  // in it — someone's existing pull should be pickable without a download.
+  // Specialist models (vision, embeddings) are not resident-LLM candidates.
+  const installed = useMemo(() => new Set(probe?.installed_models ?? []), [probe]);
+  const catalog = useMemo(() => probe?.catalog ?? [], [probe]);
+  const choices = useMemo(() => {
+    const names = catalog.map((c) => c.name);
+    const extra = [...installed].filter(
+      (m) =>
+        !names.includes(m) &&
+        !m.startsWith("moondream") &&
+        !m.startsWith("minicpm-v") &&
+        !m.includes("embed"),
+    );
+    return [...names, ...extra];
+  }, [catalog, installed]);
+
+  function choiceLabel(m: string): string {
+    const entry = catalog.find((c) => c.name === m);
+    const tags: string[] = [];
+    if (probe && m === probe.recommended.llm) tags.push("recommended");
+    if (installed.has(m)) tags.push("installed");
+    if (!entry || !entry.verified) tags.push("untested");
+    if (entry?.multimodal) tags.push("reads images");
+    return tags.length ? `${m}  (${tags.join(", ")})` : m;
+  }
+
+  // Nothing to pull: say "Start", not "Download & start".
+  const needsDownload = (assessment?.missing_models.length ?? 1) > 0;
 
   // Ask the backend how risky the current pick is on this machine.
   useEffect(() => {
@@ -135,14 +177,22 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
     try {
       setPhase("pulling");
       await setModelPlan(chosenPlan);
-      await ensureModels(
-        [chosenPlan.llm, chosenPlan.vision, chosenPlan.embed],
-        (p) =>
-          setPullLines((prev) => ({
-            ...prev,
-            [p.model]:
-              p.percentage != null ? `${p.message} (${p.percentage}%)` : p.message,
-          })),
+      // vision is "" when the profile expects no photos, and equals llm when the
+      // resident model is multimodal — pull each real model once.
+      const needed = [...new Set([chosenPlan.llm, chosenPlan.vision, chosenPlan.embed])].filter(
+        Boolean,
+      );
+      const onPull = (p: ModelProgress) =>
+        setPullLines((prev) => ({
+          ...prev,
+          [p.model]: p.percentage != null ? `${p.message} (${p.percentage}%)` : p.message,
+        }));
+      await ensureModels(needed, onPull);
+      // OCR / speech-to-text weights aren't Ollama models. Without them an
+      // attached invoice photo went unread on a fresh machine. A failure here
+      // only disables that tool, so it must never block startup.
+      await ensureToolModels(onPull).catch((e) =>
+        logger.warn("bootstrap: tool models not installed", { error: String(e) }),
       );
       setPhase("warming");
       await warmModel();
@@ -159,8 +209,19 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
 
   return (
     <div className="bootstrap">
-      <h1>Sovereign AI Workbench</h1>
-      <p className="bootstrap-sub">Offline setup</p>
+      <h1>TrustCore AI</h1>
+      <p className="bootstrap-sub">Sovereign AI Agentic Workbench · Offline setup</p>
+      <p className="muted small profile-line">
+        Profile: {profileSummary(profile)}{" "}
+        <button
+          type="button"
+          className="link-btn"
+          onClick={onChangeProfile}
+          disabled={phase === "pulling" || phase === "warming"}
+        >
+          Change profile
+        </button>
+      </p>
 
       {phase === "checking-ollama" && <p>Checking for Ollama…</p>}
 
@@ -206,13 +267,46 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
               </b>
             </li>
             <li>
-              <span>CUDA</span>
-              <b>{probe.hardware.cuda_available ? "yes" : "no"}</b>
+              <span>Runs on</span>
+              <b>
+                {{ cpu: "CPU", cuda: "NVIDIA GPU (CUDA)", rocm: "AMD GPU (ROCm)", metal: "Apple GPU (Metal)" }[
+                  probe.hardware.backend
+                ]}
+                <span className="muted small">
+                  {" "}
+                  · {probe.hardware.os}
+                  {probe.hardware.backend === "cpu" && !probe.hardware.avx2 ? " · no AVX2" : ""}
+                </span>
+              </b>
             </li>
           </ul>
 
-          <h3>Model tier</h3>
+          <h3>Recommended for you</h3>
           <p className="muted">{probe.recommended.tier_label}</p>
+          <ul className="reasons">
+            {probe.reasons.map((r, i) => (
+              <li key={i}>{r}</li>
+            ))}
+          </ul>
+          {phase === "choose" && (probe.faster || probe.smarter) && (
+            <div className="alternatives">
+              {probe.faster && (
+                <button type="button" className="secondary" onClick={() => setLlm(probe.faster!)}>
+                  Faster: {probe.faster}
+                </button>
+              )}
+              {probe.smarter && (
+                <button type="button" className="secondary" onClick={() => setLlm(probe.smarter!)}>
+                  Smarter (slower): {probe.smarter}
+                </button>
+              )}
+              {llm !== probe.recommended.llm && (
+                <button type="button" className="link-btn" onClick={() => setLlm(probe.recommended.llm)}>
+                  back to recommended
+                </button>
+              )}
+            </div>
+          )}
           <label className="field">
             Resident LLM
             <select
@@ -220,20 +314,34 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
               disabled={phase !== "choose"}
               onChange={(e) => setLlm(e.currentTarget.value)}
             >
-              {LLM_CHOICES.map((m) => (
+              {choices.map((m) => (
                 <option key={m} value={m}>
-                  {m}
-                  {m === probe.recommended.llm ? "  (recommended)" : ""}
+                  {choiceLabel(m)}
                 </option>
               ))}
             </select>
           </label>
           <p className="muted small">
-            vision: {probe.recommended.vision} · embeddings: {probe.recommended.embed}
+            vision:{" "}
+            {!chosenPlan?.vision
+              ? "none (no photos in profile)"
+              : chosenPlan.vision === llm
+                ? "built into the resident model"
+                : chosenPlan.vision}{" "}
+            · embeddings: {probe.recommended.embed}
             {assessment != null
-              ? ` · ~${assessment.approx_download_gb.toFixed(1)} GB download`
+              ? needsDownload
+                ? ` · ~${assessment.approx_download_gb.toFixed(1)} GB to download (${assessment.missing_models.join(", ")})`
+                : " · all models already installed — nothing to download"
               : ""}
           </p>
+          {probe.legacy_system_models && needsDownload && (
+            <p className="muted small">
+              Models from an earlier system-wide Ollama install were found, but this
+              app runs its own per-user Ollama (no admin password) and cannot read
+              them, so the ones listed above will be downloaded again.
+            </p>
+          )}
 
           {assessment != null && assessment.warnings.length > 0 && (
             <ul
@@ -257,7 +365,11 @@ export function BootstrapGate({ onReady }: { onReady: (plan: ModelPlan) => void 
                   : undefined
               }
             >
-              {blocked ? "Model too large for this machine" : "Download & start"}
+              {blocked
+                ? "Model too large for this machine"
+                : needsDownload
+                  ? "Download & start"
+                  : "Start"}
             </button>
           )}
 

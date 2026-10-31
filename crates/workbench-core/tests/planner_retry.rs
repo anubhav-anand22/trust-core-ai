@@ -1,7 +1,7 @@
 //! Phase 1 gate: the planner retries a rejected plan at most twice. If it still
 //! has no valid plan it builds a deterministic fallback (Stage 3) rather than
-//! dead-ending — and only parks for the user if even that fallback is empty
-//! (nothing to extract, no knowledge to fetch). A valid plan on the last allowed
+//! dead-ending — and only parks for the user if even that fallback cannot run
+//! (e.g. an attachment missing from disk). A valid plan on the last allowed
 //! attempt is still accepted.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -98,17 +98,45 @@ async fn exhausted_planner_falls_back_instead_of_parking() {
     );
 }
 
-/// The genuine dead end: nothing attached and no knowledge needed, so even the
-/// deterministic fallback is empty. Only then does it park.
+/// Nothing attached, no knowledge needed, no history — "hi" on a fresh chat.
+/// This used to be treated as the one genuine dead end (the fallback came back
+/// empty and the turn parked). With `answer_directly` it answers instead.
 #[tokio::test]
-async fn truly_empty_fallback_still_parks() {
+async fn bare_first_message_falls_back_to_answer_directly() {
     let src = AlwaysInvalid {
         build_calls: AtomicU32::new(0),
         needs_knowledge: false,
     };
     let sink = VecSink::new();
 
-    let (_intent, outcome) = plan_turn(&src, "chat with no inputs", &[], "", false, &sink)
+    let (_intent, outcome) = plan_turn(&src, "hi", &[], "", false, &sink).await.unwrap();
+
+    match outcome {
+        PlanOutcome::Ready(plan) => {
+            assert_eq!(plan.steps.len(), 1, "{plan:?}");
+            assert_eq!(plan.steps[0].task, "answer_directly");
+        }
+        other => panic!("expected an answer_directly fallback, got {other:?}"),
+    }
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), MAX_PLAN_ATTEMPTS);
+}
+
+/// The park path still exists for a fallback that genuinely cannot run: an
+/// attachment that vanished from disk between upload and planning.
+#[tokio::test]
+async fn fallback_that_cannot_run_still_parks() {
+    let src = AlwaysInvalid {
+        build_calls: AtomicU32::new(0),
+        needs_knowledge: false,
+    };
+    let sink = VecSink::new();
+    let gone = vec![InputFile {
+        path: "/definitely/not/here/report.pdf".into(),
+        kind: FileKind::Pdf,
+        original_name: "report.pdf".into(),
+    }];
+
+    let (_intent, outcome) = plan_turn(&src, "read this", &gone, "", false, &sink)
         .await
         .unwrap();
 
@@ -118,7 +146,6 @@ async fn truly_empty_fallback_still_parks() {
         }
         other => panic!("expected AwaitingUser, got {other:?}"),
     }
-    assert_eq!(src.build_calls.load(Ordering::SeqCst), MAX_PLAN_ATTEMPTS);
     assert_eq!(
         sink.stages().last().map(String::as_str),
         Some("awaiting_user"),

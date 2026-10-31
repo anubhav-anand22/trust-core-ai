@@ -4,6 +4,7 @@
 //! * [`PersistentMemory`] — user-level history. AES-256-GCM at rest, machine-derived key.
 
 pub mod persistent;
+pub mod proposals;
 pub mod session;
 
 pub use persistent::PersistentMemory;

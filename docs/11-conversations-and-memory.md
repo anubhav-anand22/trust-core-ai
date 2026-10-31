@@ -11,13 +11,15 @@ stored, how a follow-up is answered, and where the two tiers of memory live.
  ─────────────────            ────────────────────────
  sessions/<id>.json           persistent_memory.json
  plain JSON                   AES-256-GCM, machine-derived key
- the transcript + a bounded   a compressed digest + (Stage 5)
- model-context summary        confirmed facts
+ the transcript + a bounded   ONLY facts the user clicked
+ model-context summary        "Remember" on
 ```
 
 `SessionContext` (`crates/workbench-core/src/memory/session.rs`) is one file per
-chat. `PersistentMemory` (`persistent.rs`) is one encrypted file for the user,
-folded in after every turn and on `end_session`.
+chat. `PersistentMemory` (`persistent.rs`) is one encrypted file for the user. It
+is written **only** through `confirm_memory` / `forget_memory` — never
+automatically. (Until 2026-10-10 a per-turn digest was folded into it
+automatically, which is what leaked one chat into another; see below.)
 
 ## A session file
 
@@ -103,12 +105,15 @@ run_turn
   ├─ screen_uploads            drop unsupported types, warn
   ├─ SessionContext::load_or_new(sessions/<id>.json)     ← loaded up front now
   ├─ plan_turn(prompt, uploads, history, has_history)    ← role A + role B see history
-  │     └─ retries exhausted → deterministic fallback (never a dead end)
+  │     └─ retries exhausted → deterministic fallback (never a dead end;
+  │        a bare "hi" gets `answer_directly`)
   ├─ execute_plan(..., session_blob)                     ← answer_followup can read it
   ├─ assert_sane
   ├─ compile_report(prompt, results, session.context_blob(), facility.context_blob())
-  └─ session.record_turn(exchange, turn)                 ← full Exchange + bounded summary
-        └─ persist_long_term(session)                    ← encrypted digest, every turn
+  │     └─ report.memory_proposals, minus facts already confirmed
+  └─ session.record_turn(exchange, turn)                 ← full Exchange (ts stamped) + bounded summary
+
+   (separately, on a click)  confirm_memory / forget_memory → persistent_memory.json
 ```
 
 ## Reading the log
@@ -121,10 +126,31 @@ run_turn
 | `session deleted` / `migrated legacy session_context.json` | session-management events |
 | `session compression failed; keeping raw digest` | the summariser call failed; the raw digest is kept rather than lost |
 
-## Persistent memory today
+## Persistent memory: propose → you confirm (built 2026-10-10)
 
-`persist_long_term` still only writes `history_digest` (a rolling prose summary),
-and `facility_metadata` / `recurrent_tags` are structurally present but unwritten.
-Turning those into a visible "what we remember about you" panel — with
-**propose → you confirm** so a small model's mistake never becomes a permanent
-fact — is Stage 5, not yet built.
+1. **Propose.** Role C's report schema has an optional `memory_proposals:
+   [{key, value}]`. The prompt asks for at most three durable facility facts
+   (plant, unit, equipment tag, governing standard) *stated in the request or
+   evidence*. It rides on the report call that already happens, so there's no extra
+   model call. Facts already stored are filtered out before `Done`.
+2. **Confirm.** The report shows *Remember / Dismiss*. Remember calls
+   `confirm_memory`, which writes `facility_metadata` through the same AES-GCM
+   `persist` (keys normalised to lowercase). Dismiss stores nothing.
+3. **Use.** Every later turn, in every chat, gives role C the confirmed facts as
+   `FACILITY MEMORY`. That sharing is the point, and it's safe now because nothing
+   arrives automatically.
+4. **Forget.** The audit sidebar lists remembered facts, each with a × that
+   calls `forget_memory`.
+
+Why it's built this way: a small model's guess should never become a permanent
+fact, and one chat's conversation should never become another's background. The
+old automatic digest broke both. `history_digest` is still on the struct as
+`#[serde(default, skip_serializing)]`, so an old file still decrypts, but the
+digest is never prompted with and never written back. `recurrent_tags` is still
+unwritten.
+
+| Log line | Says |
+|---|---|
+| `user confirmed a memory fact key=…` / `memory fact confirmed by user` | a fact was stored |
+| `user forgot a memory fact` / `memory fact forgotten by user` | a fact was removed |
+| `compiler returned bad JSON` | if this appears more often than before, the extra schema field is hurting a small model |

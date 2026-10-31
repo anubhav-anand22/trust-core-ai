@@ -8,6 +8,7 @@
 //! resident model.
 
 use crate::engine::schemas::{TaskStep, ToolResult};
+use crate::engine::ollama_engine::LiveOutput;
 use crate::tools::{Tool, ToolContext};
 use crate::Result;
 
@@ -37,7 +38,12 @@ impl Tool for AnswerFollowupTool {
                            guessing.";
         match ctx
             .engine
-            .analyze(instruction, ctx.session_blob, ctx.prompt)
+            .analyze(
+                instruction,
+                ctx.session_blob,
+                ctx.prompt,
+                Some(LiveOutput { sink: ctx.sink, tool: self.name() }),
+            )
             .await
         {
             Ok(text) => Ok(ToolResult {
@@ -49,6 +55,41 @@ impl Tool for AnswerFollowupTool {
                 warning: None,
                 elapsed_ms: started.elapsed().as_millis(),
             }),
+            Err(e) => Ok(ToolResult::failure(
+                &step.id,
+                self.name(),
+                e.to_string(),
+                started.elapsed().as_millis(),
+            )),
+        }
+    }
+}
+
+/// `answer_directly` — a request with nothing to read: no files, no knowledge
+/// base, no earlier turn. The sibling of [`AnswerFollowupTool`] for a fresh chat;
+/// without it a plain "hi" had no valid plan at all.
+pub struct AnswerDirectlyTool;
+
+#[async_trait::async_trait]
+impl Tool for AnswerDirectlyTool {
+    fn name(&self) -> &'static str {
+        "answer_directly"
+    }
+
+    async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
+        let started = std::time::Instant::now();
+        let live = LiveOutput { sink: ctx.sink, tool: self.name() };
+        match ctx.engine.respond(ctx.prompt, Some(live)).await {
+            Ok(text) => Ok(ToolResult {
+                step_id: step.id.clone(),
+                task: self.name().into(),
+                ok: true,
+                data: serde_json::json!({ "text": text, "source": "direct" }),
+                error: None,
+                warning: None,
+                elapsed_ms: started.elapsed().as_millis(),
+            }),
+            Err(crate::CoreError::Cancelled) => Err(crate::CoreError::Cancelled),
             Err(e) => Ok(ToolResult::failure(
                 &step.id,
                 self.name(),

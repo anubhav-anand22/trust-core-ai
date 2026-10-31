@@ -14,6 +14,13 @@ export interface HardwareInfo {
   gpu_name: string;
   vram_gb: number | null;
   cuda_available: boolean;
+  /** The inference backend Ollama will use. `metal` = Apple Silicon unified memory. */
+  backend: "cpu" | "cuda" | "rocm" | "metal";
+  os: string;
+  arch: string;
+  /** Without AVX2, CPU inference is several times slower per core. */
+  avx2: boolean;
+  avx512: boolean;
 }
 
 // workbench_core::bootstrap::models::LlmAssessment — the override risk check.
@@ -21,8 +28,22 @@ export interface LlmAssessment {
   model: string;
   approx_ram_gb: number;
   approx_download_gb: number;
+  /** Which of (resident, vision, embed) still need pulling. Empty = no download. */
+  missing_models: string[];
+  /** Vision model that goes with this choice: "" = none, or the model itself if multimodal. */
+  vision: string;
   severity: "ok" | "caution" | "blocked";
   warnings: string[];
+}
+
+// src-tauri bootstrap::profile::UserProfile — answers from the first screen.
+// Empty string / empty list = "Not sure".
+export interface UserProfile {
+  industry: string;
+  work: string[];
+  inputs: string[];
+  priority: string;
+  language: string;
 }
 
 export interface ModelPlan {
@@ -34,10 +55,29 @@ export interface ModelPlan {
   num_ctx: number;
 }
 
+export interface CatalogEntry {
+  name: string;
+  /** Proven to drive this app's structured-JSON pipeline. Unverified = pickable, never recommended. */
+  verified: boolean;
+  multimodal: boolean;
+  download_gb: number;
+}
+
 export interface SystemProbe {
   hardware: HardwareInfo;
   recommended: ModelPlan;
   assessment: LlmAssessment;
+  /** Why this model, one plain-language line each. */
+  reasons: string[];
+  /** Next smaller model that fits (snappier), and next more capable one (slower). */
+  faster: string | null;
+  smarter: string | null;
+  /** Dropdown options, straight from the backend catalogue. */
+  catalog: CatalogEntry[];
+  /** Local tags with Ollama's implicit `:latest` stripped — compare with `===`. */
+  installed_models: string[];
+  /** Linux: an old system-wide Ollama's models exist but this app can't see them. */
+  legacy_system_models: boolean;
 }
 
 export interface ModelProgress {
@@ -74,7 +114,11 @@ export type StepEvent =
   | { stage: "quality_check"; passed: boolean }
   | { stage: "synthesizing" }
   | { stage: "done"; report_json: string }
-  | { stage: "error"; message: string };
+  | { stage: "error"; message: string }
+  /** Partial output of a prose model call. `text` is the FULL text so far (not a
+   *  delta), so a dropped or repeated message can't garble the display. Never
+   *  stored in the `events` list — see App.tsx `liveText`. */
+  | { stage: "streaming"; tool: string; text: string };
 
 export type StepStage = StepEvent["stage"];
 
@@ -104,12 +148,22 @@ export interface SessionMeta {
 }
 
 // workbench_core::engine::schemas::FinalReport
+// workbench_core::engine::schemas::MemoryFact — one confirmed (or proposed)
+// cross-chat fact, e.g. { key: "plant", value: "MRPL Phase-3" }.
+export interface MemoryFact {
+  key: string;
+  value: string;
+}
+
 export interface FinalReport {
   summary: string;
   findings: string[];
   citations: string[];
   safety_notes: string[];
   degraded: boolean;
+  /** Facts the model suggests remembering across chats. Absent on reports saved
+   *  before this field existed. Nothing is stored until the user confirms. */
+  memory_proposals?: MemoryFact[];
 }
 
 // workbench_core::engine::schemas::Plan (for the HITL editor)

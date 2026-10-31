@@ -567,12 +567,862 @@ sat behind two others (keep the whole transcript, show the planner the history)
 that only became visible once the first was done. A feature that "does not work"
 often has a stack of causes, and you find the second only after fixing the first.
 
+## Post-demo — part 5: one input, three identical answers
+
+One file, one prompt, **three identical report cards** on screen. The obvious
+suspects — the model looping, the pipeline running three times, a stale event
+listener — were all wrong. Worth writing down because the triage order is the
+lesson, not the fix.
+
+### Ruling out the backend first
+
+The answer can only reach the screen through paths you can enumerate, so
+enumerate them:
+
+| Checked | Finding |
+|---|---|
+| `StepEvent::Done` construction sites | exactly one, `pipeline.rs:287` |
+| the command's return value | `submit_turn` returns `Ok(())` and drops the report — not a second path |
+| global events / multi-window fan-out | none. No `app.emit`, no `emit_all`, no `listen` anywhere: the transport is a `tauri::ipc::Channel` built fresh per invoke |
+| model-call loops | the planner's ≤3 retries re-roll the **plan**, never the answer; the compiler's retry returns on first success; deep-read's per-window calls reduce to one `ToolResult` |
+| the executor | one `ToolResult` per step, no step re-runs |
+
+Ten minutes of grep, and three quarters of the search space is gone. The `3` in
+`MAX_PLAN_ATTEMPTS` is a **coincidence** with the symptom — the kind of
+coincidence that sends you down a two-hour dead end if you start from a hunch
+instead of from the delivery paths.
+
+### Cause 1 — a side effect inside a state updater
+
+```tsx
+setReport((r) => {
+  if (r) setTranscript((prev) => [...prev, { … , report: r }]);
+  return r;                       // ← setTranscript ran as a side effect
+});
+```
+
+React treats the function you hand to a set-function as **pure** and is free to
+call it more than once. `<React.StrictMode>` double-invokes it *on purpose*, in
+dev, to make exactly this kind of impurity visible. Each invocation queued its
+own `setTranscript(prev => [...prev, x])`, and every queued append is applied —
+so one turn landed in the transcript more than once.
+
+It was written that way for an understandable reason: `run()` has no local handle
+on the report, which arrives asynchronously on the channel callback. Reaching for
+it through `setReport` was the path of least resistance. The right way to carry a
+value out of an async callback is a **ref** — `liveReport`.
+
+> **Rule:** an updater passed to `setState` may read `prev` and return a new
+> value. Nothing else. No `setOther(...)`, no logging, no fetch.
+
+### Cause 2 — the live pane was never retired
+
+`clearLive()` only ran at the *start of the next* turn. When a turn finished,
+`busy` went false but `events` was still full, so `showLive` stayed true and the
+live block drew the same prompt bubble and the same `ReportView` one more time,
+on top of the transcript copies. Transcript copies + one live copy = three.
+
+The underlying design error is **two places rendering one thing with no rule
+about which owns it**. `commitTurn` now *moves* the result: appends to the
+transcript, then clears `report` and `livePrompt`.
+
+### The trap in the obvious fix
+
+"Clear the live state on commit" is a one-liner that breaks two things:
+
+- `clearLive()` also clears `hitl`, and `commitTurn` runs after **every** turn —
+  including one the planner parked. Calling it there closes the HITL modal the
+  instant it opens. So `commitTurn` clears fields explicitly and guards on
+  `if (finished)`, which is null on a parked turn.
+- Clearing `events` blanks the **audit sidebar**, whose timings table is derived
+  from them, exactly when the user wants to read it. So `events` survives the
+  commit and a separate `turnCommitted` flag retires the live block instead.
+
+Both were caught by asking "who else reads this state?" before deleting it —
+cheaper than finding out from a demo.
+
+### Not a testing bug
+
+Tempting conclusion: "StrictMode caused it, turn StrictMode off." Wrong twice
+over. StrictMode is a dev-only harness that *revealed* the impurity; cause 2 is
+unconditional, so a production build would still have shown **two** cards. It
+stays on.
+
+### Smaller fixes in the same pass
+
+- **A real in-flight guard.** `PromptPanel.submit()` guarded on the `busy`
+  *prop*, which the parent sets asynchronously — a double-click on Run, or
+  Ctrl+Enter twice, both read the stale `busy === false` and fired two genuine
+  `submit_turn` invokes. That is two pipeline runs and two exchanges on disk, not
+  a render artifact. `run()`/`resume()` now hold an `inFlight` ref, which updates
+  synchronously.
+- **`installGlobalErrorLogging` is idempotent.** It added `window` listeners with
+  no cleanup and no guard, so StrictMode registered them twice and every uncaught
+  error was logged twice — actively misleading when the log is the debugging tool.
+
+### Deliberately not done
+
+- **Stable ids on `Exchange`.** Index keys neither cause nor mask this bug: an
+  append-only list that is never reordered renders correctly with them, and
+  `Exchange` mirrors the Rust struct.
+- **A frontend test runner.** There is no vitest/RTL in `package.json`, so none
+  of this is pinned by an automated test yet, and `workbench-core/tests/` has no
+  assertion that a turn emits exactly one `done`. Both are worth doing; both are
+  bigger than this fix.
+
+### Takeaway
+
+Three identical outputs from one input feels like a duplication bug and is
+usually a **rendering** bug. Count the delivery paths in the backend before
+theorising about the model: if there is provably one emit site, one channel and
+one return value, the duplication is downstream and nothing about the model or
+the prompt can explain it. Then look for state that two components render with
+no rule about which owns it.
+
+## Post-demo — part 6: input reset, and a dropdown nobody could read
+
+Two UX fixes from the same demo session. Both small; both worth writing down
+because each has a non-obvious constraint behind it.
+
+### The prompt box did not empty itself
+
+After a turn delivered its answer, the prompt text and the attached files stayed
+in the panel. Asking a follow-up meant manually clearing both first, every time.
+
+The fix is a `resetToken` counter that `App` bumps and `PromptPanel` watches.
+The interesting part is **what it is not keyed on**. The obvious trigger is
+`busy` going false — and it is wrong, because `busy` also goes false when a turn
+**fails** or **parks in the HITL modal**. Clearing there would throw away the
+user's prompt and attachments at the exact moment they need them to retry. So the
+counter is bumped in one place only: inside `commitTurn`'s `if (finished)` block,
+which runs only when a report was actually delivered.
+
+Two details that bite:
+
+- **The hidden `<input type="file">` keeps its own value.** Clearing the React
+  `files` state is not enough — without `inputRef.current.value = ""`, picking the
+  *same* file again fires no `change` event and the attachment silently never
+  comes back.
+- **The `deep` toggle deliberately survives the reset.** It reads as a session
+  preference, not per-question input.
+
+### The model dropdown was a bright white slab
+
+On the hardware screen, opening the *Resident LLM* dropdown produced a glaring
+white popup in an otherwise dark app — and the option text was nearly invisible.
+
+The cause is not a missing `background` rule. The **popup list is drawn by the
+OS**, not by page CSS, and the webview renders native widgets in **light** mode
+unless the page declares otherwise. The closed control looked fine because CSS
+styles it directly (`background: var(--panel-2); color: var(--text)`); the moment
+it opened, that near-white `--text` was painted onto the OS's white popup.
+
+The fix is one line — `color-scheme: dark` on `:root` — which tells the engine to
+render *all* native UI dark. It also darkens scrollbars and the checkbox app-wide,
+which were quietly light for the same reason. Explicit `select option` colours and
+focus/disabled states were added alongside, so the contrast is deliberate rather
+than inherited by accident.
+
+### Takeaway
+
+A colour that "will not apply" is often a control the page does not actually
+paint. Before adding more `background` rules, ask whether the pixels belong to
+the OS — `color-scheme` is the lever for that whole category, and it fixes
+scrollbars, checkboxes and date pickers at the same time.
+
+## Post-demo — part 7: the dead gutter, and a shell that owns the viewport
+
+"The chat should be full screen, there is unused space on the right." One line
+caused it:
+
+```css
+.wb-left { flex: 1; padding: 20px; overflow: auto; max-width: 860px; }
+```
+
+`.wb-left` sits in a flex row between a 232px session rail and a 320px audit
+rail. Capped at 860px, the three add up to 1412px — so on a 1920px monitor about
+500px had nowhere to go and rendered as a dead gutter between the transcript and
+the audit panel. The cap was there for a good reason (line length), but it was
+applied to the **container** rather than to the **text**.
+
+### The shape it became
+
+- **`.wb-left` fills the row**, and the two rails take a share of the extra width
+  with `clamp()` — an ultrawide now widens all three columns instead of dumping
+  everything into the middle one.
+- **Prose keeps its measure in `ch`, not the panel.** `.bubble-user` is
+  `min(90%, 88ch)`, `.report-summary` is `96ch`. Panels go full-bleed; lines
+  stay readable. This is the distinction the original cap missed.
+- **`height: 100vh` instead of `min-height`.** The shell owns the viewport and
+  the panes scroll inside it. With `min-height` the whole *page* scrolled, which
+  is why a long transcript could push the prompt box off-screen entirely.
+- **The transcript scrolls; the prompt panel is pinned** with a rule above it.
+  That single change is most of what makes it read as an app rather than a
+  document.
+- **The report uses the width.** Its sections flow into
+  `repeat(auto-fit, minmax(320px, 1fr))` — three columns at 1920px, two at
+  1366px, one on a narrow window. No media query, no JSX change.
+
+### Following the output
+
+Making the transcript its own scroll container created a new obligation: new
+output no longer scrolls into view by itself. Naive auto-scroll is worse than
+none, because it yanks you back to the bottom while you are reading an earlier
+answer. The fix is a `stickToBottom` ref updated from the **scroll handler**, not
+measured inside the effect — by the time the effect runs the new content is
+already in the DOM, so "was the user at the bottom *before* this?" can no longer
+be answered.
+
+### Verifying a layout without running the app
+
+The GUI needs Ollama and a multi-minute turn, which is a poor loop for CSS. So
+the layout was checked against a static harness — the **real `App.css`** plus the
+real DOM structure with fixture content — screenshotted with Playwright at 1920
+and 1366, asserting the numbers that matter:
+
+```
+wide    gap=0px overflow=0px cols=362px 362px 362px
+narrow  gap=0px overflow=0px cols=350px 350px
+```
+
+`gap` is the distance between `.wb-left`'s right edge and `.audit`'s left edge —
+the dead gutter, now zero. `overflow` is page scroll height beyond the viewport —
+zero means the shell really does own the viewport.
+
+That harness also caught an edge case reasoning alone got wrong. A degraded
+report has only one section, and `auto-fit` was expected to stretch it across the
+whole panel. It does not: `.report-head` and `.report-summary` are
+`grid-column: 1 / -1`, so every track is spanned and none is empty for `auto-fit`
+to collapse. The single section stays in one track, correctly.
+
+> One harness artifact worth knowing about: `.bubble` is `white-space: pre-wrap`,
+> so HTML indentation inside the bubble renders as real whitespace and the bubble
+> looks too tall. React passes a single text node and has no such problem. Do not
+> "fix" that one.
+
+### Takeaway
+
+A max-width on a flex child in a three-column shell does not centre anything — it
+leaves a hole. Constrain the **text**, let the **container** fill. And a static
+harness over the real stylesheet is a cheap way to check a layout when the real
+app costs minutes per look.
+
+## Post-demo — part 8: the cross-session leak
+
+Reported from testing: "memory data leaking from different sessions to each
+other." True, and structural rather than a slip in one call site.
+
+### The shape of the leak
+
+`PersistentMemory` (`memory/persistent.rs`) is **one file**,
+`persistent_memory.json`, encrypted with a key derived from the machine —
+not from a session id, not from a user id. Nothing scopes it. Every turn, in
+every chat, did this:
+
+```rust
+// pipeline.rs, run_from_plan — BEFORE this fix
+let facility = PersistentMemory::load(&config.persistent_path());
+...
+&facility.context_blob(),   // → role C's prompt, "long-term facility memory"
+```
+
+and `persist_long_term`, called after **every** turn and on `end_session`,
+folded whichever session had just run into that same single file:
+
+```rust
+let digest = if !session.rolling_summary.is_empty() {
+    session.rolling_summary.clone()
+} else { /* … joined turn summaries … */ };
+memory.history_digest = digest;   // overwrites the ONE global digest
+```
+
+So: ask something in chat A, its digest lands in `persistent_memory.json`. Open
+an unrelated chat B and ask anything — role C loads that same file and receives
+chat A's digest as `HISTORY: …` in its own prompt. Two conversations that never
+should have met.
+
+This is a **different mechanism** from `SessionContext`
+(`sessions/<id>.json`) — that one *is* keyed by session id and was correctly
+scoped from Stage 4 onward (see part 4 / docs 11). It is worth being precise
+about which "memory" leaked, because the fix must not touch the one that
+wasn't broken: a follow-up question inside one chat still needs its own
+history, and does not lose it here.
+
+### The temporary fix
+
+A single `const GLOBAL_MEMORY_ENABLED: bool = false;` in `pipeline.rs`, gating
+both the read and the write:
+
+- the read site now passes `facility_context = String::new()` to `compiler::compile`
+  when disabled — `ollama_engine.rs`'s prompt already renders an empty string as
+  `(none)`, so no prompt-side special-casing was needed;
+- `persist_long_term` returns immediately when disabled, at the top of the
+  function — the **one** function both `pipeline.rs`'s own call and
+  `src-tauri`'s `end_session` command go through, so neither call site can be
+  re-enabled without the other by accident.
+
+Nothing on disk is deleted. An existing `persistent_memory.json` from before
+this flag simply stops being read while the flag is `false` — inert, not
+wiped, in case there is ever a reason to look at what accumulated. Delete it
+by hand if you want a clean slate; it will be recreated empty next time the
+flag is flipped back on.
+
+### Why this is temporary, and what the real fix is
+
+Disabling the file stops the leak but also stops the thing it was *for* — a
+plant's equipment register or a recurring theme surviving across chats, which
+is a real blueprint requirement (`facility_metadata`, `recurrent_tags`; see
+known problem 9 in the README, "persistent memory is still not visible"). The
+actual fix is scoping: either key `PersistentMemory` by something narrower
+than "the machine" (a user profile the app already has an id for), or make
+cross-session memory an explicit **propose → user confirms** step before
+anything crosses a session boundary, rather than an automatic digest fold.
+Either is a bigger design decision than a bug-severity fix warrants on its
+own — hence the flag, not a rewrite.
+
+### Takeaway
+
+"Which store is this?" is the first question, not "where's the bug." Two
+memory tiers existed on purpose (session-scoped, user-scoped) and only one of
+them was actually scoped — the fix is disabling exactly that one, and the
+five extra minutes spent confirming `SessionContext` was unaffected is what
+kept a memory bug from turning into a "does the chat still remember anything"
+regression.
+
+## Post-demo — part 9: making the app pitch itself
+
+A jury walks up cold — no one from the team narrating over their shoulder. Two
+gaps stood out on a component read-through, both about the running app, not the
+README: an empty chat that gave no hint what a good question looks like, and a
+pipeline whose only on-screen explanation (the `Stepper`) is a temporary widget
+that is gone the instant a turn finishes.
+
+### Empty state: real prompts, not an invented demo
+
+The two example cards are not new copy — they are the exact prompts from
+walkthrough steps 2 and 3, against the exact fixtures in `demo/fixtures/`.
+Reusing already-verified strings instead of writing fresh ones means a card a
+judge clicks is guaranteed to be a path that has actually been run, not a
+plausible-looking sentence nobody tried.
+
+Clicking a card fills the prompt **text** only. It cannot also attach the file:
+the frontend has no filesystem capability (see part on conversations/memory —
+`load_session` etc. all go through a Tauri command for the same reason), so
+there is no way to turn a repo-relative path into a `File` object without one.
+The card's second line — `attach inspection.pdf + valve.png` — says explicitly
+what the one remaining manual step is, rather than leaving it to be guessed.
+
+### A permanent "how it works," not a temporary one
+
+The `Stepper` already narrates a turn stage by stage, but it is scoped to a
+single live turn and disappears the moment `commitTurn` fires (part 6). A judge
+who arrives, reads the empty state, and hasn't run anything yet — or who is
+looking at the audit rail after a turn already committed — never sees it.
+
+The new "How it works" list lives in `AuditSidebar` instead: that panel is open
+by default and never disappears, so it is the one static description of the
+pipeline a first-time viewer can read without running a turn or opening the
+README. It mirrors `run_turn`'s own doc comment in `pipeline.rs` almost verbatim
+— five stages, condensed from that comment's longer list (HITL and memory are
+implementation detail, not press-facing) — so the in-app description and the
+code it describes cannot quietly drift apart. The one stage worth a visual tag
+is "Validate plan → Rust, deterministic," since that is the concrete answer to
+"how do you keep a small model from hallucinating a bad plan," which is the
+project's actual technical claim over "just prompt an LLM and hope."
+
+### Small deliberate choices
+
+- **A numbered list, not a horizontal strip with arrows.** The audit rail's
+  width floor is 320px (`clamp(320px, 21vw, 420px)`, part 7); five chips in a
+  row would wrap unpredictably at that width. A vertical list degrades to
+  "still five readable rows" instead.
+- **The longer explanation is a `title` tooltip**, not inline text, so the
+  panel stays scannable at a glance and rewards a judge who hovers rather than
+  forcing everyone to read five sentences.
+- **Wired the same way `resetToken` already was** (part 6): a text value plus a
+  counter `PromptPanel` watches, bumped by the parent on every click — a click on
+  the *same* card twice still re-fills and refocuses, because the counter change
+  is what the effect keys on, not the text.
+
+### Takeaway
+
+"Self-explanatory" was being solved one layer too low last time — window title
+and a tagline fix the first five seconds, but a judge who then clicks around
+for two minutes needs the *app*, not the README, to keep explaining itself. The
+right home for that is whatever panel is already permanent, not whichever one
+happens to be easiest to add text to.
+
+## Hackathon fix pass — part 10: no admin password, and why renice never ran on Linux
+
+Two reports from the first Linux machine, which looked unrelated: installing
+"never asked for the admin password, it just sat there," and a first turn that
+**froze the whole desktop** for ~10 minutes on a 2-core i7-4600U.
+
+### One root cause
+
+On Linux, `ensure_ollama_installed` ran `curl -fsSL https://ollama.com/install.sh | sh`.
+That script installs system-wide and elevates itself with `sudo` — binary in
+`/usr/local/bin`, a dedicated **`ollama` system user**, a systemd service running
+as that user. Both symptoms fall out of that one fact:
+
+1. **The password prompt had nowhere to go.** `sudo` needs a terminal (or an
+   askpass helper). The app spawns the script as a plain child of a desktop
+   process with neither, so the elevation request didn't fail loudly — it just
+   never surfaced.
+2. **The anti-freeze guard silently did nothing.** `lower_ollama_priority()`
+   `renice`s every `ollama*` process so the window manager always wins a
+   contested core (problem 5). `renice` only works on processes **you own**; the
+   systemd-managed server belongs to `ollama`, so it failed with "Operation not
+   permitted" — swallowed by `.ok()`, logged at debug. On the standard Linux
+   install the one protection against a freeze never applied.
+
+Windows never showed either: `OllamaSetup.exe` installs per-user with no UAC
+prompt, and the server runs as you.
+
+### The fix (Linux only — Windows/macOS untouched)
+
+`ensure_ollama_installed_linux`: download the official release asset into
+`~/.local/share/trustcore-ai/ollama` and run `ollama serve` as the app's own
+detached child. No root anywhere, and since the process is yours, `renice` works.
+With no systemd unit to auto-start it, `is_ollama_installed` (which the bootstrap
+screen calls first on every launch) now restarts the server whenever it finds the
+binary but no listener — otherwise a reboot would leave "installed" reported
+while every model call failed. `is_ollama_installed` became `async` for that;
+the JS call site is unchanged because `invoke()` is always a promise.
+
+### The guess that was wrong
+
+The first draft downloaded `ollama.com/download/ollama-linux-amd64.tgz`. **404.**
+The GitHub releases API showed current releases ship `ollama-linux-amd64.tar.zst`
+— zstd, not gzip — so the URL became
+`github.com/ollama/ollama/releases/latest/download/ollama-linux-{arch}.tar.zst`
+and extraction `tar --zstd`. It was caught only because the download was actually
+run before anyone called it fixed.
+
+### Verified on the real machine
+
+Download (200, 1.4 GB, no sudo) → `tar --zstd` (layout `bin/ollama` +
+`lib/ollama/*.so`, including `libggml-cpu-haswell.so` for this CPU) → `ollama
+serve` bound `127.0.0.1:11434` in ~1 s → `ps` showed the server owned by the user
+→ `renice -n 5` succeeded (0→5) → idle 15 s at 0.3% CPU. Then through the real
+app: the bootstrap screen started the server itself in ~0.5 s.
+
+### Takeaway
+
+Two symptoms with one cause are common when the cause is "who owns this
+process." Before patching each, ask what both have in common. And a
+best-effort call whose error is swallowed (`renice … || .ok()`) can be a no-op
+in production for months — log *why* it did nothing, not just that it did.
+
+## Hackathon fix pass — part 11: "hi" parks the turn, and every timestamp is 0
+
+Two small bugs found by reading code, not by a report.
+
+### An empty fallback plan
+
+Part 4 added a deterministic fallback so an exhausted planner could never
+dead-end. `fallback_plan` builds one extraction step per attachment, plus a KB
+search if needed, plus analysis on top. For a message with **no attachments, no
+KB need and no history** — "hi" on a fresh chat — every branch was skipped and it
+returned `Plan { steps: [] }`. `validate_plan`'s very first rule rejects empty
+plans, so the fallback failed and the turn parked in the HITL modal: the one
+input a 0.5B model is most likely to fumble was the one the safety net didn't
+catch.
+
+There was no task that *could* answer it: `answer_followup` refuses an empty
+transcript, and analysis steps need evidence before them. The fix is a new
+`answer_directly` task — stage **Retrieve**, not Analyze, because the stage rules
+require every Analyze step to follow an evidence step and this one has none. It
+gets its own engine call (`OllamaEngine::respond`) because `analyze`'s system
+prompt forbids answering beyond the evidence, which with no evidence would have
+produced "the evidence does not say."
+
+An existing test, `truly_empty_fallback_still_parks`, **asserted** the park as the
+one legitimate dead end. It was written when no task could answer such a message,
+and it encoded exactly the behaviour being fixed — so it was rewritten, not
+deleted, and a new test keeps the park path covered for the case that genuinely
+can't run (an attachment missing from disk).
+
+A side effect worth stating plainly: that empty-plan case was the only practical
+way to reach the HITL modal from the GUI. See README problem 11.
+
+### `"ts": 0` on every saved turn
+
+`pipeline.rs` built each `Exchange` with `ts: 0, // filled in by record_turn
+from the clock`. `record_turn` used `exchange.ts` only to compute `updated_at`
+(`0.max(now)` — so the sidebar's sort looked right) and then pushed the exchange
+unchanged. Every turn ever saved had `"ts": 0`. Invisible because the UI never
+renders it, but visible to anyone opening the session file. Now `ts == 0` means
+"stamp it here."
+
+### Takeaway
+
+A comment that says code does something is a claim, not a fact — check it. And
+when a test fails after a fix, read what it *asserts* before "fixing" the test or
+the code: sometimes the test is the bug's specification.
+
+## Hackathon fix pass — part 12: memory, rebuilt as propose → you confirm
+
+Part 8 found the cross-session leak and switched cross-chat memory off. This is
+the real fix it pointed at.
+
+### What actually leaked
+
+Not "a shared file" — sharing across chats is what facility memory is *for* (the
+plant name and equipment tags you shouldn't have to repeat). The leak was the
+**automatic** copy: `persist_long_term` folded each chat's prose summary into the
+shared store after every turn, and every other chat read it as background.
+
+### The shape it became
+
+Only facts the user explicitly confirms ever cross a chat boundary.
+
+- **Proposing costs nothing extra.** `FinalReport` gained `memory_proposals:
+  Vec<MemoryFact>` (`#[serde(default)]`), and role C's prompt asks for at most
+  three facility facts *stated in the request or evidence* — on the report call
+  that already happens. No extra model call on a CPU where every call is minutes.
+- **Storing needs a click.** `confirm_memory` / `forget_memory` Tauri commands
+  write `facility_metadata` through the existing AES-GCM `persist`. The report
+  shows *Remember / Dismiss*; the audit sidebar lists what's remembered with ×.
+- **Deleted:** `GLOBAL_MEMORY_ENABLED`, `persist_long_term`, the `end_session`
+  command and its three frontend call sites (window close, new chat, switch).
+- **Old files migrate themselves.** `history_digest` stayed on the struct as
+  `#[serde(default, skip_serializing)]`: an old file still decrypts, the digest
+  is never read into a prompt and never written back, so the first confirm
+  cleans it. No migration code.
+- **No nagging.** Before `Done`, proposals already stored are dropped; in the UI,
+  a proposal matching a remembered fact is hidden, and Dismiss is per-view.
+
+### Risk
+
+A 0.5B model under structured output now has one more (optional) array to fill.
+If its JSON gets worse, the existing plain-text fallback catches it; the signal
+in the log is `compiler returned bad JSON`.
+
+### Takeaway
+
+When a stopgap disables a feature, write down what was actually wrong *with* it —
+here, "automatic," not "shared." That one word is the difference between a
+redesign and a one-line gate.
+
+## Hackathon fix pass — part 13: the bootstrap screen, tiers and installed models
+
+### Tier from total RAM, not available RAM
+
+`recommend_models` gated the CPU ladder on *available* RAM. That moved with
+whatever else was open, so the tier changed between launches — open a browser,
+lose a tier, and a judge relaunching sees a different model. The tier is a
+property of the machine; whether the model fits *right now* is a separate, live
+question. Now: tier from **total** RAM (thresholds 14 / 7 / 3.5 GiB, just under
+what "16 / 8 / 4 GB" laptops report), and `assess_llm` answers the live question
+— *blocked* only when the model can't fit in total RAM, *caution* ("close other
+apps") when it fits but not beside what's open.
+
+Why not total RAM for everything: the weights must stay resident during
+generation. "Fits on paper" with the rest swapped out means every token pages,
+and that is what a freeze feels like. The live caution keeps that visible
+without making the tier jumpy. On the dev laptop it changes nothing: 2 physical
+cores keep it on 0.5B however much RAM it has — a test now says so.
+
+### Installed models
+
+`ensure_models` already skipped models that were present. What was wrong was
+everything the user *saw*: a fixed dropdown with no installed marker, a download
+figure that counted all three models even when installed, and no sign of other
+local models. Now `probe_system` lists local tags; the figure counts only
+`missing_models`; the dropdown marks *(installed)* and appends local non-catalogue
+models as *(installed, untested)*; the button says **Start** when nothing will
+download. "Is it installed?" has one definition, `model_present`, used by the
+screen and the pull loop alike, so the two can't disagree. The frontend gets tags
+with `:latest` stripped and does exact matching only.
+
+Linux wrinkle from part 10: a per-user server can't read models an old
+system-wide install left under `/usr/share/ollama`. Reading them needs sudo — the
+thing part 10 removed — so the screen just explains why they'll re-download.
+
+## Hackathon fix pass — part 14: a Linux build machine from nothing
+
+The first Linux build machine had no compiler at all. Three things not in the
+README cost time:
+
+- **`protoc`.** `lance-encoding`'s build script compiles protobuf schemas and
+  fails with *Could not find `protoc`* after ~14 minutes of compiling everything
+  before it. Not optional; now in the prerequisites table.
+- **VS Code from the snap store.** The binary built fine and crashed on launch:
+  `symbol lookup error: /snap/core20/.../libpthread.so.0`. Snap VS Code exports
+  `GTK_PATH`, `GIO_MODULE_DIR`, `LOCPATH`… into every terminal it opens, so GTK
+  loaded modules linked against the snap's older glibc. Not our code — but it
+  looks exactly like ours is broken. The README gotcha has the `env -u …` line.
+- **`npm install` rewrites `package-lock.json`** on a different npm version
+  (dropped `libc` fields). Restored with `git checkout` rather than committed —
+  lockfile churn from tooling versions is merge noise for everyone else.
+
+Measured on the 2-core i7-4600U with `-j 1`: ~26 min for `cargo test -p
+workbench-core` from cold, +20 min for the Tauri crate, ~15 s incremental.
+
+## Feature pass — part 15: measure CPU time before cutting it
+
+README *Known problems* #1 had one number — "~8 min a turn, ~200 s per analysis
+step" — and no way to reproduce or decompose it. Every proposed speed-up
+(merge the two analysis steps, stream, drop moondream) attacks a *different*
+cost, so picking one without the split would be guess-and-patch.
+
+Ollama already returned the split on every response (`load_duration`,
+`prompt_eval_count/_duration`, `eval_count/_duration`); the engine read
+`.response` and dropped the rest. Now:
+
+- `CallTiming` (`engine/ollama_engine.rs`) — one per model call, recorded in
+  `record_timing` right after each guarded call (structured roles, analysis,
+  vision, respond, warm-up, session summary; embeddings wall-time only). Logged
+  at `info`, kept on the engine (`engine.timings()`), one engine per turn.
+- `pipeline.rs` — `turn phase: planning done` and `turn phases` lines.
+- `examples/e2e.rs` — prints a timing table at the end, even on failure. This is
+  the benchmark; doc 09 *Measuring before you optimise* has the command.
+
+What reading the code already suggests (to be confirmed by the table):
+`summarize` and `compare_to_sop` get the same dependencies, each re-embeds the
+whole evidence via `select_relevant` (with `keep_alive = 0`, a model reload each
+time) and each prefills ~half of `num_ctx`. That is the next change.
+
+`cargo test -p workbench-core -j 1` → **45/45** (one new unit test for the ns→ms
+breakdown). A real-model run with the table has **not** been done yet.
+
+## Feature pass — part 16: one analysis call instead of two
+
+`summarize` and `compare_to_sop` receive the same evidence. Each one ran
+`select_relevant` (embedding model loaded with `keep_alive = 0`, whole evidence
+embedded) and then prefilled ~half of `num_ctx` with the result. On a CPU that
+is two near-identical minutes, plus a second analysis text for role C to read.
+
+**The fold, not a new planner task.** `assess` (one call, both instructions) is
+registered as a tool but kept **out of `TASK_REGISTRY`**. The registry is
+printed into role B's prompt, so a new row costs prefill on *every* turn and
+gives a 0.5B planner one more name to misuse. Instead the planner keeps
+emitting the pair, and `planner::fold_analysis` rewrites it after validation.
+It is called once in `run_from_plan`, so fresh, resumed and force-resumed
+plans all go through it.
+
+Fold rules, checked by the FIX session in review before the code was final:
+- `assess` keeps the **later** step's id and slot. Every dependency of either
+  step sits before that slot; the earlier slot could precede the later step's
+  inputs.
+- Its `depends_on` is the union of both, minus the folded ids (planners often
+  write `compare_to_sop → summarize`; keeping that would be a dangling
+  self-reference).
+- Skipped entirely (two calls, as before) if some *other* step depends on an
+  analysis step, or if ids are duplicated (only possible on a force-resume,
+  which bypasses validation). Skipping just means two calls, as before, which
+  is safer than repointing.
+
+**Output budget.** One call now has the 640-token cap that each step used to
+have. Raising it would buy back the decode time the merge saves, so instead the
+instruction puts the **SOP check first**: if anything gets truncated, it is the
+findings, and role C can still read those off the raw extraction outputs. With
+no SOP passages it must say so rather than invent COMPLIANT/DEVIATION lines.
+
+User-visible: the stepper/audit list shows one `assess` step where it showed
+two, and saved `plan_summary`s read `… → assess`.
+
+`cargo test -p workbench-core -j 1` → **50/50** (five fold tests, plus `assess`
+in the no-evidence smoke test). **Not yet measured**: compare the `e2e` timing
+table on 2218be8 vs this. Watch `gen_tok` on the `analysis` row: sitting at
+640 means the cap is truncating.
+
+**Measured (2026-10-11, teammate's laptop, qwen2.5:1.5b, ~85 tok/s decode, so
+GPU-class, not the CPU target).** `103ddaf` vs `713c937`, same prompt and files:
+
+| | before (summarize + compare_to_sop) | after (assess) |
+|---|---|---|
+| analysis calls | 2 | 1 |
+| analysis wall | 7.7 + 7.2 = **14.9 s** | **5.2 s** |
+| prompt tokens read | 1842 + 1855 = 3697 | 1929 |
+| tokens generated | 582 + 484 = 1066 | 391 (cap 640: not truncated) |
+| role C prompt tokens | 3167 | 2487 |
+
+The evidence fitted the budget, so neither version re-embedded it: the
+embedding saving shows only on long documents. The two runs were made in the
+wrong order (after cold, before warm), so turn wall and `load_ms` are **not**
+comparable. The analysis rows are, since load ≈ 0 in both. **Open quality
+question:** one call wrote 391 tokens where the pair wrote 1066, and the report
+had 2 findings vs 5. One sample each and sampling noise is large, so this needs
+a few repeated warm runs per version before calling it a regression or not.
+
+**Repeated warm runs (3 per version, alternating, after one warm-up).** They
+answered the quality question and raised a bigger one.
+- *M's quality: not a regression.* Only one of the six runs drew the plan with
+  both analysis steps (after-2). Its `assess` wrote 380 tokens in 4.7 s, and
+  the report had 6 findings and the only non-empty `citations` of the six. The
+  earlier "2 findings vs 5" was sampling noise. "briefly" stays.
+- *The planner dominates everything.* Six runs, five different plans: the
+  photo was skipped in 3/6, the SOP search in 3/6, analysis in 2/6. One run
+  planned the PDF alone, with no analysis. Turn time ranged 6–25 s purely on
+  plan shape, and the 6 s runs gave the worst answers. The validator only
+  checks that a plan is *runnable*, not that it does what was asked: an
+  attachment no step reads is only a warning. Logged as B5.
+- `citations` empty in 5/6 (B3). Memory-proposal junk in 4/6 ("Not
+  Provided", "safety_note_1", "Unit-2 Pump P-101"); every one of those would
+  be dropped by the B4 screen.
+
+## Feature pass — part 17: watch the answer being written
+
+On a CPU an analysis step decodes for minutes while the UI shows "Executing:
+assess". Nothing is wrong, but it looks hung. Streaming changes when the user
+sees the text, not how long it takes: same request, same tokens.
+
+- **Backend (FEATURE).** `StepEvent::Streaming { tool, text }` carries the
+  *full* text so far, not a delta, so a dropped or repeated event can't garble
+  it. It is throttled to one event per ~300 ms, and the tail is always sent.
+  `OllamaEngine::generate_prose` serves `analyze()` and `respond()`. The whole
+  stream drain runs inside `guarded()`, so timeout and Stop still interrupt
+  mid-answer. The returned value is the `done` chunk with the full text, so the
+  part-15 timings are unchanged. The tool label matches the stepper's,
+  including `· deep read i/n`.
+- **Frontend (FIX).** `liveText` is kept *out of* `events`. In `events` it would
+  become the stepper's "current stage" and churn the activity list and audit
+  sidebar. The logger skips streaming events (otherwise one `ui_log` per chunk).
+  After a Stop the box stays, labelled as partial output.
+- **The trap.** `ollama-rs`'s `generate_stream` parses each network chunk on
+  its own and `filter_map(Result::ok)`s the result. A JSON line split across
+  two chunks is silently dropped: a missing token *in the answer*, possibly a
+  digit of a fee. The final chunk is the largest (it carries the `context`
+  array), so it is the likeliest to split, and losing it would also lose the
+  timings. So `generate_prose` reads the NDJSON itself with `reqwest` (the 0.12
+  `ollama-rs` already builds) and buffers to newlines. A `{"error":…}` line or
+  unparseable JSON is an error, never a skip. A test drives a fake Ollama on
+  localhost with a line split mid-JSON and slow chunks.
+- **Caught in review (FIX):** a stream that ends *without* a `done: true` line
+  (Ollama crashed or ran out of memory, the connection dropped) was returned
+  as a finished answer: half a sentence into role C, and no timings. Now it is
+  an error, like the one-shot call; a fake-server test closes the socket
+  mid-answer.
+- **Not streamed:** roles A/B/C. Their output is schema-constrained JSON.
+  Role C's liveness is a possible follow-up (e.g. a token counter).
+- **B1b (with this change):** `examples/e2e.rs` now calls `init_thread_pools`
+  with physical cores − 1 (via `sysinfo` as a dev-dependency, same 0.33 as the
+  host) and prints it. After B1 it would otherwise use a logical/2 guess, which
+  on a non-SMT CPU is far fewer threads than the app. e2e also stops printing
+  streaming events.
+
+`cargo test -p workbench-core -j 1` → **54/54** (split-line parsing, the
+fake-server tests for full text, throttle, tail, timings and a cut-off
+stream); FIX re-ran tauri-app 41/41 against the new signatures. The live
+streaming in the app is **untested** until a real turn runs.
+
+## Feature pass — part 18: a plan must cover what was asked
+
+The repeated warm runs (part 16) showed six identical turns producing five
+different plans: photo skipped 3/6, SOP search 3/6, analysis 2/6, and one
+plan was `parse_pdf` alone, giving a 6 s turn with a generic answer.
+`validate_plan` checks that a plan is *runnable*; nothing checked that it is
+*complete*. The user chose to guarantee coverage over the fastest possible
+turn.
+
+`planner::complete_plan` runs after validation, in `run_turn` only:
+- every attachment gets an extraction step (`parse_pdf` / `analyze_image` /
+  `transcribe_audio`), unless any step of that kind already reads it (a photo
+  sent to `ocr_image` is covered) or its tool is off (no vision model in the
+  profile, no whisper file), since a step that can only fail just buys a
+  degraded badge;
+- `search_knowledge` when role A's `needs_knowledge` is set **or** the request
+  says so (whole words: sop/sops/procedure/compliance/regulation/standards,
+  or "check against"). No bare "standard": "what's the standard rate?" is the
+  fee-card demo, not a compliance question;
+- existing analysis steps also depend on what was added (`AnalysisTool` reads
+  only declared dependencies, so an added photo would otherwise be extracted
+  and then ignored);
+- evidence but no analysis → `summarize` (+ `compare_to_sop` with the KB),
+  which the part-16 fold turns into one `assess`;
+- SOPs wanted, a KB search present, analysis present but no `compare_to_sop`
+  → add it. Found in review: the likeliest under-plan for "check it against
+  our SOPs" is PDF + photo + `summarize`, and without this rule the SOP check
+  never ran, even with the KB search added.
+
+Why `run_turn` and not `run_from_plan` (where the fold lives): a resumed plan
+is one the user edited in the HITL modal, and completing it would undo their
+edit. A conversational plan is left alone, except when it ignores attached
+files: then they are read and analysed together with the answer step, with
+no KB search added. Added ids are fresh, the result is re-validated, and the
+original plan is kept if that ever fails. `warn_uncovered_files` now uses the
+same `is_covered`, so after completion it warns only about switched-off tools.
+
+Design reviewed by the FIX session before coding (resume, tools switched
+off, OCR coverage, the keyword bug, re-validation). `cargo test -p
+workbench-core -j 1` → **74/74**, 10 new tests built from the warm runs'
+plan shapes. Cost: an under-planned turn now takes as long as a full one
+(~25 s on the teammate's machine). **Not yet run against a live model.**
+
+## Feature pass — part 19: TinyFish web search (sponsor integration, isolated)
+
+The hackathon requires using the sponsor's API. It went in as a web-search
+sidebar that shares nothing with the offline pipeline: no Tauri command, no
+pipeline state, and nothing from a turn is sent to it. Files:
+`components/SearchSidebar.{tsx,css}` and `components/tinyfish.worker.ts`, plus
+one import and one `<SearchSidebar />` in `App.tsx`.
+
+- **The SDK runs in a Web Worker.** `@tiny-fish/sdk` always sends a
+  `User-Agent` header, and TinyFish's CORS allow-list doesn't include it
+  (OPTIONS preflight: 400 with `user-agent`, 204 without). The SDK calls the
+  global `fetch` with no way to pass another, so the header has to be stripped
+  by wrapping `fetch`. The first draft wrapped the *app's* `window.fetch` and
+  set a global `window.process`. A worker has its own globals, so the wrapper
+  touches nothing in TrustCore. The SDK also lands in its own bundle chunk.
+- Links open in the system browser via the opener plugin (`target="_blank"`
+  does nothing in a Tauri webview). The panel says it is online and separate
+  from the offline analysis, since the README pitches "no cloud calls".
+- Review (FIX): only `http(s)` result URLs are handed to the opener, since
+  they come from a third party. Below 1500 px wide the open rail floats as a
+  `position: fixed` drawer: at 1366 px, two open right-hand rails left the chat
+  ~530 px. It is `fixed` so no TrustCore container's CSS had to change.
+- The API key is kept in `localStorage`, unencrypted: fine for the demo.
+- Lockfile: added with npm 11. npm 10.9 also stripped every `libc` field (the
+  part-14 churn), so only the SDK, zod, p-retry and is-network-error appear.
+
+Verified: `tsc` clean, `vite build` ok (worker chunk 122 kB). The SDK with a
+fake key returns `AuthenticationError: Invalid or expired API key`, and the
+worker's header set gets a 401, not a CORS failure. **Not yet run in the app
+with a real key.**
+
+## Fix pass — part 20: an attached image must be readable on a fresh machine
+
+The teammate's fresh install, latest tip: an invoice PNG came back "not read
+by any step" and the answer was "no data". On a second try, with the
+fallback plan, it came back "missing image analysis". Two causes stacked:
+
+- **The OCR and speech models were never installed (part A, FIX).** The two
+  `.rten` files and `ggml-base.en.bin` aren't Ollama models; the README said
+  to download them by hand, and setup only pulled Ollama models. So OCR and
+  audio were silently off on every new machine. `bootstrap::tools::
+  ensure_tool_models` now runs in **Download & start**, with the same progress
+  lines: OCR always (~12 MB), whisper (~148 MB) only when the profile expects
+  voice notes or is unsure. Each file streams into `<file>.part` and is renamed
+  only when the byte count matches Content-Length. Any read that sees no data
+  for 30 s gives up: setup awaits this before opening the app, so a stalled
+  download must not hang Start (found in review). Every failure removes the
+  `.part`, is non-fatal, and names the folder to drop the file into (the
+  air-gapped path). The file names are shared with `PipelineConfig`.
+- **With no vision model, nothing fell back to OCR (part B, FEATURE).** A
+  profile without photos has no vision model. Part-18 completion skipped an
+  uncovered image in that case, and both the model's plan and `fallback_plan`
+  send every image to `analyze_image`, which can only fail with vision off.
+  Now `Available` has an `ocr` flag (both `.rten` files present), and with no
+  vision model `complete_plan` reroutes `analyze_image` steps to `ocr_image`
+  and covers uncovered images with it. One `available_tools()` feeds both
+  completion and `warn_uncovered_files`, whose message now says *why* and
+  what to do ("tick Photos via Change profile", "tick Voice notes…").
+
+Each half reviewed by the other session. `cargo test -p workbench-core -j 1`
+→ **76/76**, `cargo test -p tauri-app -j 1` → **45/45** (fake-server tests for
+complete, truncated and stalled downloads). **Not live-tested**: the model
+hosts were unreachable from the dev machine's network. Known nit, left as is:
+a photo the planner sent to both image tools gets OCR'd twice.
+
 ## Where it ended
 
-Stages 1–4 of the prototype→product pass done. `cargo test -p workbench-core -j 1`
-and `cargo test -p tauri-app -j 1 --lib` green; `tsc` clean;
-`cargo check --workspace` clean. Not yet verified end-to-end against a running
-model. `feature/sovereign-workbench`.
+Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass
+(parts 10–14). `cargo test -p workbench-core -j 1` → **44/44**;
+`cargo test -p tauri-app -j 1` → **20/20**; `tsc` clean. The Linux bootstrap path
+(per-user Ollama, tier, probe) was exercised in the running app; a full model
+turn on the new code has **not** been run yet. `feature/sovereign-workbench`.
 
 ### Takeaways for an aspiring engineer
 

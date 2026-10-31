@@ -12,7 +12,7 @@ use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::{assert_sane, compiler, execute_plan, ToolRegistry};
 use crate::memory::{Exchange, PersistentMemory, SessionContext, TurnSummary};
-use crate::planner::{plan_turn, validate_plan, PlanOutcome};
+use crate::planner::{complete_plan, plan_turn, validate_plan, wants_knowledge, Available, PlanOutcome};
 use crate::{PipelineConfig, Result};
 
 /// Terminal state of one turn.
@@ -56,8 +56,10 @@ pub async fn run_turn(
     let history = session.context_blob();
 
     // --- plan + deterministic validation (with retry ceiling) ---------------
-    let (_intent, outcome) =
+    let plan_started = std::time::Instant::now();
+    let (intent, outcome) =
         plan_turn(engine, prompt, uploads, &history, session.has_history(), sink).await?;
+    tracing::info!(plan_ms = plan_started.elapsed().as_millis(), "turn phase: planning done");
     let plan = match outcome {
         PlanOutcome::Ready(plan) => plan,
         PlanOutcome::AwaitingUser { errors, last_plan } => {
@@ -67,6 +69,16 @@ pub async fn run_turn(
             });
         }
     };
+
+    // Make the plan cover what was asked: a small planner routinely skips the
+    // photo or the SOP search. Here and not in `run_from_plan`, so a plan the
+    // user edited in the HITL modal is never "completed" behind their back.
+    let available = available_tools(engine, config);
+    let (plan, added) =
+        complete_plan(plan, uploads, prompt, wants_knowledge(&intent, prompt), available);
+    if !added.is_empty() {
+        tracing::info!(?added, "plan completed: the planner left these out");
+    }
 
     run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, session, sink).await
 }
@@ -156,31 +168,48 @@ fn screen_uploads(uploads: &[InputFile], sink: &dyn ProgressSink) -> Vec<InputFi
 /// Warn about any attachment no plan step reads, so a silently-ignored file is
 /// visible rather than a mystery. (`validate_plan` counts nothing here — one
 /// `ocr_image` step "covers" fifty images as far as it is concerned.)
-fn warn_uncovered_files(plan: &Plan, uploads: &[InputFile], sink: &dyn ProgressSink) {
-    use crate::planner::registry::lookup;
+/// Which file-reading tools can actually run here. Shared by plan completion
+/// and the uncovered-file warning so the two can never disagree.
+fn available_tools(engine: &OllamaEngine, config: &PipelineConfig) -> Available {
+    Available {
+        vision: !engine.vision_model().trim().is_empty(),
+        ocr: config.ocr_detection_model.is_file() && config.ocr_recognition_model.is_file(),
+        audio: config.whisper_model_path.is_file(),
+    }
+}
 
+fn warn_uncovered_files(
+    plan: &Plan,
+    uploads: &[InputFile],
+    available: Available,
+    sink: &dyn ProgressSink,
+) {
+    use crate::engine::schemas::FileKind;
+
+    // Same definition `complete_plan` uses, so after completion this fires only
+    // for a file whose tool is switched off (or on a resumed plan) — and then
+    // the user should be told which tool, not just that the file was skipped.
     for f in uploads {
-        // Covered if some step names this exact file…
-        let named = plan.steps.iter().any(|s| {
-            s.args.get("file").and_then(|v| v.as_str()) == Some(f.original_name.as_str())
-        });
-        // …or a step consumes this kind without naming a file, in which case
-        // `ToolContext::file_for` falls back to the first upload of that kind.
-        let is_first_of_kind =
-            uploads.iter().find(|u| u.kind == f.kind).map(|u| &u.original_name)
-                == Some(&f.original_name);
-        let covered_by_fallback = is_first_of_kind
-            && plan.steps.iter().any(|s| {
-                s.args.get("file").is_none()
-                    && lookup(&s.task).and_then(|spec| spec.requires_file) == Some(f.kind)
-            });
-
-        if !named && !covered_by_fallback {
+        if !crate::planner::is_covered(plan, uploads, f) {
+            let why = match f.kind {
+                FileKind::Image if !available.vision && !available.ocr => Some(
+                    "Image reading is off: this profile has no vision model and the OCR model \
+                     files are missing. Restart the app so setup installs them, or tick Photos \
+                     via Change profile.",
+                ),
+                FileKind::Audio if !available.audio => Some(
+                    "Audio transcription is off: the speech model file (ggml-base.en.bin) is \
+                     missing. Tick Voice notes via Change profile and restart, or put the file \
+                     in the app's models folder.",
+                ),
+                _ => None,
+            };
             crate::events::warn(
                 sink,
                 format!(
-                    "Attached file \"{}\" is not read by any step of this plan.",
-                    f.original_name
+                    "Attached file \"{}\" is not read by any step of this plan.{}",
+                    f.original_name,
+                    why.map(|w| format!(" {w}")).unwrap_or_default()
                 ),
                 None,
             );
@@ -202,12 +231,17 @@ async fn run_from_plan(
     mut session: SessionContext,
     sink: &dyn ProgressSink,
 ) -> Result<TurnOutcome> {
-    warn_uncovered_files(&plan, uploads, sink);
+    // One model call instead of two when both analysis steps were planned. Here,
+    // not in `plan_turn`, so fresh, resumed and force-resumed plans all get it.
+    let plan = crate::planner::fold_analysis(plan);
+    warn_uncovered_files(&plan, uploads, available_tools(engine, config), sink);
 
     // --- strictly sequential tool execution --------------------------------
     let session_blob = session.context_blob();
+    let execute_started = std::time::Instant::now();
     let results =
         execute_plan(&plan, registry, uploads, config, engine, prompt, &session_blob, sink).await?;
+    let execute_ms = execute_started.elapsed().as_millis();
 
     // A Stop pressed during the final tool: don't spend another minute
     // synthesising a report the user no longer wants.
@@ -228,10 +262,12 @@ async fn run_from_plan(
     });
 
     // --- synthesise (role C) -------------------------------------------
-    // `session` was loaded before planning and handed in; only long-term memory
-    // is read here.
+    // `session` was loaded before planning and handed in. Cross-chat memory is
+    // read here, and it is safe to share across chats now: it holds only facts
+    // the user confirmed, never an automatic digest of some other conversation.
     let facility = PersistentMemory::load(&config.persistent_path());
 
+    let compile_started = std::time::Instant::now();
     let mut report = compiler::compile(
         engine,
         prompt,
@@ -241,7 +277,25 @@ async fn run_from_plan(
         sink,
     )
     .await;
+    let compile_ms = compile_started.elapsed().as_millis();
     report.degraded = report.degraded || !quality.passed;
+    // The model only *suggests* cross-chat facts; code decides. Drop anything
+    // that isn't a short, grounded facility fact (a small model happily
+    // proposes findings and document titles), then anything already confirmed.
+    let proposed = report.memory_proposals.len();
+    report.memory_proposals = crate::memory::proposals::screen(
+        std::mem::take(&mut report.memory_proposals),
+        prompt,
+        &results,
+    );
+    report.memory_proposals.retain(|p| !facility.has(p));
+    if proposed > 0 {
+        tracing::info!(
+            proposed,
+            kept = report.memory_proposals.len(),
+            "memory proposals screened"
+        );
+    }
     tracing::info!(
         degraded = report.degraded,
         findings = report.findings.len(),
@@ -270,8 +324,9 @@ async fn run_from_plan(
         prompt: prompt.to_string(),
         attachments: uploads.iter().map(|u| u.original_name.clone()).collect(),
         report: Some(report.clone()),
-        ts: 0, // filled in by record_turn from the clock
+        ts: 0, // 0 = record_turn stamps the current time
     };
+    let record_started = std::time::Instant::now();
     if let Err(e) = session
         .record_turn(exchange, turn, engine, &config.session_path_for(session_id))
         .await
@@ -279,43 +334,20 @@ async fn run_from_plan(
         tracing::warn!(error = %e, "failed to record session turn");
     }
 
-    // Fold the session digest into encrypted long-term memory every turn, so a
-    // crash between turns never loses history. `end_session` does the same on an
-    // orderly shutdown.
-    persist_long_term(config, &session);
+    // One line to read the turn's shape from; per-call detail is in the
+    // `model call timing` lines (and `engine.timings()`).
+    let calls = engine.timings();
+    tracing::info!(
+        execute_ms,
+        compile_ms,
+        record_ms = record_started.elapsed().as_millis(),
+        model_calls = calls.len(),
+        model_wall_ms = calls.iter().map(|c| c.wall_ms).sum::<u128>(),
+        "turn phases"
+    );
 
     sink.emit(StepEvent::Done {
         report_json: serde_json::to_string(&report)?,
     });
     Ok(TurnOutcome::Completed(report))
-}
-
-/// Update `persistent_memory.json` (AES-256-GCM) from the current session's
-/// rolling context.
-///
-/// **Inputs:** pipeline config (for the file path) and the session to summarise.
-/// Best-effort: a write failure is logged, never propagated — losing long-term
-/// memory must not fail a turn or a shutdown.
-pub fn persist_long_term(config: &PipelineConfig, session: &SessionContext) {
-    let path = config.persistent_path();
-    let mut memory = PersistentMemory::load(&path);
-
-    let digest = if !session.rolling_summary.is_empty() {
-        session.rolling_summary.clone()
-    } else {
-        session
-            .turns
-            .iter()
-            .map(|t| t.report_summary.as_str())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" | ")
-    };
-    if !digest.is_empty() {
-        memory.history_digest = digest;
-    }
-
-    if let Err(e) = memory.persist(&path) {
-        tracing::warn!(error = %e, "failed to persist long-term memory");
-    }
 }

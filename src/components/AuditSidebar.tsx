@@ -4,7 +4,7 @@
 import { useEffect, useState } from "react";
 import { auditPaths, openLogDir } from "../lib/pipeline";
 import { log } from "../lib/log";
-import type { AuditPaths, ModelPlan, StepEvent } from "../types";
+import type { AuditPaths, MemoryFact, ModelPlan, StepEvent } from "../types";
 
 interface ToolTiming {
   tool: string;
@@ -12,12 +12,51 @@ interface ToolTiming {
   ms: number;
 }
 
+// A static trail through the pipeline, independent of any turn actually
+// running — the live `Stepper` shows the same stages while a turn is in
+// flight, but it is gone the moment the answer commits (see App.tsx). This is
+// the one place a first-time viewer can read "what just happened" — or is
+// about to — without having run anything, and without reading the README.
+// Mirrors `run_turn`'s doc comment in crates/workbench-core/src/pipeline.rs.
+const HOW_IT_WORKS: { label: string; tag?: string; detail: string }[] = [
+  {
+    label: "Parse intent",
+    detail:
+      "A small resident model reads the prompt and the attached files and extracts what is being asked and what kind each file is.",
+  },
+  {
+    label: "Validate plan",
+    tag: "Rust, deterministic",
+    detail:
+      "The model proposes a plan; a hand-written Rust validator checks it against fixed rules — not by asking the model to grade its own work. An invalid plan retries automatically, or is handed to you to edit.",
+  },
+  {
+    label: "Execute tools",
+    detail:
+      "Each step runs one tool in turn — PDF/OCR/audio parsing, SOP retrieval, image analysis — against only the file it names.",
+  },
+  {
+    label: "Quality check",
+    detail:
+      "Rule-based checks run before synthesis, independent of the model, and mark the report degraded if something looks wrong.",
+  },
+  {
+    label: "Synthesize",
+    detail: "A final pass turns the tool outputs into one report, with citations.",
+  },
+];
+
 export function AuditSidebar({
   events,
   plan,
+  memory,
+  onForget,
 }: {
   events: StepEvent[];
   plan: ModelPlan | null;
+  /** Facts the user confirmed for cross-chat memory. */
+  memory: MemoryFact[];
+  onForget: (key: string) => void;
 }) {
   const [open, setOpen] = useState(true);
   const [paths, setPaths] = useState<AuditPaths | null>(null);
@@ -41,6 +80,23 @@ export function AuditSidebar({
       {open && (
         <div className="audit-body">
           <section>
+            <h4>How it works</h4>
+            <ol className="hiw-list">
+              {HOW_IT_WORKS.map((s, i) => (
+                <li key={s.label} title={s.detail}>
+                  <span className="hiw-num">{i + 1}</span>
+                  <span className="hiw-label">{s.label}</span>
+                  {s.tag && <span className="hiw-tag">{s.tag}</span>}
+                </li>
+              ))}
+            </ol>
+            <p className="muted small">
+              The plan is checked by code before any tool runs — not by asking the
+              model to grade its own output.
+            </p>
+          </section>
+
+          <section>
             <h4>Active models</h4>
             {plan ? (
               <dl className="audit-dl">
@@ -55,6 +111,34 @@ export function AuditSidebar({
               </dl>
             ) : (
               <p className="muted">not selected</p>
+            )}
+          </section>
+
+          <section>
+            <h4>Remembered facts</h4>
+            {memory.length === 0 ? (
+              <p className="muted small">
+                Nothing yet. Facts you confirm under a report appear here and are
+                shared with every chat.
+              </p>
+            ) : (
+              <ul className="memory-list">
+                {memory.map((f) => (
+                  <li key={f.key}>
+                    <span>
+                      <b>{f.key}</b>: {f.value}
+                    </span>
+                    <button
+                      type="button"
+                      className="link-btn"
+                      title="Forget this fact"
+                      onClick={() => onForget(f.key)}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
             )}
           </section>
 

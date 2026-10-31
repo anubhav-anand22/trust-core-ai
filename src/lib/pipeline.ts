@@ -6,6 +6,7 @@ import { log, timed, type Fields } from "./log";
 import type {
   AuditPaths,
   LlmAssessment,
+  MemoryFact,
   ModelPlan,
   ModelProgress,
   SessionContext,
@@ -13,6 +14,7 @@ import type {
   StepEvent,
   SystemProbe,
   UploadedFile,
+  UserProfile,
 } from "../types";
 
 /** Is Ollama available (server responding, on PATH, or in a known location)? */
@@ -32,6 +34,18 @@ export function ensureOllamaInstalled(onLine: (line: string) => void) {
     invoke<boolean>("ensure_ollama_installed", { onProgress: channel }),
   );
 }
+
+/** The stored profile, or null on first launch (→ show the profile screen). */
+export const getProfile = () =>
+  timed("get_profile", undefined, () => invoke<UserProfile | null>("get_profile"));
+
+/** Store the profile from the first screen. */
+export const saveProfile = (profile: UserProfile) =>
+  timed(
+    "save_profile",
+    { industry: profile.industry, priority: profile.priority },
+    () => invoke<void>("save_profile", { profile }),
+  );
 
 /** Detected RAM/GPU/cores plus the recommended model tier. */
 export const probeSystem = () =>
@@ -63,6 +77,17 @@ export function ensureModels(
   );
 }
 
+/** Download the OCR (always) and whisper (if the profile wants audio) model
+ *  files when missing. Never rejects for a failed download — that tool is just
+ *  left off, and the progress line says how to install it offline. */
+export function ensureToolModels(onProgress: (p: ModelProgress) => void) {
+  const channel = new Channel<ModelProgress>();
+  channel.onmessage = onProgress;
+  return timed("ensure_tool_models", undefined, () =>
+    invoke<void>("ensure_tool_models", { onProgress: channel }),
+  );
+}
+
 /** Persist the confirmed model plan on the backend. */
 export const setModelPlan = (plan: ModelPlan) =>
   timed("set_model_plan", { llm: plan.llm, tier: plan.tier_label }, () =>
@@ -87,10 +112,20 @@ export const cancelTurn = () => {
   );
 };
 
-/** Fold the session's context into encrypted long-term memory. */
-export const endSession = (sessionId: string) =>
-  timed("end_session", { sessionId }, () =>
-    invoke<void>("end_session", { sessionId }),
+/** Facts the user has confirmed for cross-chat memory (encrypted on disk). */
+export const getMemory = () =>
+  timed("get_memory", undefined, () => invoke<MemoryFact[]>("get_memory"));
+
+/** Confirm a proposed fact. Returns the updated list. */
+export const confirmMemory = (fact: MemoryFact) =>
+  timed("confirm_memory", { key: fact.key }, () =>
+    invoke<MemoryFact[]>("confirm_memory", { key: fact.key, value: fact.value }),
+  );
+
+/** Forget a remembered fact. Returns the updated list. */
+export const forgetMemory = (key: string) =>
+  timed("forget_memory", { key }, () =>
+    invoke<MemoryFact[]>("forget_memory", { key }),
   );
 
 /** Past chat sessions, newest first, for the sidebar. */
@@ -105,7 +140,7 @@ export const loadSession = (sessionId: string) =>
     invoke<SessionContext>("load_session", { sessionId }),
   );
 
-/** Delete a session file (the long-term digest is kept). */
+/** Delete a session file. Confirmed cross-chat facts are separate and kept. */
 export const deleteSession = (sessionId: string) =>
   timed("delete_session", { sessionId }, () =>
     invoke<void>("delete_session", { sessionId }),
@@ -170,6 +205,10 @@ export function submitTurn(
 function logStepEvent(inner: (e: StepEvent) => void) {
   return (e: StepEvent) => {
     switch (e.stage) {
+      case "streaming":
+        // ~3 per second while a model writes, each carrying the full text so
+        // far. Not worth a log line each; the call's timing is logged when it ends.
+        break;
       case "error":
         log.error("pipeline event: error", { message: e.message });
         break;

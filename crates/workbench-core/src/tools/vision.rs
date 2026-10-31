@@ -30,6 +30,18 @@ impl Tool for VisionTool {
     async fn run(&self, step: &TaskStep, ctx: &ToolContext<'_>) -> Result<ToolResult> {
         let started = std::time::Instant::now();
 
+        // The user's profile said "no photos", so no vision model was pulled.
+        // Say so plainly instead of letting Ollama fail on an empty model name.
+        if ctx.engine.vision_model().trim().is_empty() {
+            return Ok(ToolResult::failure(
+                &step.id,
+                self.name(),
+                "image analysis is off — your profile says no photos, so no vision model \
+                 was installed. Choose \"Change profile\" on the start screen and tick Photos.",
+                started.elapsed().as_millis(),
+            ));
+        }
+
         let file = match ctx.file_for(step, FileKind::Image) {
             Some(f) => f,
             None => {
