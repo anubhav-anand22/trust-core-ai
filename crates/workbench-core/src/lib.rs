@@ -19,6 +19,7 @@ pub mod engine;
 pub mod events;
 pub mod executor;
 pub mod memory;
+pub mod mesh;
 pub mod pipeline;
 pub mod planner;
 pub mod tools;
@@ -27,7 +28,7 @@ use std::path::PathBuf;
 
 pub use engine::schemas;
 pub use events::{ProgressSink, StepEvent};
-pub use pipeline::{resume_turn, run_turn, TurnOutcome};
+pub use pipeline::{resume_turn, resume_turn_with_mesh, run_turn, run_turn_with_mesh, TurnOutcome};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

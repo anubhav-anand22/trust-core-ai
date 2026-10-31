@@ -12,6 +12,7 @@ use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::{assert_sane, compiler, execute_plan, ToolRegistry};
 use crate::memory::{Exchange, PersistentMemory, SessionContext, TurnSummary};
+use crate::mesh::{execute_plan_mesh, Dispatcher};
 use crate::planner::{complete_plan, plan_turn, validate_plan, wants_knowledge, Available, PlanOutcome};
 use crate::{PipelineConfig, Result};
 
@@ -41,6 +42,22 @@ pub async fn run_turn(
     prompt: &str,
     uploads: &[InputFile],
     sink: &dyn ProgressSink,
+) -> Result<TurnOutcome> {
+    run_turn_with_mesh(engine, registry, config, session_id, prompt, uploads, sink, None).await
+}
+
+/// [`run_turn`], with the plan's steps run across the mesh when `mesh` is
+/// `Some`. `None` is exactly [`run_turn`]: the sequential executor, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_with_mesh(
+    engine: &OllamaEngine,
+    registry: &ToolRegistry,
+    config: &PipelineConfig,
+    session_id: &str,
+    prompt: &str,
+    uploads: &[InputFile],
+    sink: &dyn ProgressSink,
+    mesh: Option<&dyn Dispatcher>,
 ) -> Result<TurnOutcome> {
     sink.emit(StepEvent::Idle);
 
@@ -80,7 +97,8 @@ pub async fn run_turn(
         tracing::info!(?added, "plan completed: the planner left these out");
     }
 
-    run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, session, sink).await
+    run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, session, sink, mesh)
+        .await
 }
 
 /// Resume a turn the planner parked: execute a user-approved (optionally edited)
@@ -105,6 +123,26 @@ pub async fn resume_turn(
     force: bool,
     sink: &dyn ProgressSink,
 ) -> Result<TurnOutcome> {
+    resume_turn_with_mesh(
+        engine, registry, config, session_id, prompt, uploads, plan_json, force, sink, None,
+    )
+    .await
+}
+
+/// [`resume_turn`] with an optional mesh; see [`run_turn_with_mesh`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_turn_with_mesh(
+    engine: &OllamaEngine,
+    registry: &ToolRegistry,
+    config: &PipelineConfig,
+    session_id: &str,
+    prompt: &str,
+    uploads: &[InputFile],
+    plan_json: &str,
+    force: bool,
+    sink: &dyn ProgressSink,
+    mesh: Option<&dyn Dispatcher>,
+) -> Result<TurnOutcome> {
     sink.emit(StepEvent::Idle);
 
     let uploads = screen_uploads(uploads, sink);
@@ -127,7 +165,8 @@ pub async fn resume_turn(
         }
     }
 
-    run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, session, sink).await
+    run_from_plan(engine, registry, config, session_id, prompt, uploads, plan, session, sink, mesh)
+        .await
 }
 
 /// Keep only the attachments the pipeline can actually read; warn about the rest.
@@ -230,17 +269,28 @@ async fn run_from_plan(
     plan: Plan,
     mut session: SessionContext,
     sink: &dyn ProgressSink,
+    mesh: Option<&dyn Dispatcher>,
 ) -> Result<TurnOutcome> {
     // One model call instead of two when both analysis steps were planned. Here,
     // not in `plan_turn`, so fresh, resumed and force-resumed plans all get it.
     let plan = crate::planner::fold_analysis(plan);
     warn_uncovered_files(&plan, uploads, available_tools(engine, config), sink);
 
-    // --- strictly sequential tool execution --------------------------------
+    // --- tool execution: strictly sequential, or across the mesh when on ----
     let session_blob = session.context_blob();
     let execute_started = std::time::Instant::now();
-    let results =
-        execute_plan(&plan, registry, uploads, config, engine, prompt, &session_blob, sink).await?;
+    let results = match mesh {
+        None => {
+            execute_plan(&plan, registry, uploads, config, engine, prompt, &session_blob, sink)
+                .await?
+        }
+        Some(dispatcher) => {
+            execute_plan_mesh(
+                &plan, registry, uploads, config, engine, prompt, &session_blob, sink, dispatcher,
+            )
+            .await?
+        }
+    };
     let execute_ms = execute_started.elapsed().as_millis();
 
     // A Stop pressed during the final tool: don't spend another minute

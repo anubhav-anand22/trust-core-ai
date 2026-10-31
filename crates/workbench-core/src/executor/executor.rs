@@ -94,89 +94,116 @@ pub async fn execute_plan(
             "tool: start"
         );
 
-        let started = std::time::Instant::now();
-
-        let result = match registry.get(&step.task) {
-            Some(tool) => {
-                let ctx = ToolContext {
-                    config,
-                    uploads,
-                    outputs: &outputs,
-                    prompt,
-                    session_blob,
-                    engine,
-                    sink,
-                };
-                match tool.run(step, &ctx).await {
-                    Ok(r) => r,
-                    // User pressed Stop while this tool was running: abandon the
-                    // whole turn, don't synthesise a half-report.
-                    Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
-                    // Timed out: the turn goes on without this step's output, but
-                    // the user is told why the report is thin.
-                    Err(e @ CoreError::Timeout { .. }) => {
-                        crate::events::warn(
-                            sink,
-                            format!(
-                                "Step '{}' ran out of time and was skipped; the report                                  will be missing its findings.",
-                                step.task
-                            ),
-                            Some(e.to_string()),
-                        );
-                        ToolResult::failure(
-                            &step.id,
-                            &step.task,
-                            e.to_string(),
-                            started.elapsed().as_millis(),
-                        )
-                    }
-                    Err(e) => ToolResult::failure(
-                        &step.id,
-                        &step.task,
-                        e.to_string(),
-                        started.elapsed().as_millis(),
-                    ),
-                }
-            }
-            // Validation should have caught this; treat it as a degraded step
-            // rather than a panic so one bad row can't kill a demo.
-            None => ToolResult::failure(
-                &step.id,
-                &step.task,
-                format!("no tool registered for task `{}`", step.task),
-                started.elapsed().as_millis(),
-            ),
+        let ctx = ToolContext {
+            config,
+            uploads,
+            outputs: &outputs,
+            prompt,
+            session_blob,
+            engine,
+            sink,
         };
+        let result = run_step(registry, step, &ctx).await?;
 
-        sink.emit(StepEvent::ToolFinished {
-            tool: step.task.clone(),
-            ok: result.ok,
-            elapsed_ms: result.elapsed_ms,
-        });
-
+        finish_step(step, &result, sink);
         if result.ok {
-            tracing::info!(
-                step = %step.id,
-                tool = %step.task,
-                elapsed_ms = result.elapsed_ms,
-                output_chars = result.data.to_string().len(),
-                warning = result.warning.as_deref().unwrap_or(""),
-                "tool: ok"
-            );
             outputs.insert(step.id.clone(), result.data.clone());
-        } else {
-            // Not fatal by design — a failed tool degrades the run rather than
-            // aborting it — but it is the first thing to look for in a log.
-            tracing::error!(
-                step = %step.id,
-                tool = %step.task,
-                elapsed_ms = result.elapsed_ms,
-                error = result.error.as_deref().unwrap_or("unknown"),
-                "tool: FAILED (run continues, report will be degraded)"
-            );
         }
         results.push(result);
     }
 
     Ok(results)
+}
+
+/// Run one step's tool against `ctx` and turn every outcome into a [`ToolResult`].
+///
+/// Shared by [`execute_plan`] and the mesh executor
+/// ([`crate::mesh::execute_plan_mesh`]), so a step behaves the same whichever ran it.
+/// The only `Err` is [`CoreError::Cancelled`]: everything else degrades the step.
+pub(crate) async fn run_step(
+    registry: &ToolRegistry,
+    step: &crate::engine::schemas::TaskStep,
+    ctx: &ToolContext<'_>,
+) -> Result<ToolResult> {
+    let started = std::time::Instant::now();
+    let sink = ctx.sink;
+
+    let result = match registry.get(&step.task) {
+        Some(tool) => {
+            match tool.run(step, ctx).await {
+                Ok(r) => r,
+                // User pressed Stop while this tool was running: abandon the
+                // whole turn, don't synthesise a half-report.
+                Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                // Timed out: the turn goes on without this step's output, but
+                // the user is told why the report is thin.
+                Err(e @ CoreError::Timeout { .. }) => {
+                    crate::events::warn(
+                        sink,
+                        format!(
+                            "Step '{}' ran out of time and was skipped; the report                                  will be missing its findings.",
+                            step.task
+                        ),
+                        Some(e.to_string()),
+                    );
+                    ToolResult::failure(
+                        &step.id,
+                        &step.task,
+                        e.to_string(),
+                        started.elapsed().as_millis(),
+                    )
+                }
+                Err(e) => ToolResult::failure(
+                    &step.id,
+                    &step.task,
+                    e.to_string(),
+                    started.elapsed().as_millis(),
+                ),
+            }
+        }
+        // Validation should have caught this; treat it as a degraded step
+        // rather than a panic so one bad row can't kill a demo.
+        None => ToolResult::failure(
+            &step.id,
+            &step.task,
+            format!("no tool registered for task `{}`", step.task),
+            started.elapsed().as_millis(),
+        ),
+    };
+    Ok(result)
+}
+
+/// Emit `ToolFinished` and log the outcome of one step. The caller records the
+/// output.
+pub(crate) fn finish_step(
+    step: &crate::engine::schemas::TaskStep,
+    result: &ToolResult,
+    sink: &dyn ProgressSink,
+) {
+    sink.emit(StepEvent::ToolFinished {
+        tool: step.task.clone(),
+        ok: result.ok,
+        elapsed_ms: result.elapsed_ms,
+    });
+
+    if result.ok {
+        tracing::info!(
+            step = %step.id,
+            tool = %step.task,
+            elapsed_ms = result.elapsed_ms,
+            output_chars = result.data.to_string().len(),
+            warning = result.warning.as_deref().unwrap_or(""),
+            "tool: ok"
+        );
+    } else {
+        // Not fatal by design — a failed tool degrades the run rather than
+        // aborting it — but it is the first thing to look for in a log.
+        tracing::error!(
+            step = %step.id,
+            tool = %step.task,
+            elapsed_ms = result.elapsed_ms,
+            error = result.error.as_deref().unwrap_or("unknown"),
+            "tool: FAILED (run continues, report will be degraded)"
+        );
+    }
 }

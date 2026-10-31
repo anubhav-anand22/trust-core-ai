@@ -214,6 +214,12 @@ impl OllamaEngine {
 
     /// Set the user-context line (from the profile). Kept short by the caller:
     /// every token is prompt prefill, which is real time on a CPU.
+    /// The persona line, so a mesh Worker can build an engine that frames its
+    /// answers the same way (`mesh::StepJob::persona`).
+    pub fn persona(&self) -> &str {
+        &self.persona
+    }
+
     pub fn with_persona(mut self, persona: impl Into<String>) -> Self {
         self.persona = persona.into();
         self

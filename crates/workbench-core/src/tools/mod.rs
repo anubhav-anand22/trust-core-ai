@@ -79,29 +79,38 @@ impl<'a> ToolContext<'a> {
         step: &TaskStep,
         kind: crate::engine::schemas::FileKind,
     ) -> Option<&'a InputFile> {
-        if let Some(want) = step.args.get("file").and_then(|v| v.as_str()) {
-            let want = want.trim();
-            if !want.is_empty() {
-                if let Some(f) = self
-                    .uploads
-                    .iter()
-                    .find(|f| f.original_name == want && f.kind == kind)
-                {
-                    return Some(f);
-                }
-                // Named a file, but not one we have of this kind. Do NOT silently
-                // fall through to some other file — that is how three `ocr_image`
-                // steps all ended up reading image #1.
-                tracing::warn!(
-                    requested = want,
-                    ?kind,
-                    "file_for: step names an attachment that is not present as that kind"
-                );
-                return None;
-            }
-        }
-        self.first_file_of(kind)
+        resolve_file(self.uploads, step, kind)
     }
+}
+
+/// [`ToolContext::file_for`] without a context. The mesh builds a job's file list
+/// with this, so a Worker resolves the same attachment the Host would have.
+pub fn resolve_file<'a>(
+    uploads: &'a [InputFile],
+    step: &TaskStep,
+    kind: crate::engine::schemas::FileKind,
+) -> Option<&'a InputFile> {
+    if let Some(want) = step.args.get("file").and_then(|v| v.as_str()) {
+        let want = want.trim();
+        if !want.is_empty() {
+            if let Some(f) = uploads
+                .iter()
+                .find(|f| f.original_name == want && f.kind == kind)
+            {
+                return Some(f);
+            }
+            // Named a file, but not one we have of this kind. Do NOT silently
+            // fall through to some other file — that is how three `ocr_image`
+            // steps all ended up reading image #1.
+            tracing::warn!(
+                requested = want,
+                ?kind,
+                "file_for: step names an attachment that is not present as that kind"
+            );
+            return None;
+        }
+    }
+    uploads.iter().find(|f| f.kind == kind)
 }
 
 /// One executable capability.
