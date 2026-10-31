@@ -219,6 +219,10 @@ async fn an_approved_worker_runs_the_step_with_only_its_file() {
     assert!(events.iter().any(|e| matches!(e, StepEvent::Streaming { text, .. } if text == "reading…")));
     assert!(!events.iter().any(|e| matches!(e, StepEvent::Done { .. })), "a Worker can't fake a stage");
     assert!(!events.iter().any(|e| matches!(e, StepEvent::Warning { .. })), "no fallback happened");
+    assert!(
+        events.iter().any(|e| matches!(e, StepEvent::ToolFinished { device: Some(d), .. } if d == "gpu-box")),
+        "the audit panel can say where the step ran"
+    );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(std::fs::read_dir(&m.worker_scratch).unwrap().count(), 0, "the Worker kept nothing");

@@ -36,6 +36,10 @@ pub enum StepEvent {
 
     /// A tool finished. `elapsed_ms` feeds the audit sidebar.
     ToolFinished {
+        /// The mesh device that ran it. Absent (not even serialised) when it ran
+        /// here, so a turn without the mesh emits exactly the JSON it always did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
         tool: String,
         ok: bool,
         elapsed_ms: u128,

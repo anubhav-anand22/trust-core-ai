@@ -196,6 +196,23 @@ impl Hub {
         *self.inner.pinned.lock().expect("pin lock") = device_id;
     }
 
+    pub fn pinned(&self) -> Option<String> {
+        self.inner.pinned.lock().expect("pin lock").clone()
+    }
+
+    pub fn device_id(&self) -> String {
+        self.inner.me.device_id()
+    }
+
+    /// Stop hosting: close pairing and say goodbye to every Worker. Each
+    /// supervisor then ends on its own and the Workers return to idle.
+    pub fn shutdown(&self, reason: &str) {
+        self.close_pairing();
+        for slot in self.inner.slots.lock().expect("slots lock").values() {
+            let _ = slot.tx.send(Frame::Bye { reason: reason.to_string() });
+        }
+    }
+
     pub fn workers(&self) -> Vec<WorkerStatus> {
         let slots = self.inner.slots.lock().expect("slots lock");
         let mut list: Vec<WorkerStatus> = slots
@@ -323,7 +340,24 @@ impl Hub {
         let mut slots = self.inner.slots.lock().expect("slots lock");
         let slot = slots.get_mut(device_id)?;
         match frame {
-            Frame::Done { job_id, result } => {
+            Frame::Done { job_id, result, timings } => {
+                // Same fields as the engine's own `model call timing` line, plus
+                // the device, so one log shows a whole mesh turn.
+                for t in &timings {
+                    tracing::info!(
+                        device = %slot.peer.name,
+                        role = %t.role,
+                        model = %t.model,
+                        wall_ms = t.wall_ms,
+                        load_ms = ?t.load_ms,
+                        prompt_tokens = ?t.prompt_tokens,
+                        prefill_ms = ?t.prefill_ms,
+                        gen_tokens = ?t.gen_tokens,
+                        decode_ms = ?t.decode_ms,
+                        decode_tok_per_s = ?t.decode_tok_per_s().map(|v| (v * 10.0).round() / 10.0),
+                        "mesh model call timing"
+                    );
+                }
                 if let Some(mut w) = slot.jobs.remove(&job_id) {
                     if let Some(done) = w.done.take() {
                         let _ = done.send(Ok(Reply::Tool(result)));
@@ -555,6 +589,10 @@ impl Dispatcher for TurnDispatcher {
 
     fn delegator(&self) -> Option<String> {
         self.hub.delegator()
+    }
+
+    fn device_name(&self, worker: &str) -> Option<String> {
+        self.hub.inner.slots.lock().expect("slots lock").get(worker).map(|s| s.peer.name.clone())
     }
 
     async fn plan_on_worker(&self, worker: &str, job: PlanJob) -> workbench_core::Result<PlanReply> {

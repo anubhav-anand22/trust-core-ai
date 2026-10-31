@@ -134,7 +134,7 @@ async fn the_right_code_pairs_both_sides_and_large_frames_flow_both_ways() {
         warning: None,
         elapsed_ms: 5,
     };
-    w.send(&Frame::Done { job_id: "j1".into(), result }).await.unwrap();
+    w.send(&Frame::Done { job_id: "j1".into(), result, timings: vec![] }).await.unwrap();
     assert!(matches!(h.recv().await.unwrap(), Frame::Done { result, .. } if result.data["text"] == "corrosion"));
 }
 
@@ -241,5 +241,7 @@ async fn a_worker_finds_the_host_by_its_tag() {
     assert!(found.iter().any(|a| a.port() == 48123), "{found:?}");
     let none = workbench_mesh::discovery::find_hosts("ZZ", Duration::from_secs(2)).await.unwrap();
     assert!(none.is_empty());
+    let by_id = workbench_mesh::discovery::find_host_by_id("trustcore-test-host", Duration::from_secs(5)).await.unwrap();
+    assert!(by_id.iter().any(|a| a.port() == 48123), "a paired Worker finds its Host without a code");
     drop(ad);
 }

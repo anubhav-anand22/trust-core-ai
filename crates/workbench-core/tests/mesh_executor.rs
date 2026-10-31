@@ -230,8 +230,9 @@ async fn independent_steps_run_at_once_but_never_two_on_one_worker() {
     let ws: &[&str] = &["w1", "w2"];
     let mesh = FakeMesh::new(&log, &[("parse_pdf", ws), ("ocr_image", ws), ("summarize", ws)], &[]);
 
+    let sink = VecSink::new();
     let results =
-        execute_plan_mesh(&p, &reg, &uploads, &cfg(), &engine(), "q", "", &NullSink, &mesh)
+        execute_plan_mesh(&p, &reg, &uploads, &cfg(), &engine(), "q", "", &sink, &mesh)
             .await
             .unwrap();
 
@@ -242,6 +243,16 @@ async fn independent_steps_run_at_once_but_never_two_on_one_worker() {
         "results stay in plan order"
     );
     assert_eq!(mesh.max_total.load(Ordering::SeqCst), 2, "both workers busy at once");
+    let on: Vec<String> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            StepEvent::ToolFinished { device: Some(d), .. } => Some(d),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(on.len(), 4, "every step names the worker that ran it: {on:?}");
+    assert!(on.iter().all(|d| d == "w1" || d == "w2"));
     assert_eq!(mesh.max_on_one_worker.load(Ordering::SeqCst), 1, "one job per worker");
 }
 
@@ -288,6 +299,15 @@ async fn a_dropped_worker_is_retried_elsewhere_then_on_the_host() {
         .unwrap();
 
     assert!(results[0].ok, "the Host ran it");
+    let finished: Vec<Option<String>> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            StepEvent::ToolFinished { device, .. } => Some(device),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished, [None], "run here: no device named, the pre-mesh JSON");
     let tried: Vec<String> = mesh.jobs.lock().unwrap().iter().map(|(w, _)| w.clone()).collect();
     assert_eq!(tried, ["bad1", "bad2"]);
     let warnings =

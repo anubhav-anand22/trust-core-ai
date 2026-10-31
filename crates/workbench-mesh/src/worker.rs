@@ -177,15 +177,16 @@ async fn run_one(
         }
         let engine = (rt.make_engine)(&job, flag);
         let sink = Forward { job_id: job_id.clone(), outbox: outbox.clone() };
-        run_job(&job, &rt.registry, &rt.config, &engine, &sink).await.map_err(|e| e.to_string())
+        let result = run_job(&job, &rt.registry, &rt.config, &engine, &sink).await.map_err(|e| e.to_string())?;
+        Ok((result, engine.timings()))
     }
     .await;
 
     let elapsed_ms = started.elapsed().as_millis();
     match outcome {
-        Ok(result) => {
+        Ok((result, timings)) => {
             tracing::info!(job = %job_id, ok = result.ok, elapsed_ms, "mesh worker: job done");
-            let _ = outbox.send(Frame::Done { job_id: job_id.clone(), result });
+            let _ = outbox.send(Frame::Done { job_id: job_id.clone(), result, timings });
         }
         Err(message) => {
             tracing::warn!(job = %job_id, elapsed_ms, "mesh worker: job could not run");

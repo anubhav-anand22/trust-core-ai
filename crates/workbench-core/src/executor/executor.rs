@@ -105,7 +105,7 @@ pub async fn execute_plan(
         };
         let result = run_step(registry, step, &ctx).await?;
 
-        finish_step(step, &result, sink);
+        finish_step(step, &result, None, sink);
         if result.ok {
             outputs.insert(step.id.clone(), result.data.clone());
         }
@@ -174,13 +174,15 @@ pub(crate) async fn run_step(
 }
 
 /// Emit `ToolFinished` and log the outcome of one step. The caller records the
-/// output.
+/// output. `device` names the mesh device that ran it; `None` = this one.
 pub(crate) fn finish_step(
     step: &crate::engine::schemas::TaskStep,
     result: &ToolResult,
+    device: Option<String>,
     sink: &dyn ProgressSink,
 ) {
     sink.emit(StepEvent::ToolFinished {
+        device,
         tool: step.task.clone(),
         ok: result.ok,
         elapsed_ms: result.elapsed_ms,

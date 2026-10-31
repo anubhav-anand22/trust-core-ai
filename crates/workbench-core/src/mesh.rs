@@ -91,6 +91,12 @@ pub trait Dispatcher: Send + Sync {
     /// Stop was pressed: tell the Workers to abandon their jobs.
     async fn cancel_all(&self) {}
 
+    /// The name the audit panel shows for a Worker ("gpu-box"). `None` = its id.
+    fn device_name(&self, worker: &str) -> Option<String> {
+        let _ = worker;
+        None
+    }
+
     /// The Worker that should plan this turn, or `None` for the Host (MESH-10).
     fn delegator(&self) -> Option<String> {
         None
@@ -482,7 +488,11 @@ pub async fn execute_plan_mesh(
                 // The Host owns the plan: a Worker cannot relabel a result.
                 result.step_id = step.id.clone();
                 result.task = step.task.clone();
-                finish_step(step, &result, sink);
+                let device = match &node {
+                    Node::Local => None,
+                    Node::Worker(id) => Some(dispatcher.device_name(id).unwrap_or_else(|| id.clone())),
+                };
+                finish_step(step, &result, device, sink);
                 if result.ok {
                     outputs[i] = Some(result.data.clone());
                 }

@@ -84,6 +84,10 @@ pub struct ResourceLimits {
     /// on a small box, the desktop) indefinitely. Deliberately generous: CPU
     /// inference of a long prompt is slow, not stuck.
     pub call_timeout: Duration,
+    /// Model layers Ollama may put on the GPU. `None` = Ollama decides (every
+    /// normal turn). `Some(0)` = CPU only: a mesh Worker whose owner unticked
+    /// "Lend the GPU".
+    pub num_gpu: Option<u32>,
 }
 
 impl Default for ResourceLimits {
@@ -95,6 +99,7 @@ impl Default for ResourceLimits {
             num_thread: crate::worker_threads() as u32,
             num_predict: 640,
             call_timeout: Duration::from_secs(240),
+            num_gpu: None,
         }
     }
 }
@@ -108,7 +113,8 @@ impl Default for ResourceLimits {
 /// reports all three on every response; this keeps them instead of dropping them.
 /// The `Option`s are `None` when Ollama omits a field (and always for embeddings,
 /// whose response carries no breakdown).
-#[derive(Clone, Debug, serde::Serialize)]
+/// `Deserialize` too: a mesh Worker sends its calls' timings back to the Host.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CallTiming {
     /// The `what` label of the call: `"task_planner"`, `"analysis"`, `"vision"`…
     pub role: String,
@@ -434,10 +440,14 @@ impl OllamaEngine {
     /// Ollama's default *unbounded* thread count, which is enough on its own to
     /// starve the desktop for the length of a turn.
     pub(crate) fn opts(&self) -> ModelOptions {
-        ModelOptions::default()
+        let opts = ModelOptions::default()
             .num_ctx(self.limits.num_ctx)
             .num_thread(self.limits.num_thread)
-            .num_predict(self.limits.num_predict)
+            .num_predict(self.limits.num_predict);
+        match self.limits.num_gpu {
+            Some(layers) => opts.num_gpu(layers),
+            None => opts,
+        }
     }
 
     pub fn llm_model(&self) -> &str {

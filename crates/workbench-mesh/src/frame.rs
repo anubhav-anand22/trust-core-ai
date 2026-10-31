@@ -8,6 +8,7 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use workbench_core::engine::CallTiming;
 use workbench_core::mesh::{PlanJob, PlanReply, StepJob};
 use workbench_core::schemas::{FileKind, ToolResult};
 use workbench_core::StepEvent;
@@ -33,8 +34,14 @@ pub enum Frame {
     Job { job_id: String, job: StepJob, files: Vec<FileBlob> },
     /// Worker → Host: live progress from the running job (streamed text, deep-read windows).
     Event { job_id: String, event: StepEvent },
-    /// Worker → Host: the tool ran. `result.ok` may still be false.
-    Done { job_id: String, result: ToolResult },
+    /// Worker → Host: the tool ran. `result.ok` may still be false. `timings`
+    /// are its model calls, so the Host's log shows where a turn's time went.
+    Done {
+        job_id: String,
+        result: ToolResult,
+        #[serde(default)]
+        timings: Vec<CallTiming>,
+    },
     /// Worker → Host: the job could not run here (missing model, busy, panicked).
     Failed { job_id: String, message: String },
     /// Host → delegator Worker: one planner model call (MESH-9).
@@ -98,9 +105,9 @@ mod tests {
 
     #[test]
     fn every_frame_survives_the_wire() {
-        round_trip(Frame::Done { job_id: "j".into(), result: result(5, serde_json::json!({"text": "x"})) });
-        round_trip(Frame::Done { job_id: "j".into(), result: result(0, serde_json::json!({"bytes": 4096, "ran_on": "w"})) });
-        round_trip(Frame::Done { job_id: "j".into(), result: result(u64::MAX as u128 + 1, serde_json::Value::Null) });
+        round_trip(Frame::Done { job_id: "j".into(), result: result(5, serde_json::json!({"text": "x"})), timings: vec![] });
+        round_trip(Frame::Done { job_id: "j".into(), result: result(0, serde_json::json!({"bytes": 4096, "ran_on": "w"})), timings: vec![] });
+        round_trip(Frame::Done { job_id: "j".into(), result: result(u64::MAX as u128 + 1, serde_json::Value::Null), timings: vec![] });
         round_trip(Frame::Event {
             job_id: "j".into(),
             event: StepEvent::Streaming { tool: "parse_pdf".into(), text: "reading".into() },

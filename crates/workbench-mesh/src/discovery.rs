@@ -28,11 +28,13 @@ pub struct Advertisement {
 }
 
 impl Advertisement {
-    /// Announce this Host. `instance` must be unique on the LAN (the device id is).
+    /// Announce this Host. `instance` must be unique on the LAN: pass the device
+    /// id. It is also advertised as `id`, so a paired Worker can find this Host
+    /// again with no code ([`find_host_by_id`]).
     pub fn start(instance: &str, port: u16, tag: &str) -> Result<Self> {
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
         let proto = PROTOCOL_VERSION.to_string();
-        let props = [("tag", tag), ("proto", proto.as_str())];
+        let props = [("tag", tag), ("proto", proto.as_str()), ("id", instance)];
         let info = ServiceInfo::new(
             SERVICE_TYPE,
             instance,
@@ -60,7 +62,16 @@ impl Drop for Advertisement {
 /// Addresses of Hosts advertising `tag`, waiting up to `wait` for the first.
 /// Empty means none was found in time.
 pub async fn find_hosts(tag: &str, wait: Duration) -> Result<Vec<SocketAddr>> {
-    let tag = tag.to_string();
+    find_by("tag", tag, wait).await
+}
+
+/// Where a Host this Worker paired with is now (its port changes per run).
+pub async fn find_host_by_id(device_id: &str, wait: Duration) -> Result<Vec<SocketAddr>> {
+    find_by("id", device_id, wait).await
+}
+
+async fn find_by(key: &'static str, value: &str, wait: Duration) -> Result<Vec<SocketAddr>> {
+    let tag = value.to_string();
     tokio::task::spawn_blocking(move || {
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
         let events = daemon.browse(SERVICE_TYPE).map_err(mdns_err)?;
@@ -70,7 +81,7 @@ pub async fn find_hosts(tag: &str, wait: Duration) -> Result<Vec<SocketAddr>> {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
             let Ok(event) = events.recv_timeout(left) else { break };
             if let ServiceEvent::ServiceResolved(info) = event {
-                if info.get_property_val_str("tag") != Some(tag.as_str()) {
+                if info.get_property_val_str(key) != Some(tag.as_str()) {
                     continue;
                 }
                 let port = info.get_port();
