@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use workbench_core::engine::OllamaEngine;
 use workbench_core::events::VecSink;
 use workbench_core::executor::ToolRegistry;
-use workbench_core::mesh::{execute_plan_mesh, Dispatcher, RemotePlanner};
+use workbench_core::mesh::{execute_plan_mesh, Dispatcher, RemotePlanner, StepJob};
 use workbench_core::planner::{plan_turn, PlanOutcome, PlanSource};
 use workbench_core::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep, ToolResult};
 use workbench_core::tools::{Tool, ToolContext};
@@ -249,6 +249,31 @@ async fn a_much_faster_worker_plans_the_turn_over_the_real_link() {
     assert!(matches!(outcome, PlanOutcome::Ready(p) if p.steps[0].task == "search_knowledge"));
     assert_eq!(local.calls.load(Ordering::SeqCst), 0, "the Host's model wasn't used");
     assert!(!sink.events().iter().any(|e| matches!(e, StepEvent::Warning { .. })));
+}
+
+/// Security review fix C: a Worker refuses Host-only steps itself, so even a
+/// modified Host can't make it search the Worker's own knowledge base.
+#[tokio::test]
+async fn a_worker_refuses_to_search_its_own_knowledge_base_for_a_host() {
+    let m = mesh(true, Duration::ZERO).await;
+    let dispatcher = m.hub.for_turn(&[]);
+    let worker_id = m.hub.workers()[0].device_id.clone();
+    let job = StepJob {
+        step: TaskStep { id: "k1".into(), task: "search_knowledge".into(), args: json!({ "query": "salaries" }), depends_on: vec![] },
+        dep_outputs: Default::default(),
+        files: vec![],
+        prompt: "salaries".into(),
+        session_blob: String::new(),
+        mode: Default::default(),
+        persona: String::new(),
+    };
+
+    // Straight to the Worker, as a modified Host would: past the scheduler.
+    let r = dispatcher.run_on_worker(&worker_id, job, &VecSink::new()).await;
+
+    let Err(CoreError::Tool { message, .. }) = r else { panic!("expected a refusal, got {r:?}") };
+    assert!(message.contains("only runs on the Host"), "{message}");
+    assert_eq!(m.hub.workers().len(), 1, "a refusal is not a disconnect");
 }
 
 #[tokio::test]

@@ -215,6 +215,36 @@ setup with Ollama running. Ideally A is weak (no GPU) and B is stronger.
 9. **Discovery blocked:** if step 2 says no Host found, use "Enter its address"
    with the address A's panel shows.
 
+## Security review (2026-10-31)
+
+The questions asked: what can a device on the same Wi-Fi do *before* it is
+trusted, and what can a paired device make the other side do? Seven
+findings, all fixed, each with a test:
+
+| # | Finding | Fix | Test |
+|---|---|---|---|
+| A | The 5-attempt limit was checked when a handshake *started* and counted when it *ended*, so 1,000 simultaneous connections got 1,000 guesses | Each attempt holds a unit of the budget from `begin` to `finish`; a drop guard spends it on every exit but a completed pairing (wrong code, timeout, disconnect) | `a_burst_of_simultaneous_guesses_gets_no_more_than_the_budget`, `simultaneous_attempts_cannot_exceed_the_budget` |
+| B | tungstenite accepts 64 MB messages by default, and the first one is read before any authentication | `ws_config()`: max message and frame ≈ 64 KiB on both sides, since every real message is a small handshake message or one Noise chunk | `an_unauthenticated_device_cannot_send_a_huge_message` |
+| C | A Worker ran any registered tool the Host named, so a *modified* Host could make it search the Worker's own knowledge base and send the passages back | The Worker refuses Host-only steps itself, using the same `scheduler::needs` table the Host uses | `a_worker_refuses_to_search_its_own_knowledge_base_for_a_host` |
+| D | Unbounded handshakes in flight, each allowed 15 s | At most 16 at once; further connections are closed immediately | — (a bound, not behaviour) |
+| E | A frame header announcing 256 MB reserved 256 MB before any data | The buffer grows as chunks arrive (≤1 MiB up front) | existing 3 MB frame test |
+| F | The peer's self-chosen name was unbounded and could contain control characters | Trimmed, control characters dropped, 64 characters max | `a_hostile_device_name_is_trimmed` |
+| G | Joining tried only the first Host discovered, so a tag collision or a fake advertisement blocked pairing | Discovery listens 1 s past the first match; `pair_any` / `reconnect_any` try each candidate | `the_worker_tries_every_candidate_until_one_pairs` |
+
+What was checked and is fine as designed: a wrong code is only detectable
+at the Host's read of the last Noise message, so abandoning earlier teaches
+an attacker nothing. A fake Host can test one guess per Worker attempt, and
+the Worker's user must start each one. A reconnect is accepted only for a
+pinned key on both sides, and a device waiting for consent can't reconnect
+around the consent screen. Names and capabilities reach the UI through
+React, which escapes them.
+
+Left as is, with the reason:
+- A Worker sees its job in plain text (see above). That is inherent to
+  running a model on it, and it is what the consent screen says.
+- Anyone on the LAN can see that a TrustCore Host exists, plus its tag and
+  device id (mDNS). Neither is enough to pair or reconnect.
+
 ## Decisions
 
 Recorded so any session can defend them, or notice when a request contradicts

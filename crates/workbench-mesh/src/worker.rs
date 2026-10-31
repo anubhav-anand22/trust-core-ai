@@ -20,6 +20,7 @@ use workbench_core::{CancelFlag, PipelineConfig, ProgressSink, StepEvent};
 
 use crate::frame::{FileBlob, Frame};
 use crate::link::Link;
+use crate::scheduler::{needs, Needs};
 
 /// Builds this Worker's engine for one job: its own models (MESH-8) and caps,
 /// with the job's mode and persona, and the job's cancel flag.
@@ -95,6 +96,14 @@ pub async fn serve(
                     if current.is_some() {
                         // The Host schedules one job per Worker; this is a guard, not a queue.
                         let _ = outbox.send(Frame::Failed { job_id, message: "this device is busy".into() });
+                        continue;
+                    }
+                    // Enforced here too, not only in the Host's scheduler: a
+                    // modified Host must not be able to make this device search
+                    // *its own* knowledge base and send the passages back.
+                    if needs(&job.step.task) == Needs::HostOnly {
+                        tracing::warn!(job = %job_id, task = %job.step.task, "mesh worker: refused a Host-only step");
+                        let _ = outbox.send(Frame::Failed { job_id, message: "this step only runs on the Host".into() });
                         continue;
                     }
                     tracing::info!(job = %job_id, task = %job.step.task, "mesh worker: job start");

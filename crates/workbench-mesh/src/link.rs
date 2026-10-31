@@ -31,6 +31,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
@@ -174,7 +175,8 @@ impl LinkReader {
         if len > MAX_FRAME_BYTES {
             return Err(MeshError::Protocol(format!("peer announced a {len}-byte frame")));
         }
-        let mut body = Vec::with_capacity(len as usize);
+        // Grow as chunks arrive: a header alone must not reserve 256 MB.
+        let mut body = Vec::with_capacity((len as usize).min(1024 * 1024));
         while (body.len() as u64) < len {
             let part = self.open_next().await?;
             if part.is_empty() || body.len() as u64 + part.len() as u64 > len {
@@ -228,7 +230,7 @@ async fn accept_inner(
     window: &Mutex<Option<PairingWindow>>,
     trust: &Mutex<TrustStore>,
 ) -> Result<Accepted> {
-    let mut ws = tokio_tungstenite::accept_async(tcp).await?;
+    let mut ws = tokio_tungstenite::accept_async_with_config(tcp, Some(ws_config())).await?;
 
     let opening: Opening = serde_json::from_str(&next_text(&mut ws).await?)?;
     if opening.proto != PROTOCOL_VERSION {
@@ -238,22 +240,26 @@ async fn accept_inner(
 
     match opening.mode {
         Mode::Pair => {
-            let code = {
-                let guard = window.lock().expect("pairing lock");
-                let open = guard.as_ref().ok_or("this Host isn't accepting new devices right now");
-                match open.and_then(|w| w.check().map(|()| w).map_err(|c| c.reason())) {
-                    Ok(w) if Some(w.code().tag()) == opening.tag.as_deref() => Ok(w.code().clone()),
-                    Ok(_) => Err("wrong code"),
-                    Err(reason) => Err(reason),
+            // A wrong tag is refused for free (the tag is public). Past this
+            // point the attempt holds a unit of the failure budget until it ends.
+            let attempt = {
+                let mut guard = window.lock().expect("pairing lock");
+                match guard.as_mut() {
+                    None => Err("this Host isn't accepting new devices right now"),
+                    Some(w) if Some(w.code().tag()) != opening.tag.as_deref() => Err("wrong code"),
+                    Some(w) => w.begin().map(|()| w.code().clone()).map_err(|c| c.reason()),
                 }
             };
-            let code = match code {
+            let code = match attempt {
                 Ok(code) => code,
                 Err(reason) => {
                     refuse(&mut ws, reason).await;
                     return Err(MeshError::Rejected(reason.into()));
                 }
             };
+            // Spends the unit on every way out except a completed pairing,
+            // including a timeout or a dropped connection.
+            let mut attempt = Attempt { window, code: code.clone(), paired: false };
 
             let psk = spake(&mut ws, &code).await?;
             let hs = snow::Builder::new(PAIR_PARAMS.parse()?)
@@ -263,15 +269,13 @@ async fn accept_inner(
             let hs = match noise(&mut ws, hs).await {
                 Ok(hs) => hs,
                 Err(MeshError::Noise(_)) => {
-                    if let Some(w) = window.lock().expect("pairing lock").as_mut() {
-                        w.record_failure();
-                    }
                     refuse(&mut ws, "wrong code").await;
                     return Err(MeshError::Rejected("wrong code".into()));
                 }
                 Err(e) => return Err(e),
             };
             let link = finish(ws, hs, hello).await?;
+            attempt.paired = true;
             tracing::info!(device = %link.peer.device_id, name = %link.peer.name, "mesh: device paired");
             Ok(Accepted { link, newly_paired: true })
         }
@@ -294,6 +298,39 @@ async fn accept_inner(
         }
     }
 }
+
+/// One pairing attempt's hold on the window's failure budget.
+struct Attempt<'a> {
+    window: &'a Mutex<Option<PairingWindow>>,
+    code: PairingCode,
+    paired: bool,
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if let Some(w) = self.window.lock().expect("pairing lock").as_mut() {
+            // A newer code has its own budget: don't touch it.
+            if *w.code() == self.code {
+                w.finish(self.paired);
+            }
+        }
+    }
+}
+
+/// Every message on a link is small: the handshake's few hundred bytes, then
+/// Noise chunks of at most 64 KiB. tungstenite would otherwise accept 64 MB
+/// messages, and the first one arrives before the peer has proved anything.
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE))
+        .max_frame_size(Some(MAX_WS_MESSAGE))
+}
+
+const MAX_WS_MESSAGE: usize = NOISE_MAX + 1024;
+
+/// A display name from the other device, trimmed and bounded: it goes into
+/// the UI and the logs.
+const MAX_NAME_CHARS: usize = 64;
 
 // --- Worker side ---------------------------------------------------------------
 
@@ -340,9 +377,50 @@ pub async fn reconnect(
     .map_err(|_| MeshError::Timeout("reconnect"))?
 }
 
+/// [`pair`] with each of `addrs` in turn until one accepts the code.
+///
+/// Discovery can return several: two Hosts sharing a 2-character tag (about 1
+/// in 1,024), or a device advertising a tag it doesn't own. A wrong one just
+/// fails its handshake, so trying the next is safe. Returns the last error.
+pub async fn pair_any(addrs: &[SocketAddr], code: &PairingCode, me: &DeviceIdentity, hello: &Hello) -> Result<Link> {
+    let mut last = MeshError::Rejected("no Host to try".into());
+    for &addr in addrs {
+        match pair(addr, code, me, hello).await {
+            Ok(link) => return Ok(link),
+            Err(e) => {
+                tracing::warn!(%addr, error = %e, "mesh: that device didn't pair; trying the next");
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// [`reconnect`] with each of `addrs` in turn. Anyone can advertise a Host's
+/// public device id; only the real Host can prove its key.
+pub async fn reconnect_any(
+    addrs: &[SocketAddr],
+    me: &DeviceIdentity,
+    host_public_key: &[u8],
+    hello: &Hello,
+) -> Result<Link> {
+    let mut last = MeshError::Rejected("no Host to try".into());
+    for &addr in addrs {
+        match reconnect(addr, me, host_public_key, hello).await {
+            Ok(link) => return Ok(link),
+            Err(e) => {
+                tracing::warn!(%addr, error = %e, "mesh: that device wasn't our Host; trying the next");
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
 async fn dial(addr: SocketAddr, mode: Mode, tag: Option<&str>) -> Result<Ws> {
     let tcp = TcpStream::connect(addr).await?;
-    let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/mesh"), tcp).await?;
+    let (mut ws, _) =
+        tokio_tungstenite::client_async_with_config(format!("ws://{addr}/mesh"), tcp, Some(ws_config())).await?;
     let opening = Opening { proto: PROTOCOL_VERSION, mode, tag: tag.map(str::to_string) };
     ws.send(Message::text(serde_json::to_string(&opening)?)).await?;
     Ok(ws)
@@ -401,8 +479,9 @@ async fn finish(ws: Ws, hs: snow::HandshakeState, hello: &Hello) -> Result<Link>
         Err(e) => return Err(sent.err().unwrap_or(e)),
     };
     sent?;
+    let name: String = theirs.name.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME_CHARS).collect();
     let peer = Peer {
-        name: theirs.name,
+        name: if name.is_empty() { "unnamed device".into() } else { name },
         device_id: device_id(&remote_key),
         public_key: remote_key,
         capabilities: theirs.capabilities,

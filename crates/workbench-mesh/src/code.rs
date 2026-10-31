@@ -97,6 +97,11 @@ pub struct PairingWindow {
     opened: Instant,
     ttl: Duration,
     failures_left: u8,
+    /// Attempts between [`Self::begin`] and [`Self::finish`]. Each one holds a
+    /// unit of the failure budget while it runs: checking only at the start and
+    /// counting only at the end would let 1,000 simultaneous connections make
+    /// 1,000 guesses before the first failure was recorded.
+    in_flight: u8,
 }
 
 /// Why a pairing attempt was refused before any key exchange.
@@ -104,6 +109,8 @@ pub struct PairingWindow {
 pub enum Closed {
     Expired,
     TooManyFailures,
+    /// Every remaining attempt is already in use by other connections.
+    Busy,
 }
 
 impl Closed {
@@ -111,13 +118,14 @@ impl Closed {
         match self {
             Closed::Expired => "this pairing code has expired; ask for a new one",
             Closed::TooManyFailures => "too many wrong attempts; ask for a new code",
+            Closed::Busy => "other devices are pairing right now; try again in a moment",
         }
     }
 }
 
 impl PairingWindow {
     pub fn open(code: PairingCode, ttl: Duration, max_failures: u8) -> Self {
-        Self { code, opened: Instant::now(), ttl, failures_left: max_failures }
+        Self { code, opened: Instant::now(), ttl, failures_left: max_failures, in_flight: 0 }
     }
 
     pub fn code(&self) -> &PairingCode {
@@ -139,9 +147,25 @@ impl PairingWindow {
         }
     }
 
-    /// A handshake with this code failed: the guess was wrong.
-    pub fn record_failure(&mut self) {
-        self.failures_left = self.failures_left.saturating_sub(1);
+    /// Start an attempt: it holds one unit of the failure budget until
+    /// [`Self::finish`]. Refused when the window is closed or every remaining
+    /// unit is already held.
+    pub fn begin(&mut self) -> Result<(), Closed> {
+        self.check()?;
+        if self.in_flight >= self.failures_left {
+            return Err(Closed::Busy);
+        }
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// End an attempt started with [`Self::begin`]. Anything but a completed
+    /// pairing (wrong code, dropped connection, timeout) spends the unit.
+    pub fn finish(&mut self, paired: bool) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if !paired {
+            self.failures_left = self.failures_left.saturating_sub(1);
+        }
     }
 }
 
@@ -179,13 +203,26 @@ mod tests {
     #[test]
     fn a_window_closes_on_time_or_after_the_failure_budget() {
         let mut w = PairingWindow::open(PairingCode::generate(), DEFAULT_TTL, 2);
+        assert_eq!(w.begin(), Ok(()));
+        w.finish(false);
         assert_eq!(w.check(), Ok(()));
-        w.record_failure();
-        assert_eq!(w.check(), Ok(()));
-        w.record_failure();
+        assert_eq!(w.begin(), Ok(()));
+        w.finish(false);
         assert_eq!(w.check(), Err(Closed::TooManyFailures));
+        assert_eq!(w.begin(), Err(Closed::TooManyFailures));
 
         let expired = PairingWindow::open(PairingCode::generate(), Duration::ZERO, 5);
         assert_eq!(expired.check(), Err(Closed::Expired));
+    }
+
+    #[test]
+    fn simultaneous_attempts_cannot_exceed_the_budget() {
+        let mut w = PairingWindow::open(PairingCode::generate(), DEFAULT_TTL, 3);
+        assert!((0..3).all(|_| w.begin().is_ok()));
+        assert_eq!(w.begin(), Err(Closed::Busy), "a 4th guess while 3 are running");
+        w.finish(true); // a real device paired: its unit comes back
+        assert_eq!(w.begin(), Ok(()));
+        (0..3).for_each(|_| w.finish(false));
+        assert_eq!(w.begin(), Err(Closed::TooManyFailures));
     }
 }

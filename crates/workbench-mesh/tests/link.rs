@@ -231,6 +231,87 @@ async fn a_protocol_mismatch_is_named_on_both_sides() {
     assert!(text.as_str().contains(&format!("\"proto\":{PROTOCOL_VERSION}")));
 }
 
+/// Security review fix A: the failure budget held per attempt, so a burst of
+/// simultaneous guesses gets no more tries than one guess after another.
+#[tokio::test]
+async fn a_burst_of_simultaneous_guesses_gets_no_more_than_the_budget() {
+    let host = Host::new(window(3));
+    let code = host.code();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (me_h, window_h, trust_h) = (host.me.clone(), host.window.clone(), host.trust.clone());
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let (me, window, trust) = (me_h.clone(), window_h.clone(), trust_h.clone());
+            tokio::spawn(async move {
+                let hello = Hello { name: me.name.clone(), capabilities: serde_json::json!({}) };
+                let _ = accept(tcp, &me, &hello, &window, &trust).await;
+            });
+        }
+    });
+
+    let guesses = (0..12).map(|_| {
+        let wrong = wrong_secret(&code);
+        async move {
+            let (me, hello) = worker();
+            match pair(addr, &wrong, &me, &hello).await {
+                Err(MeshError::Rejected(reason)) => reason,
+                other => panic!("a wrong code can't pair: {:?}", other.err()),
+            }
+        }
+    });
+    let reasons = futures_util::future::join_all(guesses).await;
+
+    let reached_the_key_exchange = reasons.iter().filter(|r| *r == "wrong code").count();
+    assert!(reached_the_key_exchange <= 3, "{reached_the_key_exchange} guesses got through: {reasons:?}");
+    let (me, hello) = worker();
+    assert!(rejected(pair(addr, &code, &me, &hello).await).contains("too many wrong attempts"));
+}
+
+/// Fix B: before the peer has proved anything, a message is at most ~64 KiB,
+/// not tungstenite's default 64 MB.
+#[tokio::test]
+async fn an_unauthenticated_device_cannot_send_a_huge_message() {
+    let host = Host::new(window(5));
+    let (addr, task) = host.accept_one().await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::client_async(format!("ws://{addr}/mesh"), tcp).await.unwrap();
+    let _ = ws.send(Message::text("x".repeat(2 * 1024 * 1024))).await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), task).await.expect("refused promptly");
+    assert!(outcome.unwrap().is_err(), "a 2 MB opening message must be refused");
+}
+
+/// Fix F: the other device names itself; that name is bounded and printable.
+#[tokio::test]
+async fn a_hostile_device_name_is_trimmed() {
+    let host = Host::new(window(5));
+    let (addr, task) = host.accept_one().await;
+    let me = DeviceIdentity::generate("x").unwrap();
+    let hello = Hello { name: format!("  evil\u{7}{}", "A".repeat(500)), capabilities: serde_json::json!({}) };
+    let _w = pair(addr, &host.code(), &me, &hello).await.unwrap();
+    let accepted = task.await.unwrap().unwrap();
+    let name = &accepted.link.peer().name;
+    assert_eq!(name.chars().count(), 64);
+    assert!(name.starts_with("evilAAA"), "{name}");
+}
+
+/// Fix G: with several candidates (a tag collision, an impostor, a dead
+/// address), the Worker tries each until the real Host pairs.
+#[tokio::test]
+async fn the_worker_tries_every_candidate_until_one_pairs() {
+    let host = Host::new(window(5));
+    // Nothing listens here once the listener is dropped: connection refused.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+    let (real, task) = host.accept_one().await;
+    let (me, hello) = worker();
+
+    let link = workbench_mesh::link::pair_any(&[dead, real], &host.code(), &me, &hello).await.unwrap();
+    assert_eq!(link.peer().public_key, host.me.public_key);
+    assert!(task.await.unwrap().is_ok());
+}
+
 /// Needs multicast on a real interface, which CI sandboxes often block.
 /// Run by hand: `cargo test -p workbench-mesh --test link -- --ignored`.
 #[tokio::test]

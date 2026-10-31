@@ -75,9 +75,13 @@ async fn find_by(key: &'static str, value: &str, wait: Duration) -> Result<Vec<S
     tokio::task::spawn_blocking(move || {
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
         let events = daemon.browse(SERVICE_TYPE).map_err(mdns_err)?;
-        let deadline = Instant::now() + wait;
-        let mut found = Vec::new();
-        while found.is_empty() {
+        // After the first match, listen a moment longer: a second device with
+        // the same tag (a collision, or an impostor) must reach the list too, so
+        // the Worker can try each (`link::pair_any`).
+        const AFTER_FIRST: Duration = Duration::from_secs(1);
+        let mut deadline = Instant::now() + wait;
+        let mut found: Vec<SocketAddr> = Vec::new();
+        loop {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
             let Ok(event) = events.recv_timeout(left) else { break };
             if let ServiceEvent::ServiceResolved(info) = event {
@@ -85,9 +89,15 @@ async fn find_by(key: &'static str, value: &str, wait: Duration) -> Result<Vec<S
                     continue;
                 }
                 let port = info.get_port();
-                found.extend(
-                    info.get_addresses_v4().into_iter().map(|ip| SocketAddr::new(IpAddr::V4(ip), port)),
-                );
+                let first = found.is_empty();
+                for addr in info.get_addresses_v4().into_iter().map(|ip| SocketAddr::new(IpAddr::V4(ip), port)) {
+                    if !found.contains(&addr) {
+                        found.push(addr);
+                    }
+                }
+                if first && !found.is_empty() {
+                    deadline = deadline.min(Instant::now() + AFTER_FIRST);
+                }
             }
         }
         let _ = daemon.stop_browse(SERVICE_TYPE);

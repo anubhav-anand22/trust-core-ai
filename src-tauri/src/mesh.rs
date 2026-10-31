@@ -28,7 +28,7 @@ use workbench_mesh::discovery::{find_host_by_id, find_hosts, Advertisement};
 use workbench_mesh::frame::Hello;
 use workbench_mesh::hub::{Hub, TurnDispatcher};
 use workbench_mesh::identity::{DeviceIdentity, TrustStore};
-use workbench_mesh::link::{pair, reconnect, Link};
+use workbench_mesh::link::{pair_any, reconnect_any, Link};
 use workbench_mesh::scheduler::Capabilities;
 use workbench_mesh::worker::{serve, Activity, WorkerRuntime};
 
@@ -399,16 +399,15 @@ pub async fn mesh_join(
     ensure_off(&mesh).await?;
     let code = PairingCode::parse(&code)
         .ok_or("That code doesn't look right: it is 6 letters and digits, like K7Q-4M9.")?;
-    let addr = match address.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-        Some(a) => a.parse::<SocketAddr>().map_err(|_| "The address should look like 192.168.1.20:52345.")?,
-        None => *find_hosts(code.tag(), FIND_HOST_FOR)
-            .await
-            .map_err(|e| e.to_string())?
-            .first()
-            .ok_or("No Host with that code was found on this network. Check both devices are on the same Wi-Fi, or enter the Host's address.")?,
+    let addrs = match address.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+        Some(a) => vec![a.parse::<SocketAddr>().map_err(|_| "The address should look like 192.168.1.20:52345.")?],
+        None => find_hosts(code.tag(), FIND_HOST_FOR).await.map_err(|e| e.to_string())?,
     };
+    if addrs.is_empty() {
+        return Err("No Host with that code was found on this network. Check both devices are on the same Wi-Fi, or enter the Host's address.".into());
+    }
     let (me, hello, plan) = worker_hello(&app, &state).await?;
-    let link = pair(addr, &code, &me, &hello).await.map_err(|e| e.to_string())?;
+    let link = pair_any(&addrs, &code, &me, &hello).await.map_err(|e| e.to_string())?;
     let host = link.peer().clone();
     let mut hosts = TrustStore::load(&mesh_dir(&app)?.join("hosts.json")).map_err(|e| e.to_string())?;
     hosts.add(&host.name, &host.public_key).map_err(|e| e.to_string())?;
@@ -428,13 +427,12 @@ pub async fn mesh_reconnect(
     let known = hosts.devices().iter().find(|d| d.device_id == device_id).ok_or("That Host isn't paired any more.")?;
     use base64::Engine as _;
     let key = base64::engine::general_purpose::STANDARD.decode(&known.public_key).map_err(|e| e.to_string())?;
-    let addr = *find_host_by_id(&device_id, FIND_HOST_FOR)
-        .await
-        .map_err(|e| e.to_string())?
-        .first()
-        .ok_or("That Host isn't hosting right now, or isn't on this network.")?;
+    let addrs = find_host_by_id(&device_id, FIND_HOST_FOR).await.map_err(|e| e.to_string())?;
+    if addrs.is_empty() {
+        return Err("That Host isn't hosting right now, or isn't on this network.".into());
+    }
     let (me, hello, plan) = worker_hello(&app, &state).await?;
-    let link = reconnect(addr, &me, &key, &hello).await.map_err(|e| e.to_string())?;
+    let link = reconnect_any(&addrs, &me, &key, &hello).await.map_err(|e| e.to_string())?;
     start_worker(&app, &mesh, link, plan).await
 }
 

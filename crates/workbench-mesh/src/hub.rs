@@ -33,6 +33,10 @@ use crate::scheduler::{self, Capabilities, WorkerView};
 pub const PING_EVERY: Duration = Duration::from_secs(5);
 pub const SILENCE_LIMIT: Duration = Duration::from_secs(20);
 
+/// Handshakes the Host runs at once (see [`Hub::serve`]). A real room has a
+/// handful of devices joining, not sixteen in the same 15 seconds.
+pub const MAX_HANDSHAKES: usize = 16;
+
 /// Size of the one-off bandwidth probe sent at join.
 const PROBE_BYTES: usize = 1024 * 1024;
 const PROBE_ID: u64 = u64::MAX;
@@ -150,10 +154,21 @@ impl Hub {
     /// Accept Workers until the listener fails. Each handshake runs on its own
     /// task, so a slow or hostile client never blocks the next one.
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
+        // Handshakes run before the peer has proved anything. Bound how many at
+        // once, so a burst of silent connections (each may hold for the 15 s
+        // handshake timeout) can't pile up. Over the bound, a connection is
+        // closed at once.
+        let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_HANDSHAKES));
         loop {
             let (tcp, from) = listener.accept().await?;
+            let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+                tracing::warn!(%from, "mesh: too many devices joining at once; dropped one");
+                drop(tcp);
+                continue;
+            };
             let hub = self.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let hello = Hello {
                     name: hub.inner.me.name.clone(),
                     capabilities: serde_json::to_value(hub.host_caps()).unwrap_or_default(),

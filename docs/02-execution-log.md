@@ -1567,6 +1567,35 @@ already there; the work was only to put the network behind it.
 state it owns. Here, "the role is Worker" wasn't enough; it had to be "the
 role is *my* Worker".
 
+## Fix pass — part 25: a security review of the mesh
+
+Read adversarially: what can a device on the same Wi-Fi do before it is
+trusted, and what can a paired one make the other side do. The full table
+is in [12-mesh.md](12-mesh.md#security-review-2026-10-31). The three that
+mattered:
+
+- **The attempt limit was a race.** `check()` ran at the start of a
+  handshake and `record_failure()` at its end, so every connection that
+  started before the first failure got a free guess. With 1,000 at once,
+  that is 1,000 guesses against a 1-in-a-million secret. Now each attempt
+  *holds* a unit of the budget for its whole life (a drop guard spends it on
+  every way out except success). The test fires 12 simultaneous wrong
+  guesses at a budget of 3 and asserts at most 3 reach the key exchange.
+- **64 MB before hello.** tungstenite's default message limit is 64 MB, and
+  the Host reads the opening message before the peer has proved anything.
+  Every real message is under 64 KiB, so that is the limit now.
+- **The Worker trusted the Host's scheduler.** Our Host never sends
+  `search_knowledge` to a Worker, but the Worker would have run it against
+  *its own* knowledge base if asked. A Worker owner can't rely on the Host
+  running our code. The Worker now refuses Host-only steps itself.
+
+Also: at most 16 handshakes at once; no 256 MB pre-allocation from a frame
+header; device names bounded and printable; joining tries every discovered
+candidate, which also made the docs' claim about tag collisions true.
+
+**Takeaway:** a limit that is checked in one place and counted in another
+is not a limit under concurrency. Reserve before the work, settle after it.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass
