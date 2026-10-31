@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use workbench_core::engine::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep};
 use workbench_core::events::VecSink;
 use workbench_core::planner::{plan_turn, PlanOutcome, PlanSource, MAX_PLAN_ATTEMPTS};
-use workbench_core::Result;
+use workbench_core::{CoreError, Result};
 
 fn bogus_plan() -> Plan {
     Plan {
@@ -207,6 +207,69 @@ impl PlanSource for ValidOnLastAttempt {
             Ok(valid_plan())
         }
     }
+}
+
+/// Fails every build call the way a real model or a real Stop does.
+struct FailingPlanner {
+    build_calls: AtomicU32,
+    cancelled: bool,
+}
+
+#[async_trait]
+impl PlanSource for FailingPlanner {
+    async fn parse_intent(&self, _p: &str, _h: &str, _u: &[InputFile]) -> Result<IntentResult> {
+        Ok(intent(false))
+    }
+    async fn build_plan(
+        &self,
+        _p: &str,
+        _h: &str,
+        _i: &IntentResult,
+        _u: &[InputFile],
+        _e: &[String],
+    ) -> Result<Plan> {
+        self.build_calls.fetch_add(1, Ordering::SeqCst);
+        if self.cancelled {
+            return Err(CoreError::Cancelled);
+        }
+        // The lead's 2026-11-01 failure: 640 tokens of invented image steps, cut
+        // off mid-string ("EOF while parsing a string").
+        let cut = r#"{"steps":[{"id":"1","task":"parse_pdf","args":{},"depends_on":[]},{"id":"2","task":"analyze_image","args":{"file":"image1.jp"#;
+        let source = serde_json::from_str::<Plan>(cut).unwrap_err();
+        Err(CoreError::Schema { role: "task_planner", source })
+    }
+}
+
+/// Malformed plan JSON used to end the turn with an error. It now goes straight
+/// to the fallback (no retries: a cut-off generation tends to repeat and costs
+/// ~50 s each on CPU) — here, a follow-up answered from the conversation.
+#[tokio::test]
+async fn malformed_plan_json_falls_back_without_retrying() {
+    let src = FailingPlanner { build_calls: AtomicU32::new(0), cancelled: false };
+    let sink = VecSink::new();
+
+    let (_intent, outcome) = plan_turn(&src, "give me a plan on how to implement", &[], "earlier turns", true, &sink)
+        .await
+        .expect("a malformed plan must not fail the turn");
+
+    let PlanOutcome::Ready(plan) = outcome else {
+        panic!("expected a fallback Ready plan, got {outcome:?}");
+    };
+    assert_eq!(plan.steps.len(), 1, "{plan:?}");
+    assert_eq!(plan.steps[0].task, "answer_followup");
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), 1, "no retries after malformed JSON");
+    assert!(sink.stages().contains(&"warning".to_string()), "stages: {:?}", sink.stages());
+}
+
+/// Only malformed JSON is absorbed. Stop still ends the turn.
+#[tokio::test]
+async fn cancel_during_planning_still_ends_the_turn() {
+    let src = FailingPlanner { build_calls: AtomicU32::new(0), cancelled: true };
+    let sink = VecSink::new();
+
+    let err = plan_turn(&src, "p", &[], "", false, &sink).await.unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "got {err:?}");
+    assert_eq!(src.build_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -45,9 +45,12 @@ const LOG_FILE: &str = "workbench.log";
 /// * `tauri_app` matches by prefix, so it covers the real crate name
 ///   `tauri_app_lib` as well.
 ///
+/// * `workbench_mesh` carries the Worker timings, link and pairing lines. It was
+///   missing at first, so a mesh turn's remote side never reached the log.
+///
 /// [`default_filter_admits_our_targets`] guards this string against edits that
 /// drop a source by accident.
-const DEFAULT_FILTER: &str = "warn,tauri_app=debug,workbench_core=debug,ui=debug";
+const DEFAULT_FILTER: &str = "warn,tauri_app=debug,workbench_core=debug,workbench_mesh=debug,ui=debug";
 
 /// Install the global subscriber. Call once, as early as possible.
 ///
@@ -170,6 +173,7 @@ mod tests {
             tracing::info!(target: "ui", "front-end event");
             tracing::info!(target: "workbench_core::pipeline", "pipeline event");
             tracing::info!(target: "tauri_app_lib::logging", "host event");
+            tracing::info!(target: "workbench_mesh::hub", "mesh event");
             // A stand-in for the webview/HTTP crates whose internals bury ours.
             tracing::info!(target: "hyper::client", "noisy dependency");
         });
@@ -188,6 +192,11 @@ mod tests {
             seen.iter().any(|t| t == "tauri_app_lib::logging"),
             "host logs filtered out — `tauri_app` should prefix-match the real \
              crate name `tauri_app_lib`. Admitted targets: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|t| t == "workbench_mesh::hub"),
+            "mesh logs filtered out; a mesh turn's Worker side goes missing. \
+             Admitted targets: {seen:?}"
         );
         assert!(
             !seen.iter().any(|t| t == "hyper::client"),

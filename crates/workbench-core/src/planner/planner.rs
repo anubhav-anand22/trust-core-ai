@@ -12,7 +12,7 @@ use crate::engine::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep};
 use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::planner::registry::validate_plan;
-use crate::Result;
+use crate::{CoreError, Result};
 
 /// 1 initial planner call + 2 retries. Exceeding this parks the run for the user.
 pub const MAX_PLAN_ATTEMPTS: u32 = 3;
@@ -97,9 +97,20 @@ pub async fn plan_turn(
     let mut errors: Vec<String> = Vec::new();
 
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
-        let plan = source
-            .build_plan(prompt, history, &intent, uploads, &errors)
-            .await?;
+        let plan = match source.build_plan(prompt, history, &intent, uploads, &errors).await {
+            Ok(plan) => plan,
+            // The model's JSON did not parse — usually cut off at the token cap
+            // after it rambled. A small model that did that once tends to do it
+            // again, and each retry is a full generation (~50 s on CPU), so go
+            // straight to the deterministic fallback below. Any other error
+            // (cancel, Ollama down, timeout) still ends the turn as before.
+            Err(e @ CoreError::Schema { .. }) => {
+                tracing::warn!(attempt, error = %e, "planner returned malformed JSON; using the fallback plan");
+                errors = vec![e.to_string()];
+                break;
+            }
+            Err(e) => return Err(e),
+        };
 
         sink.emit(StepEvent::ValidatingPlan { attempt });
         errors = validate_plan(&plan, uploads);

@@ -1596,6 +1596,42 @@ candidate, which also made the docs' claim about tag collisions true.
 **Takeaway:** a limit that is checked in one place and counted in another
 is not a limit under concurrency. Reserve before the work, settle after it.
 
+## Fix pass — part 26: the first two-device test
+
+The lead ran the mesh on two laptops (a 1-thread GPU-less Host, an 8-core
+Worker at 77 tok/s), then the same prompts with the mesh off as a
+baseline. The mesh did its job: turn 1 took **102.7 s on the mesh vs
+198.7 s off**. The answers were thin either way, and the baseline exposed
+two bugs that were there before the mesh.
+
+- **A plan with broken JSON ended the turn.** The 0.5b planner invented
+  `analyze_image` steps for images nobody attached, hit the 640-token cap,
+  and the JSON stopped mid-string (`EOF while parsing a string at line 1
+  column 2266`). `plan_turn` called `build_plan(...).await?`, so that `?`
+  returned the error and skipped both the retries and the fallback plan the
+  comments promised. Those only ran when the *validator* rejected a plan.
+  Now `CoreError::Schema` goes straight to the deterministic fallback. For a
+  follow-up with no files, that is one `answer_followup` step. Any other
+  error (Stop, Ollama down, timeout) still ends the turn. The test replays
+  the cut-off JSON; on the old code it fails with the lead's exact error.
+- **The Worker's side of a mesh turn never reached the log.** The default
+  filter listed `tauri_app`, `workbench_core` and `ui`, but not the new
+  `workbench_mesh`, so its info lines were dropped. That covered Worker
+  timings, link and pairing events, and which model the Worker used. The
+  filter guard test now checks a `workbench_mesh` target too.
+
+**Deliberately not done (yet), one fix at a time:** we do not retry after
+malformed JSON. A small model that rambled to the cap once tends to do it
+again, and each retry costs about 50 s on this CPU. This is the lead's
+latency-first call. Still open, all seen in the same test: a follow-up with
+no files is planned as `search_knowledge` against an empty knowledge base,
+so it degrades. The final write-up always runs on the Host (about 60 s at 1
+thread) even when a faster Worker is idle. The 640-token cap also cuts off
+`output_compiler`, which wasted a 24 s retry.
+
+**Takeaway:** a retry loop only protects the failures it actually catches.
+Read where the `?` sits, not just what the comment says.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass
