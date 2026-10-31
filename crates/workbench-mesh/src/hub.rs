@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use workbench_core::mesh::{Dispatcher, Node, StepJob};
+use workbench_core::mesh::{Dispatcher, Node, PlanJob, PlanReply, StepJob};
 use workbench_core::schemas::{InputFile, TaskStep, ToolResult};
 use workbench_core::{CoreError, ProgressSink, StepEvent};
 
@@ -57,7 +57,13 @@ pub struct WorkerStatus {
     pub busy: bool,
 }
 
-type JobOutcome = std::result::Result<ToolResult, String>;
+/// What a Worker answers: a step's result, or a planner call's.
+enum Reply {
+    Tool(ToolResult),
+    Plan(PlanReply),
+}
+
+type JobOutcome = std::result::Result<Reply, String>;
 
 struct Waiter {
     task: String,
@@ -320,7 +326,14 @@ impl Hub {
             Frame::Done { job_id, result } => {
                 if let Some(mut w) = slot.jobs.remove(&job_id) {
                     if let Some(done) = w.done.take() {
-                        let _ = done.send(Ok(result));
+                        let _ = done.send(Ok(Reply::Tool(result)));
+                    }
+                }
+            }
+            Frame::Planned { job_id, reply } => {
+                if let Some(mut w) = slot.jobs.remove(&job_id) {
+                    if let Some(done) = w.done.take() {
+                        let _ = done.send(Ok(Reply::Plan(reply)));
                     }
                 }
             }
@@ -369,7 +382,59 @@ impl Hub {
         }
     }
 
-    async fn run_job(&self, worker: &str, mut job: StepJob, sink: &dyn ProgressSink) -> JobOutcome {
+    /// Send one frame that expects one reply, and wait for it, forwarding the
+    /// job's allowed events to `sink` meanwhile.
+    async fn request(
+        &self,
+        worker: &str,
+        job_id: String,
+        task: String,
+        frame: Frame,
+        sink: Option<&dyn ProgressSink>,
+    ) -> JobOutcome {
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (done_tx, mut done) = oneshot::channel();
+        {
+            let mut slots = self.inner.slots.lock().expect("slots lock");
+            let slot = slots
+                .get_mut(worker)
+                .filter(|s| s.consented)
+                .ok_or_else(|| "that device is no longer connected".to_string())?;
+            slot.jobs.insert(job_id.clone(), Waiter { task, events: events_tx, done: Some(done_tx) });
+            slot.tx.send(frame).map_err(|_| "the connection closed".to_string())?;
+        }
+        tracing::info!(worker, job = %job_id, "mesh: job sent");
+        let _forget = ForgetOnDrop { hub: self, worker, job_id: &job_id };
+
+        let emit = |event| {
+            if let Some(sink) = sink {
+                sink.emit(event);
+            }
+        };
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    if let Some(event) = event { emit(event); }
+                }
+                outcome = &mut done => {
+                    // Flush what arrived before the result.
+                    while let Ok(event) = events.try_recv() { emit(event); }
+                    return outcome.unwrap_or_else(|_| Err("the device left mid-job".into()));
+                }
+            }
+        }
+    }
+
+    async fn run_plan(&self, worker: &str, job: PlanJob) -> std::result::Result<PlanReply, String> {
+        let job_id = format!("plan#{}", self.inner.next_job.fetch_add(1, Ordering::Relaxed));
+        let frame = Frame::PlanJob { job_id: job_id.clone(), job };
+        match self.request(worker, job_id, "plan".into(), frame, None).await? {
+            Reply::Plan(reply) => Ok(reply),
+            Reply::Tool(_) => Err("answered a planner call with a step result".into()),
+        }
+    }
+
+    async fn run_job(&self, worker: &str, mut job: StepJob, sink: &dyn ProgressSink) -> std::result::Result<ToolResult, String> {
         // The Worker gets the bytes and the file's name, never the Host's path
         // (it would leak the user's home folder and username).
         let mut files = Vec::with_capacity(job.files.len());
@@ -380,36 +445,11 @@ impl Hub {
         }
 
         let job_id = format!("{}#{}", job.step.id, self.inner.next_job.fetch_add(1, Ordering::Relaxed));
-        let (events_tx, mut events) = mpsc::unbounded_channel();
-        let (done_tx, mut done) = oneshot::channel();
-        {
-            let mut slots = self.inner.slots.lock().expect("slots lock");
-            let slot = slots
-                .get_mut(worker)
-                .filter(|s| s.consented)
-                .ok_or_else(|| "that device is no longer connected".to_string())?;
-            slot.jobs.insert(
-                job_id.clone(),
-                Waiter { task: job.step.task.clone(), events: events_tx, done: Some(done_tx) },
-            );
-            slot.tx
-                .send(Frame::Job { job_id: job_id.clone(), job, files })
-                .map_err(|_| "the connection closed".to_string())?;
-        }
-        tracing::info!(worker, job = %job_id, "mesh: job sent");
-        let _forget = ForgetOnDrop { hub: self, worker, job_id: &job_id };
-
-        loop {
-            tokio::select! {
-                event = events.recv() => {
-                    if let Some(event) = event { sink.emit(event); }
-                }
-                outcome = &mut done => {
-                    // Flush what arrived before the result.
-                    while let Ok(event) = events.try_recv() { sink.emit(event); }
-                    return outcome.unwrap_or_else(|_| Err("the device left mid-job".into()));
-                }
-            }
+        let task = job.step.task.clone();
+        let frame = Frame::Job { job_id: job_id.clone(), job, files };
+        match self.request(worker, job_id, task, frame, Some(sink)).await? {
+            Reply::Tool(result) => Ok(result),
+            Reply::Plan(_) => Err("answered a step with a planner reply".into()),
         }
     }
 
@@ -464,6 +504,8 @@ fn frame_name(f: &Frame) -> &'static str {
         Frame::Event { .. } => "event",
         Frame::Done { .. } => "done",
         Frame::Failed { .. } => "failed",
+        Frame::PlanJob { .. } => "plan_job",
+        Frame::Planned { .. } => "planned",
         Frame::Cancel { .. } => "cancel",
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",
@@ -509,5 +551,16 @@ impl Dispatcher for TurnDispatcher {
 
     async fn cancel_all(&self) {
         self.hub.cancel_everything();
+    }
+
+    fn delegator(&self) -> Option<String> {
+        self.hub.delegator()
+    }
+
+    async fn plan_on_worker(&self, worker: &str, job: PlanJob) -> workbench_core::Result<PlanReply> {
+        self.hub
+            .run_plan(worker, job)
+            .await
+            .map_err(|message| CoreError::Tool { tool: format!("mesh:{worker}"), message })
     }
 }

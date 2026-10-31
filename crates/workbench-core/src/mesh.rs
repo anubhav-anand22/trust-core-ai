@@ -20,12 +20,12 @@ use std::time::Duration;
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::schemas::{InputFile, Plan, TaskStep, ToolResult};
+use crate::engine::schemas::{InputFile, IntentResult, Plan, TaskStep, ToolResult};
 use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::executor::{finish_step, run_step};
 use crate::executor::ToolRegistry;
-use crate::planner::{lookup, Stage};
+use crate::planner::{lookup, PlanSource, Stage};
 use crate::tools::{resolve_file, ToolContext};
 use crate::{CoreError, PipelineConfig, Result, TurnMode};
 
@@ -90,6 +90,177 @@ pub trait Dispatcher: Send + Sync {
 
     /// Stop was pressed: tell the Workers to abandon their jobs.
     async fn cancel_all(&self) {}
+
+    /// The Worker that should plan this turn, or `None` for the Host (MESH-10).
+    fn delegator(&self) -> Option<String> {
+        None
+    }
+
+    /// Run one planner model call on `worker`. Errors mean the same as for
+    /// [`Dispatcher::run_on_worker`]: [`RemotePlanner`] falls back to the Host.
+    async fn plan_on_worker(&self, worker: &str, job: PlanJob) -> Result<PlanReply> {
+        let _ = job;
+        Err(CoreError::Tool { tool: format!("mesh:{worker}"), message: "this mesh can't plan remotely".into() })
+    }
+}
+
+/// One planner model call for a delegator Worker (MESH-9). Only the *model call*
+/// moves: the Host still validates, retries, completes the plan and parks it for
+/// the user, because validation checks attachments that exist only on the Host.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanJob {
+    pub call: PlanCall,
+    /// As [`StepJob::persona`]: the planner's system prompts carry it too.
+    #[serde(default)]
+    pub persona: String,
+}
+
+/// The two calls of [`PlanSource`]. `uploads` carry names and kinds only: the
+/// path is replaced with the name, so the Host's folders never leave it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanCall {
+    ParseIntent { prompt: String, history: String, uploads: Vec<InputFile> },
+    BuildPlan {
+        prompt: String,
+        history: String,
+        intent: IntentResult,
+        uploads: Vec<InputFile>,
+        previous_errors: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReply {
+    Intent(IntentResult),
+    Plan(Plan),
+}
+
+/// Run one planner call on this device. A delegator Worker calls this.
+pub async fn run_plan_job(job: &PlanJob, source: &dyn PlanSource) -> Result<PlanReply> {
+    match &job.call {
+        PlanCall::ParseIntent { prompt, history, uploads } => {
+            source.parse_intent(prompt, history, uploads).await.map(PlanReply::Intent)
+        }
+        PlanCall::BuildPlan { prompt, history, intent, uploads, previous_errors } => source
+            .build_plan(prompt, history, intent, uploads, previous_errors)
+            .await
+            .map(PlanReply::Plan),
+    }
+}
+
+/// A [`PlanSource`] that asks the delegator Worker, and falls back to the Host's
+/// own model for the rest of the turn the first time the Worker can't answer.
+/// `plan_turn` runs on the Host unchanged around it.
+pub struct RemotePlanner<'a> {
+    dispatcher: &'a dyn Dispatcher,
+    worker: String,
+    local: &'a dyn PlanSource,
+    /// Polled while waiting on the Worker, so Stop works during planning too.
+    engine: &'a OllamaEngine,
+    sink: &'a dyn ProgressSink,
+    gave_up: std::sync::atomic::AtomicBool,
+}
+
+impl<'a> RemotePlanner<'a> {
+    pub fn new(
+        dispatcher: &'a dyn Dispatcher,
+        worker: String,
+        local: &'a dyn PlanSource,
+        engine: &'a OllamaEngine,
+        sink: &'a dyn ProgressSink,
+    ) -> Self {
+        Self { dispatcher, worker, local, engine, sink, gave_up: Default::default() }
+    }
+
+    /// `Ok(None)` = the Worker couldn't answer; plan locally.
+    async fn ask(&self, call: PlanCall) -> Result<Option<PlanReply>> {
+        use std::sync::atomic::Ordering;
+        if self.gave_up.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.engine.cancel_check()?;
+        let job = PlanJob { call, persona: self.engine.persona().to_string() };
+        let remote = self.dispatcher.plan_on_worker(&self.worker, job);
+        tokio::pin!(remote);
+        let outcome = loop {
+            match tokio::time::timeout(CANCEL_POLL, &mut remote).await {
+                Ok(outcome) => break outcome,
+                Err(_) if self.engine.cancel_check().is_err() => {
+                    self.dispatcher.cancel_all().await;
+                    return Err(CoreError::Cancelled);
+                }
+                Err(_) => continue,
+            }
+        };
+        match outcome {
+            Ok(reply) => Ok(Some(reply)),
+            Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+            Err(e) => {
+                self.gave_up.store(true, Ordering::SeqCst);
+                crate::events::warn(
+                    self.sink,
+                    "The mesh device planning this turn couldn't answer; planning on this device.",
+                    Some(e.to_string()),
+                );
+                tracing::warn!(worker = %self.worker, error = %e, "mesh: delegated planning failed, planning locally");
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Names and kinds only (see [`PlanCall`]).
+fn without_paths(uploads: &[InputFile]) -> Vec<InputFile> {
+    uploads
+        .iter()
+        .map(|f| InputFile { path: f.original_name.clone(), kind: f.kind, original_name: f.original_name.clone() })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl PlanSource for RemotePlanner<'_> {
+    async fn parse_intent(&self, prompt: &str, history: &str, uploads: &[InputFile]) -> Result<IntentResult> {
+        let call = PlanCall::ParseIntent {
+            prompt: prompt.to_string(),
+            history: history.to_string(),
+            uploads: without_paths(uploads),
+        };
+        match self.ask(call).await? {
+            Some(PlanReply::Intent(intent)) => Ok(intent),
+            Some(PlanReply::Plan(_)) => Err(CoreError::Tool {
+                tool: format!("mesh:{}", self.worker),
+                message: "answered an intent call with a plan".into(),
+            }),
+            None => self.local.parse_intent(prompt, history, uploads).await,
+        }
+    }
+
+    async fn build_plan(
+        &self,
+        prompt: &str,
+        history: &str,
+        intent: &IntentResult,
+        uploads: &[InputFile],
+        previous_errors: &[String],
+    ) -> Result<Plan> {
+        let call = PlanCall::BuildPlan {
+            prompt: prompt.to_string(),
+            history: history.to_string(),
+            intent: intent.clone(),
+            uploads: without_paths(uploads),
+            previous_errors: previous_errors.to_vec(),
+        };
+        match self.ask(call).await? {
+            Some(PlanReply::Plan(plan)) => Ok(plan),
+            Some(PlanReply::Intent(_)) => Err(CoreError::Tool {
+                tool: format!("mesh:{}", self.worker),
+                message: "answered a plan call with an intent".into(),
+            }),
+            None => self.local.build_plan(prompt, history, intent, uploads, previous_errors).await,
+        }
+    }
 }
 
 /// Run one job on this device. A Worker calls this with its own engine (built

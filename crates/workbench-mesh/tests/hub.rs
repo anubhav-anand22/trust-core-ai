@@ -1,7 +1,7 @@
 //! Host hub + Worker runtime + the core mesh executor, end to end over loopback.
 //! Tools are fakes registered under real task names; no model, no Ollama.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,8 +10,9 @@ use tokio::net::TcpListener;
 use workbench_core::engine::OllamaEngine;
 use workbench_core::events::VecSink;
 use workbench_core::executor::ToolRegistry;
-use workbench_core::mesh::execute_plan_mesh;
-use workbench_core::schemas::{FileKind, InputFile, Plan, TaskStep, ToolResult};
+use workbench_core::mesh::{execute_plan_mesh, Dispatcher, RemotePlanner};
+use workbench_core::planner::{plan_turn, PlanOutcome, PlanSource};
+use workbench_core::schemas::{FileKind, InputFile, IntentResult, Plan, TaskStep, ToolResult};
 use workbench_core::tools::{Tool, ToolContext};
 use workbench_core::{CancelFlag, CoreError, PipelineConfig, Result, StepEvent};
 use workbench_mesh::frame::Hello;
@@ -82,6 +83,26 @@ impl Tool for FakePdf {
     }
 }
 
+/// Plans without a model: one intent, then a plan that searches the knowledge base.
+#[derive(Default)]
+struct FixedPlanner {
+    calls: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl PlanSource for FixedPlanner {
+    async fn parse_intent(&self, _p: &str, _h: &str, _u: &[InputFile]) -> Result<IntentResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(IntentResult { intents: vec!["inspect".into()], file_kinds: vec![], needs_knowledge: true })
+    }
+    async fn build_plan(&self, _p: &str, _h: &str, _i: &IntentResult, _u: &[InputFile], _e: &[String]) -> Result<Plan> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Plan {
+            steps: vec![TaskStep { id: "k1".into(), task: "search_knowledge".into(), args: json!(null), depends_on: vec![] }],
+        })
+    }
+}
+
 struct Probe {
     saw_cancel: Arc<AtomicBool>,
     saw_path: Arc<Mutex<String>>,
@@ -108,7 +129,8 @@ struct Mesh {
 
 /// A GPU-less Host and one paired Worker. `approve` = the Host user consented.
 async fn mesh(approve: bool, worker_work: Duration) -> Mesh {
-    let host_caps = Capabilities { physical_cores: 2, ..Default::default() };
+    // A weak Host (8 tok/s, no GPU) and a Worker 7× faster: the Worker plans.
+    let host_caps = Capabilities { physical_cores: 2, decode_tok_s: Some(8.0), ..Default::default() };
     let hub = Hub::new(DeviceIdentity::generate("host").unwrap(), host_caps, TrustStore::in_memory());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -118,7 +140,13 @@ async fn mesh(approve: bool, worker_work: Duration) -> Mesh {
     let mut events = hub.subscribe();
 
     let me = DeviceIdentity::generate("gpu-box").unwrap();
-    let caps = Capabilities { physical_cores: 16, gpu: true, ..Default::default() };
+    let caps = Capabilities {
+        physical_cores: 16,
+        gpu: true,
+        llm_model: Some("qwen2.5:7b".into()),
+        decode_tok_s: Some(60.0),
+        ..Default::default()
+    };
     let hello = Hello { name: me.name.clone(), capabilities: serde_json::to_value(caps).unwrap() };
     let link = pair(addr, &code, &me, &hello).await.unwrap();
 
@@ -140,6 +168,7 @@ async fn mesh(approve: bool, worker_work: Duration) -> Mesh {
         make_engine: Arc::new(|job, flag| {
             engine().with_mode(job.mode).with_persona(job.persona.clone()).with_cancel(flag)
         }),
+        make_planner: Arc::new(|_job, _flag| Box::new(FixedPlanner::default()) as Box<dyn PlanSource>),
     });
     let worker_task = tokio::spawn(serve(link, rt, None));
     // Let the join-time probe settle.
@@ -195,6 +224,27 @@ async fn an_approved_worker_runs_the_step_with_only_its_file() {
     assert_eq!(std::fs::read_dir(&m.worker_scratch).unwrap().count(), 0, "the Worker kept nothing");
     let w = &m.hub.workers()[0];
     assert!(w.link_mbps.is_some_and(|mbps| mbps > 0.0), "link speed measured at join");
+}
+
+#[tokio::test]
+async fn a_much_faster_worker_plans_the_turn_over_the_real_link() {
+    let m = mesh(true, Duration::ZERO).await;
+    let host_dir = tempfile::tempdir().unwrap();
+    let (_plan, uploads) = pdf_turn(host_dir.path());
+    let dispatcher = m.hub.for_turn(&uploads);
+    let worker_id = m.hub.workers()[0].device_id.clone();
+    assert_eq!(dispatcher.delegator(), Some(worker_id.clone()), "60 tok/s vs the Host's 8");
+
+    let local = FixedPlanner::default();
+    let engine = engine();
+    let sink = VecSink::new();
+    let remote = RemotePlanner::new(&dispatcher, worker_id, &local, &engine, &sink);
+    let (intent, outcome) = plan_turn(&remote, "check the pump", &uploads, "", false, &sink).await.unwrap();
+
+    assert!(intent.needs_knowledge);
+    assert!(matches!(outcome, PlanOutcome::Ready(p) if p.steps[0].task == "search_knowledge"));
+    assert_eq!(local.calls.load(Ordering::SeqCst), 0, "the Host's model wasn't used");
+    assert!(!sink.events().iter().any(|e| matches!(e, StepEvent::Warning { .. })));
 }
 
 #[tokio::test]

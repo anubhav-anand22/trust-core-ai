@@ -8,7 +8,7 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use workbench_core::mesh::StepJob;
+use workbench_core::mesh::{PlanJob, PlanReply, StepJob};
 use workbench_core::schemas::{FileKind, ToolResult};
 use workbench_core::StepEvent;
 
@@ -37,6 +37,10 @@ pub enum Frame {
     Done { job_id: String, result: ToolResult },
     /// Worker → Host: the job could not run here (missing model, busy, panicked).
     Failed { job_id: String, message: String },
+    /// Host → delegator Worker: one planner model call (MESH-9).
+    PlanJob { job_id: String, job: PlanJob },
+    /// Worker → Host: that call's answer. The Host validates it.
+    Planned { job_id: String, reply: PlanReply },
     /// Host → Worker: Stop was pressed. `None` cancels everything.
     Cancel { job_id: Option<String> },
     Ping { n: u64 },
@@ -103,6 +107,10 @@ mod tests {
         });
         round_trip(Frame::Event { job_id: "j".into(), event: StepEvent::Done { report_json: "{}".into() } });
         round_trip(Frame::Probe { n: 1, padding: vec![1, 2, 3] });
+        round_trip(Frame::Planned {
+            job_id: "p".into(),
+            reply: PlanReply::Plan(workbench_core::schemas::Plan { steps: vec![] }),
+        });
         round_trip(Frame::Cancel { job_id: None });
         round_trip(Frame::Hello(Hello { name: "w".into(), capabilities: serde_json::json!({"gpu": true}) }));
     }

@@ -1507,6 +1507,34 @@ timings in the Host's turn breakdown, and the GPU cap.
 **Takeaway:** when a fallback hides a failure, make the fallback say why
 before you go looking. One `map_err` turned a guess into a line number.
 
+## Feature pass — part 23: the mesh, phase 4 (a faster Worker plans)
+
+- **The problem:** on a weak Host the planner's two model calls (intent, plan)
+  are the slowest part of a turn, and with a bad plan they repeat up to three
+  times. MESH-10 says a Worker ≥2× faster should do them.
+- **The evidence that shaped it:** `validate_plan` checks every attachment
+  exists on disk (`registry.rs`), and the files exist only on the Host. Moving
+  `plan_turn` to the Worker would fail validation on every turn with a file.
+  But `plan_turn` already takes a `&dyn PlanSource`, the trait for exactly those
+  two model calls.
+- **What changed:** `RemotePlanner` (a `PlanSource` that sends each call to the
+  delegator as a `PlanJob` frame and falls back to the Host's model after one
+  failure); two optional `Dispatcher` methods with defaults (`delegator`,
+  `plan_on_worker`), so existing implementations didn't change; the hub routes
+  `Planned` replies; the Worker runs planning calls under the same
+  one-at-a-time guard. `run_turn_with_mesh` swaps the plan source only when a
+  delegator is chosen.
+- **Deliberately not done:** moving validation, retries, completion or HITL.
+  They stay on the Host, which is what MESH-9 asked for.
+
+Tests: `cargo test -p workbench-core -p workbench-mesh --no-fail-fast` → all
+green (core 62 + mesh executor 6 + mesh planner 3 + existing suites; mesh
+crate 15 + hub 5 + link 6). The Tauri app crate was not rebuilt for this part;
+its call sites are unchanged. Not live-tested.
+
+**Takeaway:** look for the trait before you move a function. The seam was
+already there; the work was only to put the network behind it.
+
 ## Where it ended
 
 Stages 1–4 of the prototype→product pass done, plus the hackathon fix pass

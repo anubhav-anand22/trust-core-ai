@@ -12,7 +12,7 @@ use crate::engine::OllamaEngine;
 use crate::events::{ProgressSink, StepEvent};
 use crate::executor::{assert_sane, compiler, execute_plan, ToolRegistry};
 use crate::memory::{Exchange, PersistentMemory, SessionContext, TurnSummary};
-use crate::mesh::{execute_plan_mesh, Dispatcher};
+use crate::mesh::{execute_plan_mesh, Dispatcher, RemotePlanner};
 use crate::planner::{complete_plan, plan_turn, validate_plan, wants_knowledge, Available, PlanOutcome};
 use crate::{PipelineConfig, Result};
 
@@ -74,8 +74,17 @@ pub async fn run_turn_with_mesh(
 
     // --- plan + deterministic validation (with retry ceiling) ---------------
     let plan_started = std::time::Instant::now();
-    let (intent, outcome) =
-        plan_turn(engine, prompt, uploads, &history, session.has_history(), sink).await?;
+    // A capable Worker plans when the Host is the weak one (MESH-10). Only the
+    // two model calls move: validation, retries and HITL run here as always.
+    let delegate = mesh.and_then(|d| d.delegator().map(|worker| (d, worker)));
+    let (intent, outcome) = match delegate {
+        None => plan_turn(engine, prompt, uploads, &history, session.has_history(), sink).await?,
+        Some((dispatcher, worker)) => {
+            tracing::info!(%worker, "turn phase: planning on a mesh device");
+            let remote = RemotePlanner::new(dispatcher, worker, engine, engine, sink);
+            plan_turn(&remote, prompt, uploads, &history, session.has_history(), sink).await?
+        }
+    };
     tracing::info!(plan_ms = plan_started.elapsed().as_millis(), "turn phase: planning done");
     let plan = match outcome {
         PlanOutcome::Ready(plan) => plan,

@@ -14,7 +14,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use workbench_core::engine::OllamaEngine;
 use workbench_core::executor::ToolRegistry;
-use workbench_core::mesh::{run_job, StepJob};
+use workbench_core::mesh::{run_job, run_plan_job, PlanJob, StepJob};
+use workbench_core::planner::PlanSource;
 use workbench_core::{CancelFlag, PipelineConfig, ProgressSink, StepEvent};
 
 use crate::frame::{FileBlob, Frame};
@@ -24,12 +25,18 @@ use crate::link::Link;
 /// with the job's mode and persona, and the job's cancel flag.
 pub type EngineFactory = Arc<dyn Fn(&StepJob, CancelFlag) -> OllamaEngine + Send + Sync>;
 
+/// Builds the planner for a delegated planning call: in the app, this Worker's
+/// own engine with the job's persona. Separate from [`EngineFactory`] so tests
+/// can plan without a model.
+pub type PlannerFactory = Arc<dyn Fn(&PlanJob, CancelFlag) -> Box<dyn PlanSource> + Send + Sync>;
+
 pub struct WorkerRuntime {
     pub registry: ToolRegistry,
     pub config: PipelineConfig,
     /// Per-job temp dirs live here. Wiped on start.
     pub scratch: PathBuf,
     pub make_engine: EngineFactory,
+    pub make_planner: PlannerFactory,
 }
 
 /// What the Worker's own screen may show: the job's *type*, never its content.
@@ -95,6 +102,19 @@ pub async fn serve(
                     let flag = CancelFlag::new();
                     let handle = tokio::spawn(run_one(
                         job_id.clone(), job, files, rt.clone(), flag.clone(), outbox.clone(), finished_tx.clone(),
+                    ));
+                    current = Some((job_id, flag, AbortOnDrop(handle)));
+                }
+                Some(Frame::PlanJob { job_id, job }) => {
+                    if current.is_some() {
+                        let _ = outbox.send(Frame::Failed { job_id, message: "this device is busy".into() });
+                        continue;
+                    }
+                    tracing::info!(job = %job_id, "mesh worker: planning call");
+                    show(Activity::Busy { task: "planning".into() });
+                    let flag = CancelFlag::new();
+                    let handle = tokio::spawn(plan_one(
+                        job_id.clone(), job, rt.clone(), flag.clone(), outbox.clone(), finished_tx.clone(),
                     ));
                     current = Some((job_id, flag, AbortOnDrop(handle)));
                 }
@@ -172,6 +192,25 @@ async fn run_one(
             let _ = outbox.send(Frame::Failed { job_id: job_id.clone(), message });
         }
     }
+    let _ = finished.send(job_id);
+}
+
+async fn plan_one(
+    job_id: String,
+    job: PlanJob,
+    rt: Arc<WorkerRuntime>,
+    flag: CancelFlag,
+    outbox: mpsc::UnboundedSender<Frame>,
+    finished: mpsc::UnboundedSender<String>,
+) {
+    let started = std::time::Instant::now();
+    let planner = (rt.make_planner)(&job, flag);
+    let frame = match run_plan_job(&job, planner.as_ref()).await {
+        Ok(reply) => Frame::Planned { job_id: job_id.clone(), reply },
+        Err(e) => Frame::Failed { job_id: job_id.clone(), message: e.to_string() },
+    };
+    tracing::info!(job = %job_id, elapsed_ms = started.elapsed().as_millis(), "mesh worker: planning call done");
+    let _ = outbox.send(frame);
     let _ = finished.send(job_id);
 }
 

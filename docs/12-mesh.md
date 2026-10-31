@@ -1,8 +1,8 @@
 # 12 · The mesh: borrowing nearby machines without giving them your data
 
-> Status: **Phases 1–3 of 6 landed**: the core scheduler, the encrypted link,
-> and the Host hub plus Worker runtime, all tested over loopback. Not yet wired
-> into the app: no UI, no Tauri commands, no delegated planning. See [Phases](#phases).
+> Status: **Phases 1–4 of 6 landed**: the core scheduler, the encrypted link,
+> the Host hub plus Worker runtime, and delegated planning, all tested over
+> loopback. Not yet wired into the app: no UI and no Tauri commands. See [Phases](#phases).
 
 TrustCore is built to run on a weak, often GPU-less office machine. On a
 machine like that a turn takes minutes. Most offices have a stronger
@@ -129,7 +129,34 @@ later:  Worker ──ws──▶ Opening{reconnect} → Noise XX → each side c
   that Worker. A GPU-less Host isn't a candidate (MESH-14) but is still the last resort.
 - **Delegator (`scheduler::delegator`):** the pinned device, else the fastest
   Worker at ≥2× the Host's tok/s. If the Host's speed is unmeasured, the Host
-  plans. Wired into planning in phase 4.
+  plans.
+
+## Delegated planning (phase 4)
+
+The planner already talks to its model through a two-method trait,
+`PlanSource` (`parse_intent`, `build_plan`). `RemotePlanner` is one more
+`PlanSource` that sends those two calls to the delegator. `plan_turn` runs **on
+the Host, unchanged** around it:
+
+```text
+Host: plan_turn ── parse_intent ──▶ delegator Worker (its model, maybe bigger)
+                ◀── IntentResult ──
+                ── build_plan ────▶
+                ◀── Plan ─────────
+      validate_plan (checks files exist, which they do only here) ── errors? ──▶ build_plan again
+      complete_plan · fold · HITL park      all on the Host, as always
+```
+
+- Why only the model calls move: validation checks that attachments exist on
+  disk, and they exist only on the Host. MESH-9 wanted exactly this split: the
+  delegator plans, the Host decides.
+- The delegator gets the prompt, the session history the local planner would
+  see (MESH-5), the persona, and attachment *names and kinds*, with each path
+  replaced by its name.
+- If the delegator can't answer, the Host warns once and plans the rest of the
+  turn itself. Stop works while waiting on it.
+- With no mesh, or no delegator chosen, `run_turn_with_mesh` makes the same
+  `plan_turn(engine, …)` call as before.
 
 ## Decisions
 
@@ -171,6 +198,6 @@ trust.
 | 1 | Core: `StepJob`, `Dispatcher`, `run_job`, `execute_plan_mesh`, pipeline seam | **done**: 6 integration tests (`tests/mesh_executor.rs`) + 3 unit tests |
 | 2 | Link: code → SPAKE2 → Noise, WebSocket frames, mDNS (`crates/workbench-mesh`) | **done**: 6 link tests (+1 multicast, run by hand) + unit tests |
 | 3 | Scheduler, delegator rule, Host hub (`Dispatcher` over real links), Worker runtime | **done**: 4 end-to-end hub tests + scheduler unit tests. Open: Worker `CallTiming`s don't reach the Host's turn breakdown; GPU cap (`num_gpu`) comes with the UI caps in phase 5 |
-| 4 | Delegated planning | todo |
+| 4 | Delegated planning (`RemotePlanner`, `PlanJob`/`Planned` frames) | **done**: 3 core tests (Worker plans while the Host validates and retries; fallback after one failure; Stop) + 1 end-to-end over a real link |
 | 5 | UI: header toggle, sidebar, consent, Worker mode, `served_by` in the audit panel | todo |
 | 6 | Two-machine LAN benchmark | todo |
